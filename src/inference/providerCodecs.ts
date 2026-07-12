@@ -193,7 +193,7 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
           name: this.#vendorToInternal.get(fn.name) ?? fn.name,
           input: parseJsonValue(fn.arguments, "Chat Completions function arguments"),
         },
-        continuation: message,
+        continuation: { ...message, tool_calls: [toolCall] },
       };
     }
     if (typeof message.content === "string" && message.content.trim().length > 0) {

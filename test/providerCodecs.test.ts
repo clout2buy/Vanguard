@@ -87,6 +87,10 @@ test("DeepSeek-compatible chat codec preserves reasoning content and tool histor
           id: "deep-call",
           type: "function",
           function: { name: "workspace_read", arguments: "{\"path\":\"a.ts\"}" },
+        }, {
+          id: "discarded-parallel-call",
+          type: "function",
+          function: { name: "workspace_list", arguments: "{}" },
         }],
       },
     }],
@@ -103,4 +107,5 @@ test("DeepSeek-compatible chat codec preserves reasoning content and tool histor
   });
   assert.match(JSON.stringify(followup), /reasoning_content/);
   assert.match(JSON.stringify(followup), /tool_call_id/);
+  assert.doesNotMatch(JSON.stringify(followup), /discarded-parallel-call/);
 });
