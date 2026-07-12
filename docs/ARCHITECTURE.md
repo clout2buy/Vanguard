@@ -41,4 +41,8 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Workspace-confined file operations with version-bound guarded edits
 - Allowlisted no-shell process execution and command-based verification
 - Persistent hash-chained run journals
+- Runtime-owned working-state checkpoints that survive transcript compaction
+- Provider-neutral checkpoint injection for OpenAI, Anthropic, and DeepSeek protocols
+- Sealed v2 cases for multi-file lifecycle work and asynchronous greenfield implementation
+- Trajectory and patch-scope scorecard metrics for quality audits beyond pass/fail
 - End-to-end inspect, patch, test, and independently verify control-loop coverage

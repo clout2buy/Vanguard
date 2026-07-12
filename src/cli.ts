@@ -4,6 +4,7 @@ import path from "node:path";
 import type { VerifierPort } from "./kernel/contracts.js";
 import {
   AgentKernel,
+  CheckpointTool,
   CommandVerifier,
   FileJournal,
   HttpModelAdapter,
@@ -11,6 +12,7 @@ import {
   ProcessTool,
   ReadFileTool,
   ReplaceTextTool,
+  RunCheckpointLedger,
   SearchTextTool,
   WorkspaceBoundary,
   WorkspaceIntegrityVerifier,
@@ -21,6 +23,7 @@ import {
   createDeepSeekModel,
   createOpenAIModel,
   analyzeTrajectory,
+  analyzePatch,
 } from "./index.js";
 
 interface CommandSpec {
@@ -53,6 +56,7 @@ async function main(): Promise<void> {
   const session = await createCodingSession(options.workspace);
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
   const versions = new WorkspaceVersionLedger();
+  const workingState = new RunCheckpointLedger();
   const agentAllowedCommands = options.restrictProcess
     ? [...new Set(["node", ...options.allowedCommands])]
     : [...new Set(["node", "npm", "npx", "git", options.verification.command, ...options.allowedCommands])];
@@ -93,16 +97,19 @@ async function main(): Promise<void> {
       new ReadFileTool(workspace, 1_000_000, versions),
       new WriteFileTool(workspace, versions),
       new ReplaceTextTool(workspace, versions),
+      new CheckpointTool(workingState),
       processTool,
     ],
     verifiers,
     journal,
+    workingState,
     options: { maxSteps: options.maxSteps, maxContextBytes: 2_000_000, maxRepeatedAction: 3 },
   });
 
   const startedAt = Date.now();
   const outcome = await kernel.run(options.task);
   const trajectory = analyzeTrajectory(await journal.readValidated());
+  const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
   const scorecard = {
     version: 1,
     sessionId: session.id,
@@ -114,6 +121,7 @@ async function main(): Promise<void> {
     verification: options.verification,
     outcome,
     trajectory,
+    patch,
     grade: {
       verified: outcome.status === "completed",
       score: outcome.status === "completed" ? 1 : 0,

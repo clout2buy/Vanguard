@@ -68,6 +68,12 @@ try {
         verificationFailures = $Scorecard.trajectory.verificationFailures
         completionClaims = $Scorecard.trajectory.completionClaims
         policyBlocks = $Scorecard.trajectory.policyBlocks
+        changedFiles = $Scorecard.patch.changedFiles.Count
+        filesAdded = $Scorecard.patch.filesAdded
+        filesDeleted = $Scorecard.patch.filesDeleted
+        filesModified = $Scorecard.patch.filesModified
+        beforeLines = $Scorecard.patch.beforeLines
+        afterLines = $Scorecard.patch.afterLines
         session = $Scorecard.workspaceRoot
         scorecard = $Scorecard.scorecardFile
         exitCode = $ExitCode
@@ -81,6 +87,16 @@ try {
         verified = $false
         steps = 0
         durationMs = 0
+        toolFailures = 0
+        verificationFailures = 0
+        completionClaims = 0
+        policyBlocks = 0
+        changedFiles = 0
+        filesAdded = 0
+        filesDeleted = 0
+        filesModified = 0
+        beforeLines = 0
+        afterLines = 0
         session = $null
         scorecard = $null
         exitCode = $ExitCode
@@ -106,6 +122,14 @@ try {
       verificationFailures = [int](($Results | Measure-Object -Property verificationFailures -Sum).Sum)
       completionClaims = [int](($Results | Measure-Object -Property completionClaims -Sum).Sum)
       policyBlocks = [int](($Results | Measure-Object -Property policyBlocks -Sum).Sum)
+    }
+    patch = [pscustomobject]@{
+      changedFiles = [int](($Results | Measure-Object -Property changedFiles -Sum).Sum)
+      filesAdded = [int](($Results | Measure-Object -Property filesAdded -Sum).Sum)
+      filesDeleted = [int](($Results | Measure-Object -Property filesDeleted -Sum).Sum)
+      filesModified = [int](($Results | Measure-Object -Property filesModified -Sum).Sum)
+      beforeLines = [int](($Results | Measure-Object -Property beforeLines -Sum).Sum)
+      afterLines = [int](($Results | Measure-Object -Property afterLines -Sum).Sum)
     }
     cases = $Results
   }

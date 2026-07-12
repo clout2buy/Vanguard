@@ -5,6 +5,7 @@ export interface SerializableModelRequest {
   readonly transcript: ModelRequest["transcript"];
   readonly tools: ModelRequest["tools"];
   readonly remainingSteps: number;
+  readonly workingState: ModelRequest["workingState"];
 }
 
 export interface ModelWireCodec {
@@ -53,6 +54,7 @@ export class HttpModelAdapter implements ModelPort {
       transcript: request.transcript,
       tools: request.tools,
       remainingSteps: request.remainingSteps,
+      workingState: request.workingState,
     }));
     let lastError: unknown;
 

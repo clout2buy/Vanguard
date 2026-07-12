@@ -1,0 +1,10 @@
+{
+  "id": "async-pool",
+  "track": "greenfield-async",
+  "workspace": "workspace",
+  "task": "TASK.md",
+  "grader": "grader.mjs",
+  "protected": ["package.json"],
+  "editableRoots": ["src"],
+  "maxSteps": 130
+}

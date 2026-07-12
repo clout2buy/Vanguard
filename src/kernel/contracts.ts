@@ -27,6 +27,7 @@ export interface ModelRequest {
   readonly tools: readonly ToolDefinition[];
   readonly remainingSteps: number;
   readonly signal: AbortSignal;
+  readonly workingState: JsonValue;
 }
 
 export interface ModelPort {
@@ -58,6 +59,10 @@ export interface ToolPort {
 
 export interface ContextPolicyPort {
   select(task: string, transcript: readonly TranscriptEntry[], maxBytes: number): readonly TranscriptEntry[];
+}
+
+export interface WorkingStatePort {
+  snapshot(): JsonValue;
 }
 
 export interface VerificationResult {

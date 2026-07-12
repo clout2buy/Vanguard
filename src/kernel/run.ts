@@ -9,6 +9,7 @@ import type {
   TranscriptEntry,
   VerifierPort,
   VerificationResult,
+  WorkingStatePort,
 } from "./contracts.js";
 import { EvidenceContextPolicy } from "./contextPolicy.js";
 
@@ -37,6 +38,7 @@ export interface KernelDependencies {
   readonly verifiers: readonly VerifierPort[];
   readonly journal: JournalPort;
   readonly contextPolicy?: ContextPolicyPort;
+  readonly workingState?: WorkingStatePort;
   readonly options?: Partial<RunOptions>;
 }
 
@@ -52,6 +54,7 @@ export class AgentKernel {
   readonly #verifiers: readonly VerifierPort[];
   readonly #journal: JournalPort;
   readonly #contextPolicy: ContextPolicyPort;
+  readonly #workingState: WorkingStatePort | undefined;
   readonly #options: RunOptions;
   #sequence = 0;
 
@@ -61,6 +64,7 @@ export class AgentKernel {
     this.#verifiers = dependencies.verifiers;
     this.#journal = dependencies.journal;
     this.#contextPolicy = dependencies.contextPolicy ?? new EvidenceContextPolicy();
+    this.#workingState = dependencies.workingState;
     this.#options = { ...DEFAULT_OPTIONS, ...dependencies.options };
 
     if (
@@ -93,6 +97,7 @@ export class AgentKernel {
           tools: [...this.#tools.values()].map((tool) => tool.definition),
           remainingSteps: this.#options.maxSteps - step + 1,
           signal,
+          workingState: this.#workingState?.snapshot() ?? null,
         });
       } catch (error) {
         return this.#fail(`Model failure: ${errorMessage(error)}`, step - 1);

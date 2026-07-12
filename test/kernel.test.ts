@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ModelDecision, ModelPort, ModelRequest, ToolDefinition, ToolPort, VerifierPort } from "../src/index.js";
-import { AgentKernel, MemoryJournal } from "../src/index.js";
+import { AgentKernel, CheckpointTool, MemoryJournal, RunCheckpointLedger } from "../src/index.js";
 
 class ScriptedModel implements ModelPort {
   #index = 0;
@@ -10,6 +10,19 @@ class ScriptedModel implements ModelPort {
   async decide(_request: ModelRequest): Promise<ModelDecision> {
     const decision = this.decisions[this.#index];
     this.#index += 1;
+    if (decision === undefined) throw new Error("Script exhausted");
+    return decision;
+  }
+}
+
+class CapturingModel implements ModelPort {
+  readonly requests: ModelRequest[] = [];
+  #index = 0;
+  constructor(private readonly decisions: readonly ModelDecision[]) {}
+
+  async decide(request: ModelRequest): Promise<ModelDecision> {
+    this.requests.push(request);
+    const decision = this.decisions[this.#index++];
     if (decision === undefined) throw new Error("Script exhausted");
     return decision;
   }
@@ -103,4 +116,45 @@ test("executes a successful tool action and completes", async () => {
   const outcome = await kernel.run("inspect then answer");
   assert.equal(outcome.status, "completed");
   assert.equal(outcome.steps, 2);
+});
+
+test("kernel injects runtime-owned checkpoint state independently of transcript compaction", async () => {
+  const ledger = new RunCheckpointLedger();
+  const checkpoint = new CheckpointTool(ledger);
+  const model = new CapturingModel([
+    {
+      kind: "tool",
+      call: {
+        id: "checkpoint",
+        name: "run.checkpoint",
+        input: {
+          summary: "Repository mapped; implementing parser next.",
+          completed: ["mapped files"],
+          next: ["implement parser", "run tests"],
+          evidence: ["read src/index.ts"],
+          risks: ["edge-case escaping"],
+        },
+      },
+    },
+    { kind: "complete", answer: "done" },
+  ]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [checkpoint],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    workingState: ledger,
+    options: { maxContextBytes: 2 },
+  });
+  const outcome = await kernel.run("long task");
+  assert.equal(outcome.status, "completed");
+  assert.equal(model.requests[0]?.workingState, null);
+  assert.deepEqual(model.requests[1]?.workingState, {
+    revision: 1,
+    summary: "Repository mapped; implementing parser next.",
+    completed: ["mapped files"],
+    next: ["implement parser", "run tests"],
+    evidence: ["read src/index.ts"],
+    risks: ["edge-case escaping"],
+  });
 });

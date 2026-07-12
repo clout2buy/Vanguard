@@ -5,6 +5,7 @@ import { AnthropicMessagesCodec, OpenAIChatCompletionsCodec, OpenAIResponsesCode
 
 const request: SerializableModelRequest = {
   task: "repair",
+  workingState: null,
   remainingSteps: 10,
   tools: [{
     name: "workspace.read",
@@ -71,6 +72,17 @@ test("provider codecs retain the task even when context compaction drops its tra
   const compacted = { ...request, transcript: request.transcript.slice(1) };
   assert.match(JSON.stringify(new OpenAIResponsesCodec("test").encode(compacted)), /repair/);
   assert.match(JSON.stringify(new AnthropicMessagesCodec("test").encode(compacted)), /repair/);
+});
+
+test("provider codecs inject runtime-owned working state independently of transcript", () => {
+  const stateful = {
+    ...request,
+    workingState: { revision: 2, summary: "phase two", next: ["test"] },
+    transcript: [],
+  };
+  assert.match(JSON.stringify(new OpenAIResponsesCodec("test").encode(stateful)), /phase two/);
+  assert.match(JSON.stringify(new AnthropicMessagesCodec("test").encode(stateful)), /phase two/);
+  assert.match(JSON.stringify(new OpenAIChatCompletionsCodec("test").encode(stateful)), /phase two/);
 });
 
 test("DeepSeek-compatible chat codec preserves reasoning content and tool history", () => {
