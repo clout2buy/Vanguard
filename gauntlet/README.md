@@ -24,7 +24,7 @@ The next implementation milestone is the gauntlet runner and the first corpus de
 
 ## Private sealed suite
 
-The initial sealed suite contains three independent tracks. Each case exposes only its behavioral task and starter workspace. Its grader remains outside the disposable agent workspace, while the integrity verifier protects manifests and restricts edits to declared source roots.
+The initial sealed suite contains three independent tracks. Each case exposes only its behavioral task and starter workspace. Its grader remains outside the disposable agent workspace, verifier output is summarized without privileged paths, the agent's Node subprocess is filesystem-confined to the disposable workspace, and the integrity verifier protects manifests and restricts edits to declared source roots.
 
 Run all cases with:
 

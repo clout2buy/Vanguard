@@ -24,3 +24,5 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design boundary and [
 Vanguard's vendor and clean-room guarantees are defined in [`docs/INDEPENDENCE.md`](docs/INDEPENDENCE.md).
 
 The first runnable coding preview is documented in [`docs/TESTING.md`](docs/TESTING.md).
+
+Audited live benchmark results, including invalidated runs, are recorded in [`docs/LIVE_RESULTS.md`](docs/LIVE_RESULTS.md).

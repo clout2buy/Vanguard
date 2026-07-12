@@ -37,7 +37,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
               },
             }
           : decisions === 2
-            ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "npm", args: ["test"] } } }
+            ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
             : { kind: "complete", answer: "Fixed and tested." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
@@ -61,6 +61,8 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
       "--max-steps", "10",
       "--protect", "package.json",
       "--editable-root", "answer.mjs",
+      "--restrict-process", "true",
+      "--verifier-evidence", "summary",
     ], { maxBuffer: 5_000_000 });
     const scorecard = JSON.parse(stdout) as {
       outcome: { status: string; verification?: unknown[] };

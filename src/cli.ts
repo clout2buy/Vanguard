@@ -14,11 +14,13 @@ import {
   SearchTextTool,
   WorkspaceBoundary,
   WorkspaceIntegrityVerifier,
+  WorkspaceVersionLedger,
   WriteFileTool,
   createAnthropicModel,
   createCodingSession,
   createDeepSeekModel,
   createOpenAIModel,
+  analyzeTrajectory,
 } from "./index.js";
 
 interface CommandSpec {
@@ -37,6 +39,8 @@ interface CliOptions {
   readonly maxSteps: number;
   readonly protectedPaths: readonly string[];
   readonly editableRoots: readonly string[];
+  readonly restrictProcess: boolean;
+  readonly verifierEvidence: "full" | "summary";
 }
 
 async function main(): Promise<void> {
@@ -48,18 +52,20 @@ async function main(): Promise<void> {
   const options = await parseOptions(process.argv.slice(3));
   const session = await createCodingSession(options.workspace);
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
-  const aliases = commandAliases();
-  const allowedCommands = [...new Set([
-    "node",
-    "npm",
-    "npx",
-    "git",
-    options.verification.command,
-    ...options.allowedCommands,
-  ])];
+  const versions = new WorkspaceVersionLedger();
+  const agentAllowedCommands = options.restrictProcess
+    ? [...new Set(["node", ...options.allowedCommands])]
+    : [...new Set(["node", "npm", "npx", "git", options.verification.command, ...options.allowedCommands])];
   const processTool = new ProcessTool(workspace, {
-    allowedCommands,
-    commandAliases: aliases,
+    allowedCommands: agentAllowedCommands,
+    commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess),
+    deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-experimental-permission"] : [],
+    timeoutMs: 600_000,
+    maxOutputBytes: 2_000_000,
+  });
+  const verifierProcessTool = new ProcessTool(workspace, {
+    allowedCommands: [options.verification.command],
+    commandAliases: commandAliases(session.workspaceRoot, false),
     timeoutMs: 600_000,
     maxOutputBytes: 2_000_000,
   });
@@ -68,7 +74,9 @@ async function main(): Promise<void> {
   const scorecardFile = path.join(container, "scorecard.json");
   const journal = await FileJournal.open(journalFile);
   const model = createModel(options);
-  const verifiers: VerifierPort[] = [new CommandVerifier("required command", processTool, options.verification)];
+  const verifiers: VerifierPort[] = [
+    new CommandVerifier("required command", verifierProcessTool, options.verification, options.verifierEvidence),
+  ];
   if (options.protectedPaths.length > 0 || options.editableRoots.length > 0) {
     verifiers.push(new WorkspaceIntegrityVerifier({
       sourceRoot: session.sourceRoot,
@@ -82,9 +90,9 @@ async function main(): Promise<void> {
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
-      new ReadFileTool(workspace),
-      new WriteFileTool(workspace),
-      new ReplaceTextTool(workspace),
+      new ReadFileTool(workspace, 1_000_000, versions),
+      new WriteFileTool(workspace, versions),
+      new ReplaceTextTool(workspace, versions),
       processTool,
     ],
     verifiers,
@@ -94,6 +102,7 @@ async function main(): Promise<void> {
 
   const startedAt = Date.now();
   const outcome = await kernel.run(options.task);
+  const trajectory = analyzeTrajectory(await journal.readValidated());
   const scorecard = {
     version: 1,
     sessionId: session.id,
@@ -104,6 +113,7 @@ async function main(): Promise<void> {
     task: options.task,
     verification: options.verification,
     outcome,
+    trajectory,
     grade: {
       verified: outcome.status === "completed",
       score: outcome.status === "completed" ? 1 : 0,
@@ -164,6 +174,8 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     allowedCommands: values.get("--allow-command") ?? [],
     protectedPaths: values.get("--protect") ?? [],
     editableRoots: values.get("--editable-root") ?? [],
+    restrictProcess: parseBoolean(single(values, "--restrict-process") ?? "false", "--restrict-process"),
+    verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence") ?? "full"),
     maxSteps,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
   };
@@ -184,13 +196,30 @@ async function detectVerification(workspace: string): Promise<CommandSpec | unde
   return undefined;
 }
 
-function commandAliases(): Record<string, { executable: string; argsPrefix: string[] }> {
+function commandAliases(
+  workspaceRoot: string,
+  restricted: boolean,
+): Record<string, { executable: string; argsPrefix: string[] }> {
   const npmBin = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin");
+  const nodePrefix = restricted
+    ? ["--experimental-permission", `--allow-fs-read=${workspaceRoot}`, `--allow-fs-write=${workspaceRoot}`]
+    : [];
   return {
-    node: { executable: process.execPath, argsPrefix: [] },
+    node: { executable: process.execPath, argsPrefix: nodePrefix },
     npm: { executable: process.execPath, argsPrefix: [path.join(npmBin, "npm-cli.js")] },
     npx: { executable: process.execPath, argsPrefix: [path.join(npmBin, "npx-cli.js")] },
   };
+}
+
+function parseBoolean(value: string, name: string): boolean {
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${name} must be true or false.`);
+}
+
+function parseEvidenceMode(value: string): "full" | "summary" {
+  if (value === "full" || value === "summary") return value;
+  throw new Error("--verifier-evidence must be full or summary.");
 }
 
 async function exists(file: string): Promise<boolean> {
@@ -215,7 +244,7 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
 }
 
 main().catch((error: unknown) => {

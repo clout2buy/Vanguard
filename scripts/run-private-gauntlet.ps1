@@ -45,6 +45,8 @@ try {
       "--verify-command", "node",
       "--verify-arg", $Grader,
       "--verify-arg", ".",
+      "--restrict-process", "true",
+      "--verifier-evidence", "summary",
       "--max-steps", [string]$Case.maxSteps
     )
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
@@ -62,6 +64,10 @@ try {
         verified = $Scorecard.grade.verified
         steps = $Scorecard.grade.steps
         durationMs = $Scorecard.durationMs
+        toolFailures = $Scorecard.trajectory.toolFailures
+        verificationFailures = $Scorecard.trajectory.verificationFailures
+        completionClaims = $Scorecard.trajectory.completionClaims
+        policyBlocks = $Scorecard.trajectory.policyBlocks
         session = $Scorecard.workspaceRoot
         scorecard = $Scorecard.scorecardFile
         exitCode = $ExitCode
@@ -94,6 +100,13 @@ try {
     total = $Total
     score = if ($Total -eq 0) { 0 } else { $Passed / $Total }
     completedAt = (Get-Date).ToUniversalTime().ToString("o")
+    trajectory = [pscustomobject]@{
+      totalSteps = [int](($Results | Measure-Object -Property steps -Sum).Sum)
+      toolFailures = [int](($Results | Measure-Object -Property toolFailures -Sum).Sum)
+      verificationFailures = [int](($Results | Measure-Object -Property verificationFailures -Sum).Sum)
+      completionClaims = [int](($Results | Measure-Object -Property completionClaims -Sum).Sum)
+      policyBlocks = [int](($Results | Measure-Object -Property policyBlocks -Sum).Sum)
+    }
     cases = $Results
   }
   $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"

@@ -6,6 +6,7 @@ import { WorkspaceBoundary } from "./workspace.js";
 export interface ProcessToolOptions {
   readonly allowedCommands: readonly string[];
   readonly commandAliases?: Readonly<Record<string, { readonly executable: string; readonly argsPrefix: readonly string[] }>>;
+  readonly deniedArgumentPrefixes?: readonly string[];
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
 }
@@ -30,6 +31,7 @@ export class ProcessTool implements ToolPort {
   readonly #timeoutMs: number;
   readonly #maxOutputBytes: number;
   readonly #commandAliases: ReadonlyMap<string, { readonly executable: string; readonly argsPrefix: readonly string[] }>;
+  readonly #deniedArgumentPrefixes: readonly string[];
 
   constructor(
     private readonly workspace: WorkspaceBoundary,
@@ -39,6 +41,7 @@ export class ProcessTool implements ToolPort {
     this.#commandAliases = new Map(
       Object.entries(options.commandAliases ?? {}).map(([name, alias]) => [normalizeCommand(name), alias]),
     );
+    this.#deniedArgumentPrefixes = options.deniedArgumentPrefixes ?? [];
     this.#timeoutMs = options.timeoutMs ?? 120_000;
     this.#maxOutputBytes = options.maxOutputBytes ?? 1_000_000;
   }
@@ -50,6 +53,12 @@ export class ProcessTool implements ToolPort {
     const relativeCwd = optionalStringField(fields, "cwd") ?? ".";
     if (!this.#allowedCommands.has(normalizeCommand(command))) {
       return { ok: false, output: { error: "Command is not allowed.", command } };
+    }
+    const deniedArgument = args.find((argument) =>
+      this.#deniedArgumentPrefixes.some((prefix) => argument.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())),
+    );
+    if (deniedArgument !== undefined) {
+      return { ok: false, output: { error: "Argument is blocked by process policy.", argument: deniedArgument } };
     }
     const cwd = await this.workspace.existing(relativeCwd);
     const alias = this.#commandAliases.get(normalizeCommand(command));

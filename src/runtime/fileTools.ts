@@ -4,6 +4,7 @@ import path from "node:path";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
+import { WorkspaceVersionLedger } from "./versionLedger.js";
 
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
 
@@ -16,6 +17,7 @@ export class ReadFileTool implements ToolPort {
   constructor(
     private readonly workspace: WorkspaceBoundary,
     private readonly maxBytes = 1_000_000,
+    private readonly versions?: WorkspaceVersionLedger,
   ) {}
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
@@ -27,7 +29,9 @@ export class ReadFileTool implements ToolPort {
       return { ok: false, output: { error: "File exceeds read limit.", bytes: metadata.size } };
     }
     const contents = await readFile(file, "utf8");
-    return { ok: true, output: { path: relativePath, sha256: contentHash(contents), contents } };
+    const sha256 = contentHash(contents);
+    this.versions?.record(relativePath, sha256);
+    return { ok: true, output: { path: relativePath, sha256, contents } };
   }
 }
 
@@ -44,14 +48,23 @@ export class WriteFileTool implements ToolPort {
     ["path", "contents"],
   );
 
-  constructor(private readonly workspace: WorkspaceBoundary) {}
+  constructor(
+    private readonly workspace: WorkspaceBoundary,
+    private readonly versions?: WorkspaceVersionLedger,
+  ) {}
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
     const relativePath = stringField(fields, "path");
     const contents = stringField(fields, "contents");
     const destination = await this.workspace.writable(relativePath);
-    const expectedSha256 = fields.expectedSha256;
+    const suppliedSha256 = fields.expectedSha256;
+    if (suppliedSha256 !== undefined && suppliedSha256 !== null && typeof suppliedSha256 !== "string") {
+      throw new Error("Field 'expectedSha256' must be a string or null.");
+    }
+    const expectedSha256 = typeof suppliedSha256 === "string"
+      ? suppliedSha256
+      : this.versions?.get(relativePath);
     let existing: string | undefined;
     try {
       const existingPath = await this.workspace.existing(relativePath);
@@ -62,7 +75,7 @@ export class WriteFileTool implements ToolPort {
 
     if (existing !== undefined) {
       if (typeof expectedSha256 !== "string") {
-        return { ok: false, output: { error: "Overwriting a file requires expectedSha256." } };
+        return { ok: false, output: { error: "Overwriting a file requires expectedSha256 or a current read lease." } };
       }
       const actualSha256 = contentHash(existing);
       if (actualSha256 !== expectedSha256) {
@@ -73,6 +86,7 @@ export class WriteFileTool implements ToolPort {
     }
 
     await atomicWrite(destination, contents);
+    this.versions?.record(relativePath, contentHash(contents));
     return {
       ok: true,
       output: { path: relativePath, bytes: Buffer.byteLength(contents), sha256: contentHash(contents) },
@@ -91,15 +105,22 @@ export class ReplaceTextTool implements ToolPort {
       before: { type: "string", description: "Exact unique text to replace." },
       after: { type: "string", description: "Replacement text." },
     },
-    ["path", "expectedSha256", "before", "after"],
+    ["path", "before", "after"],
   );
 
-  constructor(private readonly workspace: WorkspaceBoundary) {}
+  constructor(
+    private readonly workspace: WorkspaceBoundary,
+    private readonly versions?: WorkspaceVersionLedger,
+  ) {}
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
     const relativePath = stringField(fields, "path");
-    const expectedSha256 = stringField(fields, "expectedSha256");
+    const suppliedSha256 = fields.expectedSha256;
+    if (suppliedSha256 !== undefined && typeof suppliedSha256 !== "string") {
+      throw new Error("Field 'expectedSha256' must be a string.");
+    }
+    const expectedSha256 = suppliedSha256 ?? this.versions?.get(relativePath);
     const before = stringField(fields, "before");
     const after = stringField(fields, "after");
     if (before.length === 0) return { ok: false, output: { error: "Replacement target cannot be empty." } };
@@ -107,6 +128,9 @@ export class ReplaceTextTool implements ToolPort {
     const file = await this.workspace.existing(relativePath);
     const contents = await readFile(file, "utf8");
     const actualSha256 = contentHash(contents);
+    if (expectedSha256 === undefined) {
+      return { ok: false, output: { error: "Replacement requires expectedSha256 or a current read lease." } };
+    }
     if (actualSha256 !== expectedSha256) {
       return { ok: false, output: { error: "File changed since it was read.", actualSha256 } };
     }
@@ -117,6 +141,7 @@ export class ReplaceTextTool implements ToolPort {
     }
     const updated = contents.replace(before, after);
     await atomicWrite(this.workspace.lexical(relativePath), updated);
+    this.versions?.record(relativePath, contentHash(updated));
     return {
       ok: true,
       output: { path: relativePath, replacements: 1, sha256: contentHash(updated) },
