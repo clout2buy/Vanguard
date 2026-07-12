@@ -19,7 +19,14 @@ $CredentialVariable = switch ($Provider) {
   "deepseek" { "DEEPSEEK_API_KEY" }
 }
 if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($CredentialVariable, "Process"))) {
-  throw "Missing $CredentialVariable. Set `$env:$CredentialVariable in this PowerShell session before running the gauntlet. No benchmark cases were started."
+  $PersistentCredential = [Environment]::GetEnvironmentVariable($CredentialVariable, "User")
+  if (-not [string]::IsNullOrWhiteSpace($PersistentCredential)) {
+    [Environment]::SetEnvironmentVariable($CredentialVariable, $PersistentCredential, "Process")
+    $PersistentCredential = $null
+  }
+}
+if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($CredentialVariable, "Process"))) {
+  throw "Missing $CredentialVariable. Set it in the current process or persistent Windows user environment. No benchmark cases were started."
 }
 $Root = Split-Path -Parent $PSScriptRoot
 $CasesRoot = Join-Path $Root "gauntlet\cases"
