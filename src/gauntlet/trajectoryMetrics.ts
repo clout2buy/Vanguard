@@ -4,6 +4,8 @@ export interface TrajectoryMetrics {
   readonly modelDecisions: number;
   readonly toolCalls: number;
   readonly toolFailures: number;
+  readonly localTestFailures: number;
+  readonly toolFrictionFailures: number;
   readonly completionClaims: number;
   readonly verificationAttempts: number;
   readonly verificationFailures: number;
@@ -15,11 +17,14 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   let modelDecisions = 0;
   let toolCalls = 0;
   let toolFailures = 0;
+  let localTestFailures = 0;
+  let toolFrictionFailures = 0;
   let completionClaims = 0;
   let verificationAttempts = 0;
   let verificationFailures = 0;
   let policyBlocks = 0;
   const toolCallsByName: Record<string, number> = {};
+  let pendingToolName: string | undefined;
 
   for (const event of events) {
     const data = record(event.data);
@@ -28,14 +33,23 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       if (data?.kind === "tool") {
         toolCalls += 1;
         const call = record(data.call);
-        if (typeof call?.name === "string") toolCallsByName[call.name] = (toolCallsByName[call.name] ?? 0) + 1;
+        if (typeof call?.name === "string") {
+          pendingToolName = call.name;
+          toolCallsByName[call.name] = (toolCallsByName[call.name] ?? 0) + 1;
+        }
       }
       if (data?.kind === "complete") completionClaims += 1;
     }
     if (event.type === "tool.failed") {
       toolFailures += 1;
-      if (JSON.stringify(event.data).toLocaleLowerCase().includes("process policy")) policyBlocks += 1;
+      const serialized = JSON.stringify(event.data).toLocaleLowerCase();
+      const output = record(data?.output);
+      const isLocalTestFailure = pendingToolName === "process.run" && typeof output?.exitCode === "number";
+      if (isLocalTestFailure) localTestFailures += 1;
+      else toolFrictionFailures += 1;
+      if (serialized.includes("process policy") || serialized.includes("evidence policy")) policyBlocks += 1;
     }
+    if (event.type === "tool.completed" || event.type === "tool.failed") pendingToolName = undefined;
     if (event.type === "verification.completed") {
       verificationAttempts += 1;
       if (data?.passed === false) verificationFailures += 1;
@@ -46,6 +60,8 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     modelDecisions,
     toolCalls,
     toolFailures,
+    localTestFailures,
+    toolFrictionFailures,
     completionClaims,
     verificationAttempts,
     verificationFailures,

@@ -16,6 +16,13 @@ Live results are retained with an audit status. A passing verifier is necessary 
 - Core response: non-failing console assertions are blocked in restricted runs, completion after a mutation requires fresh successful execution evidence, and provider guidance requires throwing assertions plus adversarial patch review.
 - Long-horizon replay check: evidence compaction reduced the interrupted run's selected transcript from 643,931 bytes to 141,199 bytes (78.1%) while preserving the two most recent tool exchanges in full.
 
+## 2026-07-11 — atomic-ledger v2 live pass
+
+- Valid v2 pass: 12 steps, 204.7 seconds, one completion claim, zero verifier failures, and both behavioral and integrity verification passed.
+- The single failed tool was a throwing local test that discovered an actual self-transfer defect before completion. Vanguard repaired it, reran its tests, and reached the sealed grader only after the correction.
+- Aggregate schema v2 scored this run `0.90` because it treated all failed tool exits and an extra corrective edit as waste. That interpretation was wrong: test-driven defect discovery should be rewarded, not suppressed.
+- Schema v3 separates productive local test failures from tool friction. This trajectory rescored under v3 receives execution quality `1.0`, with `large-patch-expansion` retained as a human-review flag for the 7.6× line expansion.
+
 ## 2026-07-11 — public repair-cart preview
 
 - Provider/model: DeepSeek `deepseek-v4-pro`

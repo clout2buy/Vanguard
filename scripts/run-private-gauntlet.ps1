@@ -71,6 +71,8 @@ try {
         steps = $Scorecard.grade.steps
         durationMs = $Scorecard.durationMs
         toolFailures = $Scorecard.trajectory.toolFailures
+        localTestFailures = $Scorecard.trajectory.localTestFailures
+        toolFrictionFailures = $Scorecard.trajectory.toolFrictionFailures
         verificationFailures = $Scorecard.trajectory.verificationFailures
         completionClaims = $Scorecard.trajectory.completionClaims
         policyBlocks = $Scorecard.trajectory.policyBlocks
@@ -96,6 +98,8 @@ try {
         steps = 0
         durationMs = 0
         toolFailures = 0
+        localTestFailures = 0
+        toolFrictionFailures = 0
         verificationFailures = 0
         completionClaims = 0
         policyBlocks = 0
@@ -121,7 +125,7 @@ try {
   }
   $Passed = @($Results | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 2
+    version = 3
     provider = $Provider
     model = $Model
     passed = $Passed
@@ -134,6 +138,8 @@ try {
     trajectory = [pscustomobject]@{
       totalSteps = [int](($Results | Measure-Object -Property steps -Sum).Sum)
       toolFailures = [int](($Results | Measure-Object -Property toolFailures -Sum).Sum)
+      localTestFailures = [int](($Results | Measure-Object -Property localTestFailures -Sum).Sum)
+      toolFrictionFailures = [int](($Results | Measure-Object -Property toolFrictionFailures -Sum).Sum)
       verificationFailures = [int](($Results | Measure-Object -Property verificationFailures -Sum).Sum)
       completionClaims = [int](($Results | Measure-Object -Property completionClaims -Sum).Sum)
       policyBlocks = [int](($Results | Measure-Object -Property policyBlocks -Sum).Sum)

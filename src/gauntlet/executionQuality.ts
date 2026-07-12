@@ -5,11 +5,13 @@ export interface ExecutionQuality {
   readonly score: number;
   readonly cleanFirstPass: boolean;
   readonly patchExpansionRatio: number | null;
+  readonly productiveTestFailures: number;
+  readonly writeIterations: number;
+  readonly reviewFlags: readonly string[];
   readonly penalties: {
-    readonly toolFailures: number;
+    readonly toolFriction: number;
     readonly verificationFailures: number;
     readonly repeatedCompletionClaims: number;
-    readonly excessWrites: number;
   };
 }
 
@@ -22,19 +24,27 @@ export function scoreExecutionQuality(
     + (trajectory.toolCallsByName["workspace.replace"] ?? 0);
   const changedFiles = patch.changedFiles.length;
   const penalties = {
-    toolFailures: Math.min(0.32, trajectory.toolFailures * 0.08),
+    toolFriction: Math.min(0.32, trajectory.toolFrictionFailures * 0.08),
     verificationFailures: Math.min(0.36, trajectory.verificationFailures * 0.12),
     repeatedCompletionClaims: Math.min(0.16, Math.max(0, trajectory.completionClaims - 1) * 0.04),
-    excessWrites: Math.min(0.16, Math.max(0, writes - changedFiles) * 0.02),
   };
   const totalPenalty = Object.values(penalties).reduce((sum, value) => sum + value, 0);
+  const patchExpansionRatio = patch.beforeLines === 0 ? null : round(patch.afterLines / patch.beforeLines);
+  const reviewFlags: string[] = [];
+  if (patch.beforeLines >= 10 && patchExpansionRatio !== null && patchExpansionRatio > 4) {
+    reviewFlags.push("large-patch-expansion");
+  }
+  if (changedFiles > 0 && writes > changedFiles * 4) reviewFlags.push("high-edit-churn");
   return {
     score: verified ? round(Math.max(0, 1 - totalPenalty)) : 0,
     cleanFirstPass: verified
-      && trajectory.toolFailures === 0
+      && trajectory.toolFrictionFailures === 0
       && trajectory.verificationFailures === 0
       && trajectory.completionClaims === 1,
-    patchExpansionRatio: patch.beforeLines === 0 ? null : round(patch.afterLines / patch.beforeLines),
+    patchExpansionRatio,
+    productiveTestFailures: trajectory.localTestFailures,
+    writeIterations: writes,
+    reviewFlags,
     penalties,
   };
 }

@@ -18,10 +18,25 @@ test("trajectory metrics distinguish clean completion from recovery and policy f
     modelDecisions: 4,
     toolCalls: 2,
     toolFailures: 1,
+    localTestFailures: 0,
+    toolFrictionFailures: 1,
     completionClaims: 2,
     verificationAttempts: 2,
     verificationFailures: 1,
     policyBlocks: 1,
     toolCallsByName: { "workspace.read": 1, "process.run": 1 },
   });
+});
+
+test("trajectory metrics treat a non-zero local test exit as productive evidence", () => {
+  const events: RunEvent[] = [
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "process.run" } } },
+    { sequence: 2, type: "tool.failed", data: { ok: false, output: { exitCode: 1, stderr: "assertion" } } },
+    { sequence: 3, type: "model.decided", data: { kind: "tool", call: { name: "workspace.replace" } } },
+    { sequence: 4, type: "tool.completed", data: { ok: true } },
+  ];
+  const metrics = analyzeTrajectory(events);
+  assert.equal(metrics.toolFailures, 1);
+  assert.equal(metrics.localTestFailures, 1);
+  assert.equal(metrics.toolFrictionFailures, 0);
 });
