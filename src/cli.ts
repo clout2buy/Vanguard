@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
+import type { VerifierPort } from "./kernel/contracts.js";
 import {
   AgentKernel,
   CommandVerifier,
@@ -12,6 +13,7 @@ import {
   ReplaceTextTool,
   SearchTextTool,
   WorkspaceBoundary,
+  WorkspaceIntegrityVerifier,
   WriteFileTool,
   createAnthropicModel,
   createCodingSession,
@@ -33,6 +35,8 @@ interface CliOptions {
   readonly verification: CommandSpec;
   readonly allowedCommands: readonly string[];
   readonly maxSteps: number;
+  readonly protectedPaths: readonly string[];
+  readonly editableRoots: readonly string[];
 }
 
 async function main(): Promise<void> {
@@ -64,6 +68,15 @@ async function main(): Promise<void> {
   const scorecardFile = path.join(container, "scorecard.json");
   const journal = await FileJournal.open(journalFile);
   const model = createModel(options);
+  const verifiers: VerifierPort[] = [new CommandVerifier("required command", processTool, options.verification)];
+  if (options.protectedPaths.length > 0 || options.editableRoots.length > 0) {
+    verifiers.push(new WorkspaceIntegrityVerifier({
+      sourceRoot: session.sourceRoot,
+      workspaceRoot: session.workspaceRoot,
+      protectedPaths: options.protectedPaths,
+      editableRoots: options.editableRoots,
+    }));
+  }
   const kernel = new AgentKernel({
     model,
     tools: [
@@ -74,7 +87,7 @@ async function main(): Promise<void> {
       new ReplaceTextTool(workspace),
       processTool,
     ],
-    verifiers: [new CommandVerifier("required command", processTool, options.verification)],
+    verifiers,
     journal,
     options: { maxSteps: options.maxSteps, maxContextBytes: 2_000_000, maxRepeatedAction: 3 },
   });
@@ -149,6 +162,8 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     model,
     verification,
     allowedCommands: values.get("--allow-command") ?? [],
+    protectedPaths: values.get("--protect") ?? [],
+    editableRoots: values.get("--editable-root") ?? [],
     maxSteps,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
   };
@@ -200,7 +215,7 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
 }
 
 main().catch((error: unknown) => {

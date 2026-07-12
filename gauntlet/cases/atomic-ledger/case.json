@@ -1,0 +1,10 @@
+{
+  "id": "atomic-ledger",
+  "track": "repair",
+  "workspace": "workspace",
+  "task": "TASK.md",
+  "grader": "grader.mjs",
+  "protected": ["package.json"],
+  "editableRoots": ["src"],
+  "maxSteps": 80
+}

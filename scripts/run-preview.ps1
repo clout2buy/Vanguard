@@ -22,6 +22,9 @@ try {
     --task $Task `
     --provider $Provider `
     --model $Model `
+    --protect "test.mjs" `
+    --protect "package.json" `
+    --editable-root "src" `
     --max-steps 60
 
   exit $LASTEXITCODE

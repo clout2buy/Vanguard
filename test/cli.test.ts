@@ -59,14 +59,17 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
       "--model", "mock",
       "--endpoint", `http://127.0.0.1:${address.port}`,
       "--max-steps", "10",
+      "--protect", "package.json",
+      "--editable-root", "answer.mjs",
     ], { maxBuffer: 5_000_000 });
     const scorecard = JSON.parse(stdout) as {
-      outcome: { status: string };
+      outcome: { status: string; verification?: unknown[] };
       workspaceRoot: string;
       scorecardFile: string;
     };
     isolatedRoot = path.dirname(scorecard.workspaceRoot);
     assert.equal(scorecard.outcome.status, "completed");
+    assert.equal(scorecard.outcome.verification?.length, 2);
     assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
     assert.equal(JSON.parse(await readFile(scorecard.scorecardFile, "utf8")).outcome.status, "completed");

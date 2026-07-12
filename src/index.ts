@@ -7,6 +7,7 @@ export * from "./inference/httpModel.js";
 export * from "./inference/providerCodecs.js";
 export * from "./runtime/commandVerifier.js";
 export * from "./runtime/fileTools.js";
+export * from "./runtime/integrityVerifier.js";
 export * from "./runtime/processTool.js";
 export * from "./runtime/session.js";
 export * from "./runtime/workspace.js";

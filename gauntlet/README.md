@@ -22,3 +22,14 @@ The gauntlet is an evaluation product, not a demo folder. Tasks remain separate 
 
 The next implementation milestone is the gauntlet runner and the first corpus derived from sanitized Ares failures—not from proprietary competitor code.
 
+## Private sealed suite
+
+The initial sealed suite contains three independent tracks. Each case exposes only its behavioral task and starter workspace. Its grader remains outside the disposable agent workspace, while the integrity verifier protects manifests and restricts edits to declared source roots.
+
+Run all cases with:
+
+```powershell
+.\scripts\run-private-gauntlet.ps1 -Provider deepseek -Model deepseek-v4-pro
+```
+
+The runner writes per-case scorecards plus a versioned aggregate under `gauntlet/results/`. A case scores only when both its sealed behavioral grader and workspace-integrity verifier pass.

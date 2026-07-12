@@ -1,0 +1,83 @@
+import { createHash } from "node:crypto";
+import { readdir, readFile, realpath } from "node:fs/promises";
+import path from "node:path";
+import type { JsonValue, VerificationResult, VerifierPort } from "../kernel/contracts.js";
+
+export interface IntegrityVerifierOptions {
+  readonly sourceRoot: string;
+  readonly workspaceRoot: string;
+  readonly protectedPaths?: readonly string[];
+  readonly editableRoots?: readonly string[];
+}
+
+const IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
+
+export class WorkspaceIntegrityVerifier implements VerifierPort {
+  readonly name = "workspace integrity";
+  readonly #sourceRoot: string;
+  readonly #workspaceRoot: string;
+  readonly #protectedPaths: ReadonlySet<string>;
+  readonly #editableRoots: readonly string[];
+
+  constructor(options: IntegrityVerifierOptions) {
+    this.#sourceRoot = path.resolve(options.sourceRoot);
+    this.#workspaceRoot = path.resolve(options.workspaceRoot);
+    this.#protectedPaths = new Set((options.protectedPaths ?? []).map(normalizeRelative));
+    this.#editableRoots = (options.editableRoots ?? []).map(normalizeRelative);
+  }
+
+  async verify(_candidate: string, _task: string): Promise<VerificationResult> {
+    const [source, workspace] = await Promise.all([
+      snapshot(this.#sourceRoot),
+      snapshot(this.#workspaceRoot),
+    ]);
+    const allPaths = new Set([...source.keys(), ...workspace.keys()]);
+    const changedPaths = [...allPaths]
+      .filter((file) => source.get(file) !== workspace.get(file))
+      .sort();
+    const protectedViolations = changedPaths.filter((file) => this.#protectedPaths.has(file));
+    const scopeViolations = this.#editableRoots.length === 0
+      ? []
+      : changedPaths.filter((file) => !this.#editableRoots.some((root) => file === root || file.startsWith(`${root}/`)));
+    const evidence: JsonValue = { changedPaths, protectedViolations, scopeViolations };
+    return {
+      verifier: this.name,
+      passed: protectedViolations.length === 0 && scopeViolations.length === 0,
+      evidence,
+    };
+  }
+}
+
+async function snapshot(root: string): Promise<Map<string, string>> {
+  const resolvedRoot = await realpath(root);
+  const result = new Map<string, string>();
+  const queue = [resolvedRoot];
+  while (queue.length > 0) {
+    const directory = queue.shift();
+    if (directory === undefined) break;
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      const relative = normalizeRelative(path.relative(resolvedRoot, absolute));
+      if (entry.isDirectory()) {
+        if (!IGNORED_DIRECTORIES.has(entry.name)) queue.push(absolute);
+        continue;
+      }
+      if (entry.isSymbolicLink()) {
+        result.set(relative, "symbolic-link");
+        continue;
+      }
+      if (entry.isFile()) {
+        result.set(relative, createHash("sha256").update(await readFile(absolute)).digest("hex"));
+      }
+    }
+  }
+  return result;
+}
+
+function normalizeRelative(relative: string): string {
+  const normalized = relative.replaceAll("\\", "/").replace(/^\.\//u, "").replace(/\/$/u, "");
+  if (normalized.length === 0 || normalized === ".." || normalized.startsWith("../") || path.isAbsolute(normalized)) {
+    throw new Error(`Integrity path must be a non-empty relative path: ${relative}`);
+  }
+  return normalized;
+}

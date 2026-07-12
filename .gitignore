@@ -3,4 +3,4 @@ dist/
 coverage/
 .env
 .vanguard/
-
+gauntlet/results/
