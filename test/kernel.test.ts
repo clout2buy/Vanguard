@@ -1,0 +1,106 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import type { ModelDecision, ModelPort, ModelRequest, ToolDefinition, ToolPort, VerifierPort } from "../src/index.js";
+import { AgentKernel, MemoryJournal } from "../src/index.js";
+
+class ScriptedModel implements ModelPort {
+  #index = 0;
+  constructor(private readonly decisions: readonly ModelDecision[]) {}
+
+  async decide(_request: ModelRequest): Promise<ModelDecision> {
+    const decision = this.decisions[this.#index];
+    this.#index += 1;
+    if (decision === undefined) throw new Error("Script exhausted");
+    return decision;
+  }
+}
+
+const passingVerifier: VerifierPort = {
+  name: "tests",
+  async verify() {
+    return { verifier: "tests", passed: true, evidence: "all tests passed" };
+  },
+};
+
+const toolDefinition = (name: string): ToolDefinition => ({
+  name,
+  description: `${name} test tool`,
+  inputSchema: { type: "object" },
+});
+
+test("requires independent verification before completion", async () => {
+  let attempt = 0;
+  const verifier: VerifierPort = {
+    name: "tests",
+    async verify() {
+      attempt += 1;
+      return { verifier: "tests", passed: attempt > 1, evidence: `attempt ${attempt}` };
+    },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "complete", answer: "first claim" },
+      { kind: "complete", answer: "corrected claim" },
+    ]),
+    tools: [],
+    verifiers: [verifier],
+    journal,
+  });
+
+  const outcome = await kernel.run("fix the project");
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "corrected claim");
+  assert.equal(journal.events.filter((event) => event.type === "verification.completed").length, 2);
+});
+
+test("opens the circuit breaker on an identical repeated failure", async () => {
+  const failingTool: ToolPort = {
+    name: "shell",
+    definition: toolDefinition("shell"),
+    async execute() {
+      return { ok: false, output: "command failed" };
+    },
+  };
+  const repeatedCall: ModelDecision = {
+    kind: "tool",
+    call: { id: "call", name: "shell", input: { command: "bad" } },
+  };
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([repeatedCall, repeatedCall]),
+    tools: [failingTool],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { maxRepeatedAction: 2 },
+  });
+
+  const outcome = await kernel.run("do not loop forever");
+  assert.deepEqual(outcome, {
+    status: "failed",
+    reason: "Circuit breaker opened for shell.",
+    steps: 2,
+  });
+});
+
+test("executes a successful tool action and completes", async () => {
+  const tool: ToolPort = {
+    name: "read",
+    definition: toolDefinition("read"),
+    async execute(input) {
+      return { ok: true, output: { input, contents: "evidence" } };
+    },
+  };
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tool", call: { id: "one", name: "read", input: { path: "README.md" } } },
+      { kind: "complete", answer: "verified result" },
+    ]),
+    tools: [tool],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  });
+
+  const outcome = await kernel.run("inspect then answer");
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.steps, 2);
+});
