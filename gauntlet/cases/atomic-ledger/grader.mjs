@@ -36,4 +36,20 @@ for (const bad of [
 }
 assert.throws(() => applyTransactions([], []));
 assert.throws(() => applyTransactions({}, null));
+for (const balance of [-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+  assert.throws(() => applyTransactions({ alice: balance }, []));
+}
+assert.throws(() => applyTransactions(
+  { alice: 1 },
+  [{ type: "transfer", from: "toString", to: "alice", amount: 1 }],
+));
+assert.throws(() => applyTransactions({ alice: 1 }, [{ type: "deposit", account: "alice", amount: Number.MAX_SAFE_INTEGER + 1 }]));
+assert.throws(() => applyTransactions(
+  { alice: Number.MAX_SAFE_INTEGER },
+  [{ type: "deposit", account: "alice", amount: 1 }],
+));
+assert.throws(() => applyTransactions(
+  { alice: 1, bob: Number.MAX_SAFE_INTEGER },
+  [{ type: "transfer", from: "alice", to: "bob", amount: 1 }],
+));
 console.log("atomic-ledger: sealed grader passed");

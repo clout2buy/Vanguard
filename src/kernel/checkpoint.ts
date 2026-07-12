@@ -46,6 +46,7 @@ export class CheckpointTool implements ToolPort {
       required: ["summary", "completed", "next", "evidence", "risks"],
       additionalProperties: false,
     },
+    effect: "state",
   };
 
   constructor(private readonly ledger: RunCheckpointLedger) {}

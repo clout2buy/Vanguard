@@ -168,6 +168,24 @@ test("process tool enforces its command allowlist", async () => {
   }
 });
 
+test("process evidence policy rejects non-failing console assertions", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-process-evidence-"));
+  try {
+    const tool = new ProcessTool(new WorkspaceBoundary(root), {
+      allowedCommands: [process.execPath],
+      deniedArgumentSubstrings: ["console.assert"],
+    });
+    const result = await tool.execute({
+      command: process.execPath,
+      args: ["--eval", "console.assert(false); console.log('looks green')"],
+    }, context);
+    assert.equal(result.ok, false);
+    assert.match(JSON.stringify(result.output), /assertion library that throws/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("process tool resolves safe public command aliases without a shell", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-alias-"));
   try {

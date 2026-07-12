@@ -24,6 +24,7 @@ import {
   createOpenAIModel,
   analyzeTrajectory,
   analyzePatch,
+  scoreExecutionQuality,
 } from "./index.js";
 
 interface CommandSpec {
@@ -66,6 +67,7 @@ async function main(): Promise<void> {
     allowedCommands: agentAllowedCommands,
     commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess),
     deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-experimental-permission"] : [],
+    deniedArgumentSubstrings: options.restrictProcess ? ["console.assert"] : [],
     timeoutMs: 600_000,
     maxOutputBytes: 2_000_000,
   });
@@ -120,6 +122,8 @@ async function main(): Promise<void> {
   const outcome = await kernel.run(options.task, controller.signal).finally(() => clearTimeout(durationTimer));
   const trajectory = analyzeTrajectory(await fileJournal.readValidated());
   const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
+  const verified = outcome.status === "completed";
+  const executionQuality = scoreExecutionQuality(verified, trajectory, patch);
   const scorecard = {
     version: 1,
     sessionId: session.id,
@@ -133,8 +137,9 @@ async function main(): Promise<void> {
     trajectory,
     patch,
     grade: {
-      verified: outcome.status === "completed",
-      score: outcome.status === "completed" ? 1 : 0,
+      verified,
+      score: verified ? 1 : 0,
+      executionQuality,
       steps: outcome.steps,
     },
     durationMs: Date.now() - startedAt,

@@ -46,6 +46,10 @@ Run one or more selected cases without paying to repeat completed work:
 .\scripts\run-private-gauntlet.ps1 -Provider deepseek -Model deepseek-v4-pro -CaseId atomic-ledger
 ```
 
-The runner writes per-case scorecards plus a versioned aggregate under `gauntlet/results/`. A case scores only when both its sealed behavioral grader and workspace-integrity verifier pass. Scorecards retain trajectory quality (tool failures, failed verification attempts, policy blocks, and completion claims) and patch scope (changed files and line totals) so a green result can still be audited for wasteful or suspicious behavior.
+The runner writes per-case scorecards plus a versioned aggregate under `gauntlet/results/`. A case scores only when both its sealed behavioral grader and workspace-integrity verifier pass. Scorecards retain trajectory quality (tool failures, failed verification attempts, policy blocks, completion claims, and a transparent execution-quality score) and patch scope (changed files, line totals, and expansion ratio) so a green result can still be audited for wasteful or suspicious behavior. Execution quality measures run hygiene; it never overrides behavioral correctness.
 
 The runner validates the selected provider credential before creating sessions. Authentication and other pre-inference failures are infrastructure errors, not benchmark failures, and must never be recorded as a zero capability score.
+
+## Execution-quality score
+
+Correctness remains binary and exclusively grader-owned. For verified runs, execution quality begins at `1.0` and applies bounded, visible penalties for tool failures (`0.08` each), failed verifier claims (`0.12` each), repeated completion claims (`0.04` each after the first), and writes beyond the number of changed files (`0.02` each). This score measures trajectory hygiene, not code style, and a failed behavioral grader always yields zero.

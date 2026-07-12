@@ -8,6 +8,14 @@ Live results are retained with an audit status. A passing verifier is necessary 
 - `atomic-ledger`: invalid benchmark result; interrupted after 63 model turns and three failed verifier claims. The sealed grader required rejecting an array-valued `initialBalances`, but the public task did not state that input contract. With summarized verifier evidence, the model could not identify the hidden requirement and began speculative rewrites.
 - Corrective action: the public contract now states the graded input types. Vanguard now rejects no-op writes, stops after three failed completion claims, enforces a 10-minute per-case wall-clock budget in the private runner, streams turn-level progress, and supports targeted case reruns.
 
+## 2026-07-11 — corrected atomic-ledger pass and quality audit
+
+- Valid trajectory pass: 12 steps, 104.9 seconds, zero tool failures, one completion claim, and both verifiers passed.
+- Post-pass code audit found that `account in balances` accepted inherited properties and that inline checks used `console.assert`, which can report assertion failures without a non-zero process exit. The result remains a valid v1 behavioral pass but is not accepted as elite implementation quality.
+- Atomic-ledger is now case version 2. Its public contract and sealed grader cover own-property account identity, safe-integer starting balances and amounts, and arithmetic overflow. The v2 grader correctly rejects the previously passing patch.
+- Core response: non-failing console assertions are blocked in restricted runs, completion after a mutation requires fresh successful execution evidence, and provider guidance requires throwing assertions plus adversarial patch review.
+- Long-horizon replay check: evidence compaction reduced the interrupted run's selected transcript from 643,931 bytes to 141,199 bytes (78.1%) while preserving the two most recent tool exchanges in full.
+
 ## 2026-07-11 — public repair-cart preview
 
 - Provider/model: DeepSeek `deepseek-v4-pro`

@@ -1,5 +1,6 @@
 {
   "id": "atomic-ledger",
+  "version": 2,
   "track": "repair",
   "workspace": "workspace",
   "task": "TASK.md",

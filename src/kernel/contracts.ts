@@ -49,6 +49,7 @@ export interface ToolDefinition {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: JsonValue;
+  readonly effect?: "observe" | "mutate" | "execute" | "state";
 }
 
 export interface ToolPort {

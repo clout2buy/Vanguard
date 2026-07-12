@@ -87,6 +87,7 @@ export class AgentKernel {
     const transcript: TranscriptEntry[] = [{ role: "task", content: task }];
     const actionFailures = new Map<string, number>();
     let failedVerificationAttempts = 0;
+    let mutationNeedsExecutionEvidence = false;
     await this.#record("run.started", { task });
 
     for (let step = 1; step <= this.#options.maxSteps; step += 1) {
@@ -113,6 +114,23 @@ export class AgentKernel {
       transcript.push({ role: "decision", content: decision as unknown as JsonValue });
 
       if (decision.kind === "complete") {
+        if (mutationNeedsExecutionEvidence) {
+          const evidence: VerificationResult = {
+            verifier: "completion evidence policy",
+            passed: false,
+            evidence: "Run a successful executable check after the latest workspace mutation before completing.",
+          };
+          await this.#record("verification.completed", evidence as unknown as JsonValue);
+          transcript.push({ role: "verification", content: evidence as unknown as JsonValue });
+          failedVerificationAttempts += 1;
+          if (failedVerificationAttempts >= this.#options.maxFailedVerificationAttempts) {
+            return this.#fail(
+              `Verification failure budget exhausted after ${failedVerificationAttempts} failed completion claims.`,
+              step,
+            );
+          }
+          continue;
+        }
         const verification = await Promise.all(
           this.#verifiers.map((verifier) => verifier.verify(decision.answer, task)),
         );
@@ -163,6 +181,8 @@ export class AgentKernel {
           }
         } else {
           actionFailures.delete(fingerprint);
+          if (tool.definition.effect === "mutate") mutationNeedsExecutionEvidence = true;
+          if (tool.definition.effect === "execute") mutationNeedsExecutionEvidence = false;
         }
       } catch (error) {
         const count = (actionFailures.get(fingerprint) ?? 0) + 1;

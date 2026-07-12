@@ -66,6 +66,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     ], { maxBuffer: 5_000_000 });
     const scorecard = JSON.parse(stdout) as {
       outcome: { status: string; verification?: unknown[] };
+      grade: { executionQuality: { score: number; cleanFirstPass: boolean } };
       patch: { changedFiles: string[]; filesModified: number };
       workspaceRoot: string;
       scorecardFile: string;
@@ -75,6 +76,8 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     assert.equal(scorecard.outcome.verification?.length, 2);
     assert.deepEqual(scorecard.patch.changedFiles, ["answer.mjs"]);
     assert.equal(scorecard.patch.filesModified, 1);
+    assert.equal(scorecard.grade.executionQuality.cleanFirstPass, true);
+    assert.equal(scorecard.grade.executionQuality.score, 1);
     assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
     assert.equal(JSON.parse(await readFile(scorecard.scorecardFile, "utf8")).outcome.status, "completed");

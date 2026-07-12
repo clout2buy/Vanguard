@@ -17,18 +17,23 @@ const cases = [
   if (!Array.isArray(transactions)) throw new Error("transactions must be an array");
   const balances = { ...initialBalances };
   for (const [account, balance] of Object.entries(balances)) {
-    if (!account || !Number.isInteger(balance) || balance < 0) throw new Error("invalid initial balance");
+    if (!account || !Number.isSafeInteger(balance) || balance < 0) throw new Error("invalid initial balance");
   }
   const requireAccount = (account) => {
     if (typeof account !== "string" || !Object.hasOwn(balances, account)) throw new Error("unknown account");
   };
+  const add = (left, right) => {
+    const result = left + right;
+    if (!Number.isSafeInteger(result)) throw new Error("balance overflow");
+    return result;
+  };
   for (const transaction of transactions) {
     if (transaction === null || typeof transaction !== "object") throw new Error("malformed transaction");
     const { type, amount } = transaction;
-    if (!Number.isInteger(amount) || amount <= 0) throw new Error("amount must be positive integer cents");
+    if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error("amount must be positive safe-integer cents");
     if (type === "deposit") {
       requireAccount(transaction.account);
-      balances[transaction.account] += amount;
+      balances[transaction.account] = add(balances[transaction.account], amount);
     } else if (type === "withdraw") {
       requireAccount(transaction.account);
       if (balances[transaction.account] < amount) throw new Error("insufficient funds");
@@ -37,8 +42,9 @@ const cases = [
       requireAccount(transaction.from);
       requireAccount(transaction.to);
       if (balances[transaction.from] < amount) throw new Error("insufficient funds");
+      const destination = add(balances[transaction.to], amount);
       balances[transaction.from] -= amount;
-      balances[transaction.to] += amount;
+      balances[transaction.to] = destination;
     } else {
       throw new Error("unknown transaction type");
     }
@@ -126,6 +132,25 @@ test("atomic-ledger public task states the input types enforced by its sealed gr
   const task = await readFile(path.resolve("gauntlet", "cases", "atomic-ledger", "TASK.md"), "utf8");
   assert.match(task, /initialBalances.*non-null.*non-array object/i);
   assert.match(task, /transactions.*array/i);
+});
+
+test("atomic-ledger grader rejects inherited-property account lookup mutant", async () => {
+  const caseDefinition = cases[0];
+  const caseRoot = path.resolve("gauntlet", "cases", caseDefinition.id);
+  const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-atomic-ledger-mutant-"));
+  const workspace = path.join(container, "workspace");
+  try {
+    await cp(path.join(caseRoot, "workspace"), workspace, { recursive: true });
+    const mutant = caseDefinition.solution.replace(
+      "!Object.hasOwn(balances, account)",
+      "!(account in balances)",
+    );
+    assert.notEqual(mutant, caseDefinition.solution);
+    await writeFile(path.join(workspace, caseDefinition.sourceFile), mutant);
+    await assert.rejects(() => executeFile(process.execPath, [path.join(caseRoot, "grader.mjs"), workspace]));
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
 });
 
 for (const caseDefinition of cases) {

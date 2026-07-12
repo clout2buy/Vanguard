@@ -7,6 +7,7 @@ export interface ProcessToolOptions {
   readonly allowedCommands: readonly string[];
   readonly commandAliases?: Readonly<Record<string, { readonly executable: string; readonly argsPrefix: readonly string[] }>>;
   readonly deniedArgumentPrefixes?: readonly string[];
+  readonly deniedArgumentSubstrings?: readonly string[];
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
 }
@@ -26,12 +27,14 @@ export class ProcessTool implements ToolPort {
       required: ["command", "args"],
       additionalProperties: false,
     },
+    effect: "execute",
   };
   readonly #allowedCommands: ReadonlySet<string>;
   readonly #timeoutMs: number;
   readonly #maxOutputBytes: number;
   readonly #commandAliases: ReadonlyMap<string, { readonly executable: string; readonly argsPrefix: readonly string[] }>;
   readonly #deniedArgumentPrefixes: readonly string[];
+  readonly #deniedArgumentSubstrings: readonly string[];
 
   constructor(
     private readonly workspace: WorkspaceBoundary,
@@ -42,6 +45,7 @@ export class ProcessTool implements ToolPort {
       Object.entries(options.commandAliases ?? {}).map(([name, alias]) => [normalizeCommand(name), alias]),
     );
     this.#deniedArgumentPrefixes = options.deniedArgumentPrefixes ?? [];
+    this.#deniedArgumentSubstrings = options.deniedArgumentSubstrings ?? [];
     this.#timeoutMs = options.timeoutMs ?? 120_000;
     this.#maxOutputBytes = options.maxOutputBytes ?? 1_000_000;
   }
@@ -59,6 +63,19 @@ export class ProcessTool implements ToolPort {
     );
     if (deniedArgument !== undefined) {
       return { ok: false, output: { error: "Argument is blocked by process policy.", argument: deniedArgument } };
+    }
+    const deniedSubstring = this.#deniedArgumentSubstrings.find((substring) =>
+      args.some((argument) => argument.toLocaleLowerCase().includes(substring.toLocaleLowerCase())),
+    );
+    if (deniedSubstring !== undefined) {
+      return {
+        ok: false,
+        output: {
+          error: "Argument contains a construct blocked by process evidence policy.",
+          construct: deniedSubstring,
+          guidance: "Use an assertion library that throws and produces a non-zero exit code on failure.",
+        },
+      };
     }
     const cwd = await this.workspace.existing(relativeCwd);
     const alias = this.#commandAliases.get(normalizeCommand(command));

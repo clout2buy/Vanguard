@@ -12,7 +12,7 @@ export class ReadFileTool implements ToolPort {
   readonly name = "workspace.read";
   readonly definition = toolDefinition(this.name, "Read a UTF-8 file and return its contents and SHA-256 version.", {
     path: { type: "string", description: "Workspace-relative file path." },
-  }, ["path"]);
+  }, ["path"], "observe");
 
   constructor(
     private readonly workspace: WorkspaceBoundary,
@@ -46,6 +46,7 @@ export class WriteFileTool implements ToolPort {
       expectedSha256: { type: ["string", "null"], description: "Hash returned by workspace.read, or null for a new file." },
     },
     ["path", "contents"],
+    "mutate",
   );
 
   constructor(
@@ -109,6 +110,7 @@ export class ReplaceTextTool implements ToolPort {
       after: { type: "string", description: "Replacement text." },
     },
     ["path", "before", "after"],
+    "mutate",
   );
 
   constructor(
@@ -156,7 +158,7 @@ export class ListFilesTool implements ToolPort {
   readonly name = "workspace.list";
   readonly definition = toolDefinition(this.name, "Recursively list regular files within a workspace directory.", {
     path: { type: "string", description: "Optional workspace-relative directory; defaults to the root." },
-  }, []);
+  }, [], "observe");
 
   constructor(
     private readonly workspace: WorkspaceBoundary,
@@ -201,6 +203,7 @@ export class SearchTextTool implements ToolPort {
       caseSensitive: { type: "boolean", description: "Whether letter case must match; defaults to true." },
     },
     ["query"],
+    "observe",
   );
 
   constructor(
@@ -298,10 +301,12 @@ function toolDefinition(
   description: string,
   properties: Record<string, JsonValue>,
   required: readonly string[],
+  effect: NonNullable<ToolDefinition["effect"]>,
 ): ToolDefinition {
   return {
     name,
     description,
     inputSchema: { type: "object", properties, required: [...required], additionalProperties: false },
+    effect,
   };
 }

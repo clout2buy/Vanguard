@@ -64,6 +64,7 @@ try {
       $Scorecard = $Raw | ConvertFrom-Json
       $Results += [pscustomobject]@{
         id = $Case.id
+        caseVersion = if ($null -eq $Case.version) { 1 } else { [int]$Case.version }
         track = $Case.track
         score = $Scorecard.grade.score
         verified = $Scorecard.grade.verified
@@ -73,6 +74,7 @@ try {
         verificationFailures = $Scorecard.trajectory.verificationFailures
         completionClaims = $Scorecard.trajectory.completionClaims
         policyBlocks = $Scorecard.trajectory.policyBlocks
+        executionQuality = $Scorecard.grade.executionQuality.score
         changedFiles = $Scorecard.patch.changedFiles.Count
         filesAdded = $Scorecard.patch.filesAdded
         filesDeleted = $Scorecard.patch.filesDeleted
@@ -87,6 +89,7 @@ try {
     catch {
       $Results += [pscustomobject]@{
         id = $Case.id
+        caseVersion = if ($null -eq $Case.version) { 1 } else { [int]$Case.version }
         track = $Case.track
         score = 0
         verified = $false
@@ -96,6 +99,7 @@ try {
         verificationFailures = 0
         completionClaims = 0
         policyBlocks = 0
+        executionQuality = 0
         changedFiles = 0
         filesAdded = 0
         filesDeleted = 0
@@ -117,12 +121,15 @@ try {
   }
   $Passed = @($Results | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 1
+    version = 2
     provider = $Provider
     model = $Model
     passed = $Passed
     total = $Total
     score = if ($Total -eq 0) { 0 } else { $Passed / $Total }
+    executionQuality = if ($Total -eq 0) { 0 } else {
+      [math]::Round((($Results | Measure-Object -Property executionQuality -Average).Average), 3)
+    }
     completedAt = (Get-Date).ToUniversalTime().ToString("o")
     trajectory = [pscustomobject]@{
       totalSteps = [int](($Results | Measure-Object -Property steps -Sum).Sum)

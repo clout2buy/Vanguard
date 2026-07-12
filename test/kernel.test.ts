@@ -144,6 +144,40 @@ test("executes a successful tool action and completes", async () => {
   assert.equal(outcome.steps, 2);
 });
 
+test("rejects completion until fresh execution evidence follows the latest mutation", async () => {
+  const mutation: ToolPort = {
+    name: "write",
+    definition: { ...toolDefinition("write"), effect: "mutate" },
+    async execute() { return { ok: true, output: "changed" }; },
+  };
+  const execution: ToolPort = {
+    name: "test",
+    definition: { ...toolDefinition("test"), effect: "execute" },
+    async execute() { return { ok: true, output: "passed" }; },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tool", call: { id: "write", name: "write", input: {} } },
+      { kind: "complete", answer: "too early" },
+      { kind: "tool", call: { id: "test", name: "test", input: {} } },
+      { kind: "complete", answer: "verified" },
+    ]),
+    tools: [mutation, execution],
+    verifiers: [passingVerifier],
+    journal,
+  });
+
+  const outcome = await kernel.run("change then test");
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "verified");
+  assert.equal(
+    journal.events.some((event) => event.type === "verification.completed"
+      && JSON.stringify(event.data).includes("completion evidence policy")),
+    true,
+  );
+});
+
 test("kernel injects runtime-owned checkpoint state independently of transcript compaction", async () => {
   const ledger = new RunCheckpointLedger();
   const checkpoint = new CheckpointTool(ledger);
