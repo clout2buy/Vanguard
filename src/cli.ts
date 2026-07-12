@@ -15,6 +15,7 @@ import {
   WriteFileTool,
   createAnthropicModel,
   createCodingSession,
+  createDeepSeekModel,
   createOpenAIModel,
 } from "./index.js";
 
@@ -26,7 +27,7 @@ interface CommandSpec {
 interface CliOptions {
   readonly workspace: string;
   readonly task: string;
-  readonly provider: "openai" | "anthropic" | "http";
+  readonly provider: "openai" | "anthropic" | "deepseek" | "http";
   readonly model: string;
   readonly endpoint?: string;
   readonly verification: CommandSpec;
@@ -108,6 +109,7 @@ function createModel(options: CliOptions) {
   const common = { model: options.model, timeoutMs: 600_000, maxAttempts: 4 };
   if (options.provider === "openai") return createOpenAIModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "anthropic") return createAnthropicModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
+  if (options.provider === "deepseek") return createDeepSeekModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.endpoint === undefined) throw new Error("--endpoint is required for the http provider.");
   return new HttpModelAdapter({ endpoint: options.endpoint, timeoutMs: common.timeoutMs, maxAttempts: common.maxAttempts });
 }
@@ -127,8 +129,8 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   const workspace = required(values, "--workspace");
   const task = required(values, "--task");
   const provider = required(values, "--provider");
-  if (provider !== "openai" && provider !== "anthropic" && provider !== "http") {
-    throw new Error("--provider must be openai, anthropic, or http.");
+  if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "http") {
+    throw new Error("--provider must be openai, anthropic, deepseek, or http.");
   }
   const model = required(values, "--model");
   const maxSteps = Number(single(values, "--max-steps") ?? "60");
@@ -198,7 +200,7 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
 }
 
 main().catch((error: unknown) => {

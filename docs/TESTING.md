@@ -15,6 +15,8 @@ Set exactly the credential required by the selected provider:
 $env:OPENAI_API_KEY = "your API key"
 # or
 $env:ANTHROPIC_API_KEY = "your API key"
+# or
+$env:DEEPSEEK_API_KEY = "your API key"
 ```
 
 ## One-command preview
@@ -27,6 +29,12 @@ or:
 
 ```powershell
 .\scripts\run-preview.ps1 -Provider anthropic -Model claude-opus-4-8
+```
+
+or:
+
+```powershell
+.\scripts\run-preview.ps1 -Provider deepseek -Model deepseek-v4-pro
 ```
 
 Use a model ID available to your account. The fixture begins broken; Vanguard must inspect it, repair it, execute its tests, and pass the independent verifier. A score of `1` means the verifier accepted the final state. It is a smoke test, not evidence that Vanguard is already superior to established coding agents.

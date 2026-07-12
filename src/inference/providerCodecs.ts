@@ -44,6 +44,16 @@ export function createAnthropicModel(options: ProviderModelOptions): HttpModelAd
   });
 }
 
+export function createDeepSeekModel(options: ProviderModelOptions): HttpModelAdapter {
+  return new HttpModelAdapter({
+    endpoint: options.endpoint ?? "https://api.deepseek.com/chat/completions",
+    codec: new OpenAIChatCompletionsCodec(options.model),
+    headerProvider: new EnvironmentBearerHeaders("DEEPSEEK_API_KEY"),
+    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
+    ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
+  });
+}
+
 export class OpenAIResponsesCodec implements ModelWireCodec {
   readonly #vendorToInternal = new Map<string, string>();
 
@@ -136,6 +146,60 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
     }).join("\n").trim();
     if (text.length > 0) return { kind: "complete", answer: text, continuation: content };
     throw new Error(`Anthropic response stopped without actionable content (${String(record.stop_reason)}).`);
+  }
+}
+
+export class OpenAIChatCompletionsCodec implements ModelWireCodec {
+  readonly #vendorToInternal = new Map<string, string>();
+
+  constructor(private readonly model: string) {}
+
+  encode(request: SerializableModelRequest): JsonValue {
+    this.#vendorToInternal.clear();
+    for (const tool of request.tools) {
+      const vendorName = openAIToolName(tool.name);
+      this.#vendorToInternal.set(vendorName, tool.name);
+    }
+    return {
+      model: this.model,
+      messages: openAIChatMessages(request.task, request.transcript),
+      tools: request.tools.map((tool) => ({
+        type: "function",
+        function: {
+          name: openAIToolName(tool.name),
+          description: tool.description,
+          parameters: tool.inputSchema,
+        },
+      })),
+      tool_choice: "auto",
+    };
+  }
+
+  decode(response: JsonValue): ModelDecision {
+    const record = object(response, "Chat Completions response");
+    const choice = optionalObject(array(record.choices, "Chat Completions response.choices")[0]);
+    const message = optionalObject(choice?.message);
+    if (message === undefined) throw new Error("Chat Completions response is missing a message.");
+    if (Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
+      const toolCall = object(message.tool_calls[0], "Chat Completions tool call");
+      const fn = object(toolCall.function, "Chat Completions tool call.function");
+      if (typeof toolCall.id !== "string" || typeof fn.name !== "string" || typeof fn.arguments !== "string") {
+        throw new Error("Chat Completions tool call is malformed.");
+      }
+      return {
+        kind: "tool",
+        call: {
+          id: toolCall.id,
+          name: this.#vendorToInternal.get(fn.name) ?? fn.name,
+          input: parseJsonValue(fn.arguments, "Chat Completions function arguments"),
+        },
+        continuation: message,
+      };
+    }
+    if (typeof message.content === "string" && message.content.trim().length > 0) {
+      return { kind: "complete", answer: message.content, continuation: message };
+    }
+    throw new Error(`Chat Completions response stopped without actionable content (${String(choice?.finish_reason)}).`);
   }
 }
 
@@ -246,6 +310,53 @@ function anthropicMessages(task: string, transcript: readonly TranscriptEntry[])
           is_error: result?.ok === false,
         }],
       });
+      pendingCall = undefined;
+    }
+    if (entry.role === "verification") {
+      messages.push({ role: "user", content: `Independent verification result: ${JSON.stringify(entry.content)}` });
+    }
+  }
+  return messages;
+}
+
+function openAIChatMessages(task: string, transcript: readonly TranscriptEntry[]): JsonValue[] {
+  const messages: JsonValue[] = [
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: task },
+  ];
+  let pendingCall: string | undefined;
+  for (const entry of transcript) {
+    if (entry.role === "task") continue;
+    if (entry.role === "decision") {
+      const decision = optionalObject(entry.content);
+      const continuation = optionalObject(decision?.continuation);
+      if (continuation !== undefined) {
+        messages.push(continuation);
+        if (decision?.kind === "tool") {
+          const call = optionalObject(decision.call);
+          if (typeof call?.id === "string") pendingCall = call.id;
+        }
+        continue;
+      }
+      if (decision?.kind === "tool") {
+        const call = object(decision.call, "tool decision.call");
+        if (typeof call.id !== "string" || typeof call.name !== "string" || !("input" in call)) continue;
+        pendingCall = call.id;
+        messages.push({
+          role: "assistant",
+          content: null,
+          tool_calls: [{
+            id: call.id,
+            type: "function",
+            function: { name: openAIToolName(call.name), arguments: JSON.stringify(call.input) },
+          }],
+        });
+      } else if (decision?.kind === "complete" && typeof decision.answer === "string") {
+        messages.push({ role: "assistant", content: decision.answer });
+      }
+    }
+    if (entry.role === "observation" && pendingCall !== undefined) {
+      messages.push({ role: "tool", tool_call_id: pendingCall, content: JSON.stringify(entry.content) });
       pendingCall = undefined;
     }
     if (entry.role === "verification") {

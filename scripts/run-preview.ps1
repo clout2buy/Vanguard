@@ -1,6 +1,6 @@
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet("openai", "anthropic")]
+  [ValidateSet("openai", "anthropic", "deepseek")]
   [string]$Provider,
 
   [Parameter(Mandatory = $true)]

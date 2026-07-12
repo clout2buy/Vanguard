@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { SerializableModelRequest } from "../src/index.js";
-import { AnthropicMessagesCodec, OpenAIResponsesCodec } from "../src/index.js";
+import { AnthropicMessagesCodec, OpenAIChatCompletionsCodec, OpenAIResponsesCodec } from "../src/index.js";
 
 const request: SerializableModelRequest = {
   task: "repair",
@@ -71,4 +71,36 @@ test("provider codecs retain the task even when context compaction drops its tra
   const compacted = { ...request, transcript: request.transcript.slice(1) };
   assert.match(JSON.stringify(new OpenAIResponsesCodec("test").encode(compacted)), /repair/);
   assert.match(JSON.stringify(new AnthropicMessagesCodec("test").encode(compacted)), /repair/);
+});
+
+test("DeepSeek-compatible chat codec preserves reasoning content and tool history", () => {
+  const codec = new OpenAIChatCompletionsCodec("deepseek-v4-pro");
+  codec.encode(request);
+  const decision = codec.decode({
+    choices: [{
+      finish_reason: "tool_calls",
+      message: {
+        role: "assistant",
+        content: null,
+        reasoning_content: "opaque provider reasoning",
+        tool_calls: [{
+          id: "deep-call",
+          type: "function",
+          function: { name: "workspace_read", arguments: "{\"path\":\"a.ts\"}" },
+        }],
+      },
+    }],
+  });
+  assert.equal(decision.kind, "tool");
+  assert.equal(decision.kind === "tool" ? decision.call.name : "", "workspace.read");
+  const followup = codec.encode({
+    ...request,
+    transcript: [
+      { role: "task", content: "repair" },
+      { role: "decision", content: decision as never },
+      { role: "observation", content: { ok: true, output: "contents" } },
+    ],
+  });
+  assert.match(JSON.stringify(followup), /reasoning_content/);
+  assert.match(JSON.stringify(followup), /tool_call_id/);
 });
