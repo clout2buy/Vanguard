@@ -50,6 +50,8 @@ The runner writes per-case scorecards plus a versioned aggregate under `gauntlet
 
 The runner validates the selected provider credential before creating sessions. Authentication and other pre-inference failures are infrastructure errors, not benchmark failures, and must never be recorded as a zero capability score.
 
+Provider transport, authentication, and protocol/adapter failures are classified as `infrastructure_error`. Schema v4 reports total cases, evaluated cases, and infrastructure errors separately; when no case reaches a capability outcome, aggregate `score` and `executionQuality` are `null`. Exit code `2` denotes infrastructure failure, while exit code `1` denotes an evaluated capability failure.
+
 ## Execution-quality score
 
 Correctness remains binary and exclusively grader-owned. For verified runs, execution quality begins at `1.0` and applies bounded, visible penalties for tool-friction failures (`0.08` each), failed verifier claims (`0.12` each), and repeated completion claims (`0.04` each after the first). A non-zero local test exit is recorded as a productive test failure rather than penalized: discovering a defect before completion is healthy engineering. Large patch expansion and high edit churn are emitted as review flags instead of being blended into correctness. This score measures trajectory hygiene, not code style, and a failed behavioral grader always yields zero.

@@ -68,24 +68,62 @@ function compactToolExchange(chunk: ContextChunk): ContextChunk {
   const content = record(decision.content);
   const call = record(content?.call);
   if (content?.kind !== "tool" || call === undefined) return chunk;
+  const compactedInput = compactJson(call.input);
+  const compactedContent: Record<string, TranscriptEntry["content"]> = {
+    kind: "tool",
+    call: {
+      id: typeof call.id === "string" ? call.id : "historical-call",
+      name: typeof call.name === "string" ? call.name : "unknown",
+      input: compactedInput,
+    },
+  };
+  if (content.continuation !== undefined) {
+    compactedContent.continuation = compactContinuation(content.continuation, compactedInput);
+  }
   return {
     priority: chunk.priority,
     toolExchange: true,
     entries: [
       {
         role: "decision",
-        content: {
-          kind: "tool",
-          call: {
-            id: typeof call.id === "string" ? call.id : "historical-call",
-            name: typeof call.name === "string" ? call.name : "unknown",
-            input: compactJson(call.input),
-          },
-        },
+        content: compactedContent,
       },
       { role: "observation", content: compactJson(observation.content) },
     ],
   };
+}
+
+function compactContinuation(value: unknown, compactedInput: TranscriptEntry["content"]): TranscriptEntry["content"] {
+  if (Array.isArray(value)) {
+    return value.map((item) => compactContinuationItem(item, compactedInput));
+  }
+  const object = record(value);
+  if (object === undefined) return compactJson(value);
+  return Object.fromEntries(Object.entries(object).map(([key, nested]) => [
+    key,
+    key === "tool_calls" && Array.isArray(nested)
+      ? nested.map((item) => compactContinuationItem(item, compactedInput))
+      : nested as TranscriptEntry["content"],
+  ]));
+}
+
+function compactContinuationItem(value: unknown, compactedInput: TranscriptEntry["content"]): TranscriptEntry["content"] {
+  const item = record(value);
+  if (item === undefined) return compactJson(value);
+  if (item.type === "function_call") {
+    return { ...item, arguments: JSON.stringify(compactedInput) } as TranscriptEntry["content"];
+  }
+  if (item.type === "tool_use") {
+    return { ...item, input: compactedInput } as TranscriptEntry["content"];
+  }
+  const fn = record(item.function);
+  if (fn !== undefined) {
+    return {
+      ...item,
+      function: { ...fn, arguments: JSON.stringify(compactedInput) },
+    } as TranscriptEntry["content"];
+  }
+  return item as TranscriptEntry["content"];
 }
 
 function compactJson(value: unknown): TranscriptEntry["content"] {

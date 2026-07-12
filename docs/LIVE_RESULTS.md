@@ -14,7 +14,7 @@ Live results are retained with an audit status. A passing verifier is necessary 
 - Post-pass code audit found that `account in balances` accepted inherited properties and that inline checks used `console.assert`, which can report assertion failures without a non-zero process exit. The result remains a valid v1 behavioral pass but is not accepted as elite implementation quality.
 - Atomic-ledger is now case version 2. Its public contract and sealed grader cover own-property account identity, safe-integer starting balances and amounts, and arithmetic overflow. The v2 grader correctly rejects the previously passing patch.
 - Core response: non-failing console assertions are blocked in restricted runs, completion after a mutation requires fresh successful execution evidence, and provider guidance requires throwing assertions plus adversarial patch review.
-- Long-horizon replay check: evidence compaction reduced the interrupted run's selected transcript from 643,931 bytes to 141,199 bytes (78.1%) while preserving the two most recent tool exchanges in full.
+- An initial long-horizon compaction replay reduced 643,931 bytes to 141,199 bytes, but later live testing proved that version unsafe for DeepSeek thinking mode because it removed required historical reasoning fields. The corrected provider-safe compactor retains opaque reasoning/signature state and still reduces that replay to 433,242 bytes (32.7%).
 
 ## 2026-07-11 — atomic-ledger v2 live pass
 
@@ -22,6 +22,13 @@ Live results are retained with an audit status. A passing verifier is necessary 
 - The single failed tool was a throwing local test that discovered an actual self-transfer defect before completion. Vanguard repaired it, reran its tests, and reached the sealed grader only after the correction.
 - Aggregate schema v2 scored this run `0.90` because it treated all failed tool exits and an extra corrective edit as waste. That interpretation was wrong: test-driven defect discovery should be rewarded, not suppressed.
 - Schema v3 separates productive local test failures from tool friction. This trajectory rescored under v3 receives execution quality `1.0`, with `large-patch-expansion` retained as a human-review flag for the 7.6× line expansion.
+
+## 2026-07-11 — plugin-lifecycle infrastructure failure
+
+- The run stopped after four read-only turns when DeepSeek returned HTTP 400 because an older compacted assistant message omitted required `reasoning_content`. No workspace files changed and no completion or verifier claim occurred.
+- Root cause: context compaction removed the entire historical provider continuation instead of compacting only bulky tool arguments and outputs.
+- Corrective action: opaque reasoning blocks, DeepSeek `reasoning_content`, and Anthropic thinking/signature content are now preserved; only known tool payload fields are compacted. A four-turn DeepSeek regression test covers the exact failure shape.
+- Aggregate schema v4 classifies model transport/protocol failures as infrastructure errors, excludes them from capability score denominators, and exits with code 2. This aborted run is not a Vanguard coding score of zero.
 
 ## 2026-07-11 — public repair-cart preview
 

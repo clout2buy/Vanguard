@@ -7,6 +7,7 @@ export * from "./kernel/run.js";
 export * from "./gauntlet/trajectoryMetrics.js";
 export * from "./gauntlet/diffMetrics.js";
 export * from "./gauntlet/executionQuality.js";
+export * from "./gauntlet/outcomeClassification.js";
 export * from "./inference/httpModel.js";
 export * from "./inference/providerCodecs.js";
 export * from "./runtime/commandVerifier.js";

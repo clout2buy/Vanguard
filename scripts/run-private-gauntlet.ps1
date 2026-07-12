@@ -68,6 +68,8 @@ try {
         track = $Case.track
         score = $Scorecard.grade.score
         verified = $Scorecard.grade.verified
+        classification = $Scorecard.grade.classification
+        capabilityEligible = $Scorecard.grade.classification -ne "infrastructure_error"
         steps = $Scorecard.grade.steps
         durationMs = $Scorecard.durationMs
         toolFailures = $Scorecard.trajectory.toolFailures
@@ -95,6 +97,8 @@ try {
         track = $Case.track
         score = 0
         verified = $false
+        classification = "infrastructure_error"
+        capabilityEligible = $false
         steps = 0
         durationMs = 0
         toolFailures = 0
@@ -123,16 +127,21 @@ try {
   if ($Total -eq 0) {
     throw "No gauntlet cases matched -CaseId: $($CaseId -join ', ')."
   }
-  $Passed = @($Results | Where-Object verified).Count
+  $EvaluatedResults = @($Results | Where-Object capabilityEligible)
+  $Evaluated = $EvaluatedResults.Count
+  $InfrastructureErrors = $Total - $Evaluated
+  $Passed = @($EvaluatedResults | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 3
+    version = 4
     provider = $Provider
     model = $Model
     passed = $Passed
     total = $Total
-    score = if ($Total -eq 0) { 0 } else { $Passed / $Total }
-    executionQuality = if ($Total -eq 0) { 0 } else {
-      [math]::Round((($Results | Measure-Object -Property executionQuality -Average).Average), 3)
+    evaluated = $Evaluated
+    infrastructureErrors = $InfrastructureErrors
+    score = if ($Evaluated -eq 0) { $null } else { $Passed / $Evaluated }
+    executionQuality = if ($Evaluated -eq 0) { $null } else {
+      [math]::Round((($EvaluatedResults | Measure-Object -Property executionQuality -Average).Average), 3)
     }
     completedAt = (Get-Date).ToUniversalTime().ToString("o")
     trajectory = [pscustomobject]@{
@@ -159,7 +168,8 @@ try {
   $Aggregate | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Output -Encoding UTF8
   $Aggregate | ConvertTo-Json -Depth 10
   Write-Host "Aggregate scorecard: $Output" -ForegroundColor Green
-  if ($Passed -ne $Total) { exit 1 }
+  if ($InfrastructureErrors -gt 0) { exit 2 }
+  if ($Passed -ne $Evaluated) { exit 1 }
 }
 finally {
   Pop-Location

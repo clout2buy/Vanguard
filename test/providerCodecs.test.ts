@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { SerializableModelRequest } from "../src/index.js";
-import { AnthropicMessagesCodec, OpenAIChatCompletionsCodec, OpenAIResponsesCodec } from "../src/index.js";
+import type { SerializableModelRequest, TranscriptEntry } from "../src/index.js";
+import {
+  AnthropicMessagesCodec,
+  EvidenceContextPolicy,
+  OpenAIChatCompletionsCodec,
+  OpenAIResponsesCodec,
+} from "../src/index.js";
 
 const request: SerializableModelRequest = {
   task: "repair",
@@ -120,4 +125,34 @@ test("DeepSeek-compatible chat codec preserves reasoning content and tool histor
   assert.match(JSON.stringify(followup), /reasoning_content/);
   assert.match(JSON.stringify(followup), /tool_call_id/);
   assert.doesNotMatch(JSON.stringify(followup), /discarded-parallel-call/);
+});
+
+test("DeepSeek reasoning survives historical tool-payload compaction", () => {
+  const transcript: TranscriptEntry[] = [{ role: "task", content: "repair" }];
+  for (let index = 1; index <= 4; index += 1) {
+    transcript.push({
+      role: "decision" as const,
+      content: {
+        kind: "tool",
+        call: { id: `call-${index}`, name: "workspace.read", input: { path: `src/${index}.ts` } },
+        continuation: {
+          role: "assistant",
+          content: "",
+          reasoning_content: `required-reasoning-${index}`,
+          tool_calls: [{
+            id: `call-${index}`,
+            type: "function",
+            function: { name: "workspace_read", arguments: JSON.stringify({ path: `src/${index}.ts` }) },
+          }],
+        },
+      },
+    });
+    transcript.push({ role: "observation", content: { ok: true, output: { contents: "x".repeat(3_000) } } });
+  }
+  const compacted = new EvidenceContextPolicy().select("repair", transcript, 100_000);
+  const encoded = JSON.stringify(new OpenAIChatCompletionsCodec("deepseek-v4-pro").encode({
+    ...request,
+    transcript: compacted,
+  }));
+  for (let index = 1; index <= 4; index += 1) assert.match(encoded, new RegExp(`required-reasoning-${index}`));
 });

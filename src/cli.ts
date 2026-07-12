@@ -25,6 +25,7 @@ import {
   analyzeTrajectory,
   analyzePatch,
   scoreExecutionQuality,
+  classifyOutcome,
 } from "./index.js";
 
 interface CommandSpec {
@@ -123,6 +124,7 @@ async function main(): Promise<void> {
   const trajectory = analyzeTrajectory(await fileJournal.readValidated());
   const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
   const verified = outcome.status === "completed";
+  const classification = classifyOutcome(outcome);
   const executionQuality = scoreExecutionQuality(verified, trajectory, patch);
   const scorecard = {
     version: 1,
@@ -138,7 +140,8 @@ async function main(): Promise<void> {
     patch,
     grade: {
       verified,
-      score: verified ? 1 : 0,
+      classification,
+      score: classification === "infrastructure_error" ? null : verified ? 1 : 0,
       executionQuality,
       steps: outcome.steps,
     },

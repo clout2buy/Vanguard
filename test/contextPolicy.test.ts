@@ -38,7 +38,15 @@ test("context policy compacts old payloads while preserving recent tool evidence
       content: {
         kind: "tool",
         call: { id: "old", name: "process.run", input: { command: "node", args: ["--eval", hugeScript] } },
-        continuation: { reasoning_content: hugeScript },
+        continuation: {
+          role: "assistant",
+          reasoning_content: "required opaque reasoning",
+          tool_calls: [{
+            id: "old",
+            type: "function",
+            function: { name: "process_run", arguments: JSON.stringify({ script: hugeScript }) },
+          }],
+        },
       },
     },
     { role: "observation" as const, content: { ok: true, output: { stdout: hugeScript } } },
@@ -51,6 +59,7 @@ test("context policy compacts old payloads while preserving recent tool evidence
   const serialized = JSON.stringify(selected);
   assert.match(serialized, /historical payload compacted/);
   assert.match(serialized, /recent important source/);
-  assert.equal(serialized.includes("reasoning_content"), false);
+  assert.match(serialized, /required opaque reasoning/);
+  assert.match(serialized, /reasoning_content/);
   assert.equal(Buffer.byteLength(serialized) < 20_000, true);
 });
