@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { access, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { VerifierPort } from "./kernel/contracts.js";
+import type { JournalPort, RunEvent, VerifierPort } from "./kernel/contracts.js";
 import {
   AgentKernel,
   CheckpointTool,
@@ -40,6 +40,8 @@ interface CliOptions {
   readonly verification: CommandSpec;
   readonly allowedCommands: readonly string[];
   readonly maxSteps: number;
+  readonly maxDurationMs: number;
+  readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
   readonly editableRoots: readonly string[];
   readonly restrictProcess: boolean;
@@ -76,7 +78,8 @@ async function main(): Promise<void> {
   const container = path.dirname(session.workspaceRoot);
   const journalFile = path.join(container, "run.jsonl");
   const scorecardFile = path.join(container, "scorecard.json");
-  const journal = await FileJournal.open(journalFile);
+  const fileJournal = await FileJournal.open(journalFile);
+  const journal = progressJournal(fileJournal);
   const model = createModel(options);
   const verifiers: VerifierPort[] = [
     new CommandVerifier("required command", verifierProcessTool, options.verification, options.verifierEvidence),
@@ -103,12 +106,19 @@ async function main(): Promise<void> {
     verifiers,
     journal,
     workingState,
-    options: { maxSteps: options.maxSteps, maxContextBytes: 2_000_000, maxRepeatedAction: 3 },
+    options: {
+      maxSteps: options.maxSteps,
+      maxContextBytes: 2_000_000,
+      maxRepeatedAction: 3,
+      maxFailedVerificationAttempts: options.maxFailedVerificationAttempts,
+    },
   });
 
   const startedAt = Date.now();
-  const outcome = await kernel.run(options.task);
-  const trajectory = analyzeTrajectory(await journal.readValidated());
+  const controller = new AbortController();
+  const durationTimer = setTimeout(() => controller.abort(), options.maxDurationMs);
+  const outcome = await kernel.run(options.task, controller.signal).finally(() => clearTimeout(durationTimer));
+  const trajectory = analyzeTrajectory(await fileJournal.readValidated());
   const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
   const scorecard = {
     version: 1,
@@ -166,6 +176,14 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   const model = required(values, "--model");
   const maxSteps = Number(single(values, "--max-steps") ?? "60");
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer.");
+  const maxDurationMs = Number(single(values, "--max-duration-ms") ?? "900000");
+  if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1) {
+    throw new Error("--max-duration-ms must be a positive integer.");
+  }
+  const maxFailedVerificationAttempts = Number(single(values, "--max-verification-attempts") ?? "3");
+  if (!Number.isSafeInteger(maxFailedVerificationAttempts) || maxFailedVerificationAttempts < 1) {
+    throw new Error("--max-verification-attempts must be a positive integer.");
+  }
   const explicitCommand = single(values, "--verify-command");
   const verification = explicitCommand === undefined
     ? await detectVerification(workspace)
@@ -185,6 +203,8 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     restrictProcess: parseBoolean(single(values, "--restrict-process") ?? "false", "--restrict-process"),
     verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence") ?? "full"),
     maxSteps,
+    maxDurationMs,
+    maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
   };
 }
@@ -251,8 +271,31 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
   return all?.[0];
 }
 
+function progressJournal(fileJournal: FileJournal): JournalPort {
+  let modelTurns = 0;
+  return {
+    async append(event: RunEvent): Promise<void> {
+      await fileJournal.append(event);
+      if (event.type === "model.decided") {
+        modelTurns += 1;
+        const decision = event.data as { kind?: string; call?: { name?: string } };
+        const action = decision.kind === "tool" ? decision.call?.name ?? "unknown tool" : "completion claim";
+        process.stderr.write(`[Vanguard] turn ${modelTurns}: ${action}\n`);
+      } else if (event.type === "verification.completed") {
+        const verification = event.data as { verifier?: string; passed?: boolean };
+        process.stderr.write(
+          `[Vanguard] verifier ${verification.verifier ?? "unknown"}: ${verification.passed ? "passed" : "failed"}\n`,
+        );
+      } else if (event.type === "run.failed") {
+        const failure = event.data as { reason?: string };
+        process.stderr.write(`[Vanguard] stopped: ${failure.reason ?? "run failed"}\n`);
+      }
+    },
+  };
+}
+
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n  --max-duration-ms N      Wall-clock run budget (default: 900000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {

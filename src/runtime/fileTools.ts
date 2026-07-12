@@ -81,6 +81,9 @@ export class WriteFileTool implements ToolPort {
       if (actualSha256 !== expectedSha256) {
         return { ok: false, output: { error: "File changed since it was read.", actualSha256 } };
       }
+      if (existing === contents) {
+        return { ok: false, output: { error: "Write rejected because contents are unchanged." } };
+      }
     } else if (expectedSha256 !== undefined && expectedSha256 !== null) {
       return { ok: false, output: { error: "Cannot match expectedSha256 because the file does not exist." } };
     }

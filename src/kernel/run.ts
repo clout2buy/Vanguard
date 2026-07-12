@@ -16,6 +16,7 @@ import { EvidenceContextPolicy } from "./contextPolicy.js";
 export interface RunOptions {
   readonly maxSteps: number;
   readonly maxRepeatedAction: number;
+  readonly maxFailedVerificationAttempts: number;
   readonly maxContextBytes: number;
 }
 
@@ -45,6 +46,7 @@ export interface KernelDependencies {
 const DEFAULT_OPTIONS: RunOptions = {
   maxSteps: 50,
   maxRepeatedAction: 2,
+  maxFailedVerificationAttempts: 3,
   maxContextBytes: 1_000_000,
 };
 
@@ -70,9 +72,11 @@ export class AgentKernel {
     if (
       !Number.isSafeInteger(this.#options.maxSteps)
       || !Number.isSafeInteger(this.#options.maxRepeatedAction)
+      || !Number.isSafeInteger(this.#options.maxFailedVerificationAttempts)
       || !Number.isSafeInteger(this.#options.maxContextBytes)
       || this.#options.maxSteps < 1
       || this.#options.maxRepeatedAction < 1
+      || this.#options.maxFailedVerificationAttempts < 1
       || this.#options.maxContextBytes < 1
     ) {
       throw new Error("Run budgets must be positive integers.");
@@ -82,6 +86,7 @@ export class AgentKernel {
   async run(task: string, signal = new AbortController().signal): Promise<RunOutcome> {
     const transcript: TranscriptEntry[] = [{ role: "task", content: task }];
     const actionFailures = new Map<string, number>();
+    let failedVerificationAttempts = 0;
     await this.#record("run.started", { task });
 
     for (let step = 1; step <= this.#options.maxSteps; step += 1) {
@@ -100,6 +105,7 @@ export class AgentKernel {
           workingState: this.#workingState?.snapshot() ?? null,
         });
       } catch (error) {
+        if (signal.aborted) return this.#fail("Run aborted by its time or cancellation budget.", step - 1);
         return this.#fail(`Model failure: ${errorMessage(error)}`, step - 1);
       }
 
@@ -118,6 +124,14 @@ export class AgentKernel {
         if (verification.every((result) => result.passed)) {
           await this.#record("run.completed", { answer: decision.answer, step });
           return { status: "completed", answer: decision.answer, steps: step, verification };
+        }
+
+        failedVerificationAttempts += 1;
+        if (failedVerificationAttempts >= this.#options.maxFailedVerificationAttempts) {
+          return this.#fail(
+            `Verification failure budget exhausted after ${failedVerificationAttempts} failed completion claims.`,
+            step,
+          );
         }
 
         continue;

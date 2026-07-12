@@ -67,6 +67,32 @@ test("requires independent verification before completion", async () => {
   assert.equal(journal.events.filter((event) => event.type === "verification.completed").length, 2);
 });
 
+test("stops after the failed verification budget instead of thrashing", async () => {
+  const verifier: VerifierPort = {
+    name: "sealed grader",
+    async verify() {
+      return { verifier: "sealed grader", passed: false, evidence: "failed" };
+    },
+  };
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "complete", answer: "claim one" },
+      { kind: "complete", answer: "claim two" },
+      { kind: "complete", answer: "claim three" },
+    ]),
+    tools: [],
+    verifiers: [verifier],
+    journal: new MemoryJournal(),
+    options: { maxFailedVerificationAttempts: 3 },
+  });
+
+  assert.deepEqual(await kernel.run("repair"), {
+    status: "failed",
+    reason: "Verification failure budget exhausted after 3 failed completion claims.",
+    steps: 3,
+  });
+});
+
 test("opens the circuit breaker on an identical repeated failure", async () => {
   const failingTool: ToolPort = {
     name: "shell",

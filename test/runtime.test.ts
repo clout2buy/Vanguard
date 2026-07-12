@@ -67,6 +67,13 @@ test("writes reject stale content hashes and guarded replacement requires a uniq
 
     const blind = await writer.execute({ path: "code.ts", contents: "broken" }, context);
     assert.equal(blind.ok, false);
+    const unchanged = await writer.execute({
+      path: "code.ts",
+      expectedSha256: contentHash("const answer = 41;\n"),
+      contents: "const answer = 41;\n",
+    }, context);
+    assert.equal(unchanged.ok, false);
+    assert.match(JSON.stringify(unchanged.output), /unchanged/i);
     const stale = await replacer.execute({
       path: "code.ts",
       expectedSha256: contentHash("different"),

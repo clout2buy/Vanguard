@@ -4,7 +4,9 @@ param(
   [string]$Provider,
 
   [Parameter(Mandatory = $true)]
-  [string]$Model
+  [string]$Model,
+
+  [string[]]$CaseId = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +35,7 @@ try {
   foreach ($CaseFile in Get-ChildItem -LiteralPath $CasesRoot -Filter case.json -Recurse | Sort-Object FullName) {
     $CaseRoot = Split-Path -Parent $CaseFile.FullName
     $Case = Get-Content -Raw -LiteralPath $CaseFile.FullName | ConvertFrom-Json
+    if ($CaseId.Count -gt 0 -and $Case.id -notin $CaseId) { continue }
     $Workspace = Join-Path $CaseRoot $Case.workspace
     $Task = Get-Content -Raw -LiteralPath (Join-Path $CaseRoot $Case.task)
     $Grader = Join-Path $CaseRoot $Case.grader
@@ -47,6 +50,8 @@ try {
       "--verify-arg", ".",
       "--restrict-process", "true",
       "--verifier-evidence", "summary",
+      "--max-duration-ms", "600000",
+      "--max-verification-attempts", "3",
       "--max-steps", [string]$Case.maxSteps
     )
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
@@ -107,6 +112,9 @@ try {
   }
 
   $Total = $Results.Count
+  if ($Total -eq 0) {
+    throw "No gauntlet cases matched -CaseId: $($CaseId -join ', ')."
+  }
   $Passed = @($Results | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
     version = 1

@@ -2,6 +2,12 @@
 
 Live results are retained with an audit status. A passing verifier is necessary but not sufficient: trajectory integrity must also survive review.
 
+## 2026-07-11 — v2 interrupted run
+
+- `async-pool`: valid pass, 25 steps, 242.1 seconds, two tool failures, zero verifier failures.
+- `atomic-ledger`: invalid benchmark result; interrupted after 63 model turns and three failed verifier claims. The sealed grader required rejecting an array-valued `initialBalances`, but the public task did not state that input contract. With summarized verifier evidence, the model could not identify the hidden requirement and began speculative rewrites.
+- Corrective action: the public contract now states the graded input types. Vanguard now rejects no-op writes, stops after three failed completion claims, enforces a 10-minute per-case wall-clock budget in the private runner, streams turn-level progress, and supports targeted case reruns.
+
 ## 2026-07-11 — public repair-cart preview
 
 - Provider/model: DeepSeek `deepseek-v4-pro`

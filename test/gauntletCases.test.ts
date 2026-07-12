@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -121,6 +121,12 @@ const cases = [
 `,
   },
 ] as const;
+
+test("atomic-ledger public task states the input types enforced by its sealed grader", async () => {
+  const task = await readFile(path.resolve("gauntlet", "cases", "atomic-ledger", "TASK.md"), "utf8");
+  assert.match(task, /initialBalances.*non-null.*non-array object/i);
+  assert.match(task, /transactions.*array/i);
+});
 
 for (const caseDefinition of cases) {
   test(`sealed ${caseDefinition.id} grader rejects starter and accepts reference behavior`, async () => {
