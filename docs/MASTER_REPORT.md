@@ -303,6 +303,53 @@ superiority** — the evidence selects the language afterward.
   remain Phase 12; no competitive parity claim follows from this phase alone.
 - **Tests:** 170/170 (161 inherited + 9 Phase-9 adversarial cases).
 
+### Phase 11 — Provider conformance + portability hardening
+
+- **Intended KPI:** deterministic provider behavior across public HTTP wire
+  contracts; no private-login dependency; typed/sanitized failure handling;
+  a clean artifact that launches consistently across supported Node/OS
+  combinations. This phase is portability evidence, not a model-quality gain.
+- **Implemented provider boundary:** versioned `ProviderConnectionConfigV1`
+  profiles for OpenAI Responses, Anthropic Messages, DeepSeek/OpenAI-compatible
+  Chat Completions, and explicit compatible endpoints. Capability negotiation
+  is attached to the exact provider/model profile—there is no model-name
+  inference. Official profiles inherit their public wire guarantees; custom
+  profiles begin with optional capabilities disabled. Codecs now conditionally
+  request streaming, stream usage, parallel calls, and opaque continuation
+  replay from that negotiated profile.
+- **Authentication/security:** native profiles accept only explicit
+  environment API-key provenance; profile/diagnostic projections expose the
+  variable name and presence boolean, never the value. Remote endpoints
+  require HTTPS and reject embedded credentials/query material. Native OAuth,
+  refresh/session/cookie token reuse is rejected and documented; an official
+  external CLI may own its own auth only when invoked as a separate engine.
+  Provider errors are bounded/redacted and classified as authentication,
+  rate-limit, context-length, invalid-request, server, protocol, transport,
+  cancellation, or timeout. `Retry-After` is parsed and capped; an identical
+  context-overflow request is never blindly retried.
+- **Offline conformance:** an injected-transport harness covers exact
+  endpoints/auth headers, versioned config loading, capability overrides,
+  streaming plus JSON fallback for all three wires, parallel tool calls,
+  reasoning/thinking continuation replay without public leakage, usage,
+  bounded `Retry-After`, cancellation, malformed payloads, context errors,
+  and credential-safe diagnostics. It performs no network calls and cannot
+  spend provider credits.
+- **Portability/package:** package engine range `>=20.19 <25`; PowerShell and
+  POSIX launchers; LF pinning for the POSIX launcher; real compiled CLI tests
+  for Unicode/space paths, split UTF-8 + CRLF stdio, EOF shutdown, and host
+  termination. `.github/workflows/portability.yml` defines Windows/macOS/Linux
+  × Node 20.19/22/24. `npm pack` prebuilds, then the smoke installs the tarball
+  into a clean spaced path, imports the public ESM engine, and launches its CLI.
+- **Local proof:** provider harness 12/12; Windows portability 5/5; complete
+  suite 178/178; clean packed install/import/CLI smoke passed for
+  `vanguard-0.1.0.tgz` (180,774 bytes).
+- **Honest limits:** the nine-cell CI matrix is authored but has not run in
+  this local checkpoint. Live-provider conformance/cache-hit measurement is
+  deliberately separate and paid; no such claim is inferred from mocks. The
+  package remains private supervised-alpha software and requires Node/npm—no
+  native installer or single-file executable is claimed. This phase does not
+  certify parity or superiority against Claude Code, Codex, or OpenCode.
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development

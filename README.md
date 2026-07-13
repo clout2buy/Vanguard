@@ -14,6 +14,13 @@ The same surface is available in TypeScript through `VanguardEngine`. See
 [`docs/ENGINE_PROTOCOL.md`](docs/ENGINE_PROTOCOL.md) and the clients under
 `examples/`.
 
+Native provider support uses documented HTTP contracts plus API keys or an
+explicit custom endpoint; it never extracts another CLI's OAuth/session
+tokens. Versioned provider profiles and the offline conformance boundary are
+documented in [`docs/PROVIDERS.md`](docs/PROVIDERS.md). Supported Node/OS
+versions, launchers, and clean-tarball smoke testing are documented in
+[`docs/PORTABILITY.md`](docs/PORTABILITY.md).
+
 ## Core invariants
 
 1. A model proposes actions; it does not decide whether its own work succeeded.

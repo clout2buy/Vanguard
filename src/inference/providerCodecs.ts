@@ -14,8 +14,17 @@ import {
   type ModelWireCodec,
   type SerializableModelRequest,
   type StreamAccumulator,
+  type InferenceDiagnostic,
   type StreamObserver,
 } from "./httpModel.js";
+import {
+  VANGUARD_PROVIDER_CONFIG_VERSION,
+  resolveProviderProfile,
+  type ProviderCapabilities,
+  type ProviderCapabilityOverrides,
+  type ProviderConnectionConfigV1,
+  type ResolvedProviderProfile,
+} from "./providerProfiles.js";
 
 const EXECUTION_PROMPT = `You are Vanguard, an expert autonomous coding agent. Own the requested outcome end to end and work from observable repository evidence.
 On an unfamiliar repository call repository.map first for languages, build systems, entry points, and test topology. Inspect files before changing them and use the returned SHA-256 precondition. You may issue several independent read-only tool calls in one turn; mutating and executing calls run one at a time. After writing a file, use verify.syntax to catch a broken edit cheaply before spending a full build.
@@ -47,49 +56,96 @@ function systemPrompt(mode: SerializableModelRequest["mode"]): string {
 export interface ProviderModelOptions {
   readonly model: string;
   readonly endpoint?: string;
+  readonly credentialVariable?: string;
+  readonly capabilities?: ProviderCapabilityOverrides;
+  readonly apiVersion?: string;
   readonly timeoutMs?: number;
   readonly maxAttempts?: number;
+  readonly maxRetryAfterMs?: number;
+  readonly fetchImplementation?: typeof fetch;
+  readonly disableStreaming?: boolean;
+  readonly environment?: NodeJS.ProcessEnv;
+  readonly onDiagnostic?: (diagnostic: InferenceDiagnostic) => void;
   /** Receives user-visible response text as it streams. */
   readonly onTextDelta?: (text: string) => void;
   /** Full provisional-stream lifecycle observer. Supersedes onTextDelta when set. */
   readonly streamObserver?: StreamObserver;
 }
 
+export type ConfiguredProviderRuntimeOptions = Omit<ProviderModelOptions,
+  "model" | "endpoint" | "credentialVariable" | "capabilities" | "apiVersion">;
+
 export function createOpenAIModel(options: ProviderModelOptions): HttpModelAdapter {
-  return new HttpModelAdapter({
-    endpoint: options.endpoint ?? "https://api.openai.com/v1/responses",
-    codec: new OpenAIResponsesCodec(options.model),
-    headerProvider: new EnvironmentBearerHeaders("OPENAI_API_KEY"),
-    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-    ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
-    ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
-    ...(options.streamObserver === undefined ? {} : { streamObserver: options.streamObserver }),
-  });
+  return createConfiguredProviderModel({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "openai",
+    model: options.model,
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    ...(options.credentialVariable === undefined ? {} : { credential: { source: "environment", variable: options.credentialVariable } }),
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
+  }, options);
 }
 
 export function createAnthropicModel(options: ProviderModelOptions): HttpModelAdapter {
-  return new HttpModelAdapter({
-    endpoint: options.endpoint ?? "https://api.anthropic.com/v1/messages",
-    codec: new AnthropicMessagesCodec(options.model),
-    headerProvider: new AnthropicHeaders(),
-    ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-    ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
-    ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
-    ...(options.streamObserver === undefined ? {} : { streamObserver: options.streamObserver }),
-  });
+  return createConfiguredProviderModel({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "anthropic",
+    model: options.model,
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    ...(options.credentialVariable === undefined ? {} : { credential: { source: "environment", variable: options.credentialVariable } }),
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
+    ...(options.apiVersion === undefined ? {} : { apiVersion: options.apiVersion }),
+  }, options);
 }
 
 export function createDeepSeekModel(options: ProviderModelOptions): HttpModelAdapter {
+  return createConfiguredProviderModel({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "deepseek",
+    model: options.model,
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    ...(options.credentialVariable === undefined ? {} : { credential: { source: "environment", variable: options.credentialVariable } }),
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
+  }, options);
+}
+
+export function createConfiguredProviderModel(
+  config: ProviderConnectionConfigV1 | ResolvedProviderProfile,
+  options: ConfiguredProviderRuntimeOptions = {},
+): HttpModelAdapter {
+  const environment = options.environment ?? process.env;
+  // Re-resolve even an already-resolved object so untrusted JavaScript callers
+  // cannot forge the marker fields and bypass endpoint/credential validation.
+  const profile = resolveProviderProfile(config, environment);
+  const codec = profile.wire === "openai-responses"
+    ? new OpenAIResponsesCodec(profile.model, profile.capabilities)
+    : profile.wire === "anthropic-messages"
+      ? new AnthropicMessagesCodec(profile.model, 16_384, profile.capabilities)
+      : new OpenAIChatCompletionsCodec(profile.model, profile.capabilities);
+  const headerProvider = profile.wire === "anthropic-messages"
+    ? new AnthropicHeaders(profile.credential.variable, profile.apiVersion!, environment)
+    : new EnvironmentBearerHeaders(profile.credential.variable, environment);
   return new HttpModelAdapter({
-    endpoint: options.endpoint ?? "https://api.deepseek.com/chat/completions",
-    codec: new OpenAIChatCompletionsCodec(options.model),
-    headerProvider: new EnvironmentBearerHeaders("DEEPSEEK_API_KEY"),
+    endpoint: profile.endpoint,
+    codec,
+    headerProvider,
+    disableStreaming: options.disableStreaming ?? !profile.capabilities.streaming,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
+    ...(options.maxRetryAfterMs === undefined ? {} : { maxRetryAfterMs: options.maxRetryAfterMs }),
+    ...(options.fetchImplementation === undefined ? {} : { fetchImplementation: options.fetchImplementation }),
     ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
     ...(options.streamObserver === undefined ? {} : { streamObserver: options.streamObserver }),
+    ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
   });
 }
+
+const DEFAULT_CODEC_CAPABILITIES: ProviderCapabilities = {
+  streaming: true,
+  parallelToolCalls: true,
+  streamUsage: true,
+  continuationReplay: true,
+};
 
 /**
  * A semantic rendering target for one provider wire format. The shared
@@ -321,7 +377,10 @@ function fallbackContract(input: JsonValue): TaskContract | undefined {
 export class OpenAIResponsesCodec implements ModelWireCodec {
   readonly #vendorToInternal = new Map<string, string>();
 
-  constructor(private readonly model: string) {}
+  constructor(
+    private readonly model: string,
+    private readonly capabilities: ProviderCapabilities = DEFAULT_CODEC_CAPABILITIES,
+  ) {}
 
   encode(request: SerializableModelRequest): JsonValue {
     this.#vendorToInternal.clear();
@@ -338,8 +397,11 @@ export class OpenAIResponsesCodec implements ModelWireCodec {
       user: (text) => input.push({ role: "user", content: text }),
       task: (text) => input.push({ role: "user", content: text }),
       assistantContinuation: (continuation) => {
-        if (Array.isArray(continuation)) input.push(...continuation);
-        else input.push(continuation);
+        const replay = this.capabilities.continuationReplay
+          ? continuation
+          : stripPrivateContinuation(continuation, "openai-responses");
+        if (Array.isArray(replay)) input.push(...replay);
+        else input.push(replay);
       },
       assistantText: (text) => input.push({ role: "assistant", content: text }),
       assistantCalls: (calls) => {
@@ -362,7 +424,7 @@ export class OpenAIResponsesCodec implements ModelWireCodec {
       instructions: systemPrompt(request.mode),
       input,
       tools: request.tools.map((tool) => openAITool(tool, openAIToolName(tool.name))),
-      parallel_tool_calls: true,
+      ...(this.capabilities.parallelToolCalls ? { parallel_tool_calls: true } : {}),
       store: false,
     };
   }
@@ -413,6 +475,7 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
   constructor(
     private readonly model: string,
     private readonly maxTokens = 16_384,
+    private readonly capabilities: ProviderCapabilities = DEFAULT_CODEC_CAPABILITIES,
   ) {}
 
   encode(request: SerializableModelRequest): JsonValue {
@@ -439,7 +502,12 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
       },
       assistantContinuation: (continuation) => {
         flushResults();
-        messages.push({ role: "assistant", content: continuation });
+        messages.push({
+          role: "assistant",
+          content: this.capabilities.continuationReplay
+            ? continuation
+            : stripPrivateContinuation(continuation, "anthropic-messages"),
+        });
       },
       assistantText: (text) => {
         flushResults();
@@ -518,7 +586,10 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
 export class OpenAIChatCompletionsCodec implements ModelWireCodec {
   readonly #vendorToInternal = new Map<string, string>();
 
-  constructor(private readonly model: string) {}
+  constructor(
+    private readonly model: string,
+    private readonly capabilities: ProviderCapabilities = DEFAULT_CODEC_CAPABILITIES,
+  ) {}
 
   encode(request: SerializableModelRequest): JsonValue {
     this.#vendorToInternal.clear();
@@ -530,7 +601,11 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
     interpretTranscript(request.task, request.transcript, request.workingState, {
       user: (text) => messages.push({ role: "user", content: text }),
       task: (text) => messages.push({ role: "user", content: text }),
-      assistantContinuation: (continuation) => messages.push(continuation),
+      assistantContinuation: (continuation) => messages.push(
+        this.capabilities.continuationReplay
+          ? continuation
+          : stripPrivateContinuation(continuation, "openai-chat-completions"),
+      ),
       assistantText: (text) => messages.push({ role: "assistant", content: text }),
       assistantCalls: (calls) => {
         messages.push({
@@ -560,6 +635,7 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
         },
       })),
       tool_choice: "auto",
+      ...(this.capabilities.parallelToolCalls ? { parallel_tool_calls: true } : {}),
     };
   }
 
@@ -567,7 +643,7 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
     return {
       ...object(this.encode(request), "Chat Completions request"),
       stream: true,
-      stream_options: { include_usage: true },
+      ...(this.capabilities.streamUsage ? { stream_options: { include_usage: true } } : {}),
     };
   }
 
@@ -772,12 +848,26 @@ class OpenAIResponsesStreamAccumulator implements StreamAccumulator {
 }
 
 class AnthropicHeaders implements HeaderProvider {
+  constructor(
+    private readonly variable = "ANTHROPIC_API_KEY",
+    private readonly apiVersion = "2023-06-01",
+    private readonly environment: NodeJS.ProcessEnv = process.env,
+  ) {}
+
   async headers(): Promise<Readonly<Record<string, string>>> {
-    const secret = process.env.ANTHROPIC_API_KEY;
+    const secret = this.environment[this.variable];
     if (secret === undefined || secret.length === 0) {
-      throw new Error("Missing credential environment variable: ANTHROPIC_API_KEY");
+      throw new Error(`Missing credential environment variable: ${this.variable}`);
     }
-    return { "x-api-key": secret, "anthropic-version": "2023-06-01" };
+    return { "x-api-key": secret, "anthropic-version": this.apiVersion };
+  }
+
+  provenance(): Readonly<Record<string, string | boolean>> {
+    return {
+      source: "environment",
+      variable: this.variable,
+      present: typeof this.environment[this.variable] === "string" && this.environment[this.variable]!.length > 0,
+    };
   }
 }
 
@@ -794,6 +884,27 @@ function openAIToolName(internalName: string): string {
   const safe = internalName.replace(/[^a-zA-Z0-9_-]/gu, "_");
   if (safe.length === 0 || safe.length > 64) throw new Error(`Tool name cannot be mapped to OpenAI: ${internalName}`);
   return safe;
+}
+
+function stripPrivateContinuation(
+  continuation: JsonValue,
+  wire: "openai-responses" | "openai-chat-completions" | "anthropic-messages",
+): JsonValue {
+  if (wire === "openai-responses") {
+    if (!Array.isArray(continuation)) return continuation;
+    return continuation.filter((item) => optionalObject(item)?.type !== "reasoning");
+  }
+  if (wire === "anthropic-messages") {
+    if (!Array.isArray(continuation)) return continuation;
+    return continuation.filter((item) => {
+      const type = optionalObject(item)?.type;
+      return type !== "thinking" && type !== "redacted_thinking";
+    });
+  }
+  const record = optionalObject(continuation);
+  if (record === undefined) return continuation;
+  const { reasoning_content: _reasoningContent, reasoning: _reasoning, ...visible } = record;
+  return visible;
 }
 
 function anthropicTool(tool: ToolDefinition): JsonValue {

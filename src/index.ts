@@ -14,6 +14,7 @@ export * from "./gauntlet/executionQuality.js";
 export * from "./gauntlet/outcomeClassification.js";
 export * from "./inference/httpModel.js";
 export * from "./inference/providerCodecs.js";
+export * from "./inference/providerProfiles.js";
 export * from "./inference/usageLedger.js";
 export * from "./runtime/commandVerifier.js";
 export * from "./runtime/automaticVerification.js";

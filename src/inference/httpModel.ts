@@ -36,6 +36,8 @@ export interface ModelWireCodec {
 
 export interface HeaderProvider {
   headers(): Promise<Readonly<Record<string, string>>>;
+  /** Diagnostic-safe credential source metadata; never a credential value. */
+  provenance?(): Readonly<Record<string, string | boolean>>;
 }
 
 /**
@@ -65,6 +67,8 @@ export interface HttpModelOptions {
   readonly timeoutMs?: number;
   readonly maxAttempts?: number;
   readonly retryBaseMs?: number;
+  /** Upper bound applied to provider Retry-After hints. Defaults to 60s. */
+  readonly maxRetryAfterMs?: number;
   readonly fetchImplementation?: typeof fetch;
   /** Receives user-visible text as it streams. Enables SSE when the codec supports it. */
   readonly onTextDelta?: (text: string) => void;
@@ -72,6 +76,40 @@ export interface HttpModelOptions {
   readonly streamObserver?: StreamObserver;
   /** Forces the non-streaming request path even when the codec supports SSE. */
   readonly disableStreaming?: boolean;
+  /** Receives sanitized lifecycle diagnostics only; headers and bodies are never included. */
+  readonly onDiagnostic?: (diagnostic: InferenceDiagnostic) => void;
+}
+
+export type InferenceFailureKind =
+  | "authentication"
+  | "rate_limit"
+  | "context_length"
+  | "invalid_request"
+  | "server"
+  | "protocol"
+  | "transport"
+  | "cancelled"
+  | "timeout";
+
+export interface InferenceDiagnostic {
+  readonly kind: InferenceFailureKind | "retry" | "request";
+  readonly attempt: number;
+  readonly status?: number;
+  readonly retryAfterMs?: number;
+  readonly message: string;
+}
+
+export class InferenceError extends Error {
+  constructor(
+    readonly kind: InferenceFailureKind,
+    message: string,
+    readonly status?: number,
+    readonly retryable = false,
+    readonly retryAfterMs?: number,
+  ) {
+    super(sanitizeDiagnostic(message));
+    this.name = "InferenceError";
+  }
 }
 
 export class HttpModelAdapter implements ModelPort {
@@ -80,6 +118,7 @@ export class HttpModelAdapter implements ModelPort {
   readonly #timeoutMs: number;
   readonly #maxAttempts: number;
   readonly #retryBaseMs: number;
+  readonly #maxRetryAfterMs: number;
 
   constructor(private readonly options: HttpModelOptions) {
     this.#codec = options.codec ?? new VanguardJsonCodec();
@@ -87,8 +126,18 @@ export class HttpModelAdapter implements ModelPort {
     this.#timeoutMs = options.timeoutMs ?? 120_000;
     this.#maxAttempts = options.maxAttempts ?? 3;
     this.#retryBaseMs = options.retryBaseMs ?? 250;
-    if (!Number.isSafeInteger(this.#maxAttempts) || this.#maxAttempts < 1) {
-      throw new Error("HTTP model maxAttempts must be a positive integer.");
+    this.#maxRetryAfterMs = options.maxRetryAfterMs ?? 60_000;
+    if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs < 1 || this.#timeoutMs > 2_147_483_647) {
+      throw new Error("HTTP model timeoutMs must be an integer between 1 and 2147483647.");
+    }
+    if (!Number.isSafeInteger(this.#maxAttempts) || this.#maxAttempts < 1 || this.#maxAttempts > 20) {
+      throw new Error("HTTP model maxAttempts must be an integer between 1 and 20.");
+    }
+    if (!Number.isSafeInteger(this.#retryBaseMs) || this.#retryBaseMs < 0) {
+      throw new Error("HTTP model retryBaseMs must be a non-negative integer.");
+    }
+    if (!Number.isSafeInteger(this.#maxRetryAfterMs) || this.#maxRetryAfterMs < 0) {
+      throw new Error("HTTP model maxRetryAfterMs must be a non-negative integer.");
     }
     new URL(options.endpoint);
   }
@@ -110,22 +159,49 @@ export class HttpModelAdapter implements ModelPort {
     const body = JSON.stringify(streaming
       ? this.#codec.encodeStreaming!(serializable)
       : this.#codec.encode(serializable));
+    let headers: Readonly<Record<string, string>>;
+    try {
+      // Resolve credentials once per decision. A credential-provider failure is
+      // deterministic and must not become a retry storm across HTTP attempts.
+      headers = await this.options.headerProvider?.headers() ?? {};
+    } catch (error) {
+      const failure = this.#failure("authentication", error, 1);
+      observer?.failed?.(failure.message);
+      if (request.recovery !== undefined) {
+        try {
+          await request.recovery.handle({
+            operation: "provider.headers",
+            attempt: 1,
+            maxAttempts: 1,
+            idempotent: true,
+            failure: classifyFailure(failure, { source: "provider" }),
+          }, request.signal);
+        } catch (recoveryError) {
+          throw markRecoveryHandled(recoveryError);
+        }
+        throw markRecoveryHandled(failure);
+      }
+      throw failure;
+    }
+    const sensitiveValues = sensitiveHeaderValues(headers);
     let lastError: unknown;
     // Provisional text already shown to the observer; a retry after visible
     // output must reset the provisional stream before replaying.
     let visibleText = false;
 
-    const fail = (error: unknown): Error => {
-      const failure = error instanceof Error ? error : new Error(String(error));
-      observer?.failed?.(failure.message);
-      return failure;
-    };
-
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
       const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
       const attemptSignal = AbortSignal.any([request.signal, timeoutSignal]);
+      const fail = (error: unknown): Error => {
+        const marked = error instanceof RecoveryHandledError;
+        const source = marked && error.cause !== undefined ? error.cause : error;
+        const failure = this.#normalizeFailure(source, request.signal, timeoutSignal, sensitiveValues);
+        observer?.failed?.(failure.message);
+        this.#diagnostic(failure.kind, attempt, failure.message, failure.status, failure.retryAfterMs);
+        return marked ? markRecoveryHandled(failure) : failure;
+      };
       try {
-        const headers = await this.options.headerProvider?.headers() ?? {};
+        this.#diagnostic("request", attempt, "Inference request started.");
         const response = await this.#fetch(this.options.endpoint, {
           method: "POST",
           headers: { "content-type": "application/json", ...headers },
@@ -133,8 +209,8 @@ export class HttpModelAdapter implements ModelPort {
           signal: attemptSignal,
         });
         if (!response.ok) {
-          const detail = (await response.text()).slice(0, 2_000);
-          const error = new HttpInferenceError(response.status, detail, retryAfter(response.headers));
+          const detail = sanitizeDiagnostic((await response.text()).slice(0, 8_000), 2_000, sensitiveValues);
+          const error = httpFailure(response.status, detail, parseRetryAfter(response.headers, this.#maxRetryAfterMs));
           throw error;
         }
         if (streaming && isEventStream(response)) {
@@ -147,29 +223,48 @@ export class HttpModelAdapter implements ModelPort {
             visibleText = true;
             observer?.delta(text);
           });
-          await consumeServerSentEvents(response, accumulator, attemptSignal);
-          const canonical = accumulator.finish();
-          const decision = this.#codec.decode(canonical);
+          try {
+            await consumeServerSentEvents(response, accumulator, attemptSignal);
+          } catch (error) {
+            if (error instanceof SyntaxError) {
+              throw new InferenceError("protocol", "Provider stream contained malformed JSON.", response.status, true);
+            }
+            throw error;
+          }
+          let canonical: JsonValue;
+          try {
+            canonical = accumulator.finish();
+          } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            throw new InferenceError("protocol", detail, response.status, true);
+          }
+          const decision = this.#decode(canonical, response.status);
           reportUsage(canonical, observer);
           observer?.committed?.();
           return decision;
         }
         // Either a plain request, or a compatible endpoint that ignored the
         // stream flag and answered with a complete JSON body.
-        const canonical = await response.json() as JsonValue;
-        const decision = this.#codec.decode(canonical);
+        let canonical: JsonValue;
+        try {
+          canonical = await response.json() as JsonValue;
+        } catch {
+          throw new InferenceError("protocol", "Provider returned malformed JSON.", response.status, true);
+        }
+        const decision = this.#decode(canonical, response.status);
         reportUsage(canonical, observer);
         observer?.committed?.();
         return decision;
       } catch (error) {
-        if (request.signal.aborted) throw fail(markRecoveryHandled(error));
-        lastError = error;
-        const failure = classifyFailure(error, {
+        const normalized = this.#normalizeFailure(error, request.signal, timeoutSignal, sensitiveValues);
+        lastError = normalized;
+        if (request.signal.aborted) {
+          throw fail(request.recovery === undefined ? normalized : markRecoveryHandled(normalized));
+        }
+        const failure = classifyFailure(normalized, {
           source: "provider",
-          ...(error instanceof HttpInferenceError ? {
-            status: error.status,
-            ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
-          } : {}),
+          ...(normalized.status === undefined ? {} : { status: normalized.status }),
+          ...(normalized.retryAfterMs === undefined ? {} : { retryAfterMs: normalized.retryAfterMs }),
           timedOut: timeoutSignal.aborted,
         });
 
@@ -198,38 +293,121 @@ export class HttpModelAdapter implements ModelPort {
             visibleText = false;
           }
           try {
-            await delay(
-              failure.retryAfterMs ?? this.#retryBaseMs * 2 ** (attempt - 1),
-              request.signal,
-            );
+            const wait = Math.min(this.#maxRetryAfterMs, failure.retryAfterMs ?? this.#backoff(attempt));
+            this.#diagnostic("retry", attempt, "Retrying after a transient inference failure.", failure.status, wait);
+            await delay(wait, request.signal);
           } catch (delayError) {
             throw fail(delayError);
           }
           retry = true;
         }
-        if (retry) continue;
-        throw fail(request.recovery === undefined ? error : markRecoveryHandled(error));
+        if (retry && attempt < this.#maxAttempts) {
+          this.#diagnostic("retry", attempt, "Recovery approved a transient inference retry.", failure.status, failure.retryAfterMs);
+          continue;
+        }
+        throw fail(request.recovery === undefined ? normalized : markRecoveryHandled(normalized));
       }
     }
-    throw fail(request.recovery === undefined ? lastError : markRecoveryHandled(lastError));
+    const terminal = this.#normalizeFailure(
+      lastError,
+      request.signal,
+      new AbortController().signal,
+      sensitiveValues,
+    );
+    observer?.failed?.(terminal.message);
+    throw request.recovery === undefined ? terminal : markRecoveryHandled(terminal);
   }
 
   #observer(): StreamObserver | undefined {
-    if (this.options.streamObserver !== undefined) return this.options.streamObserver;
-    if (this.options.onTextDelta !== undefined) return { delta: this.options.onTextDelta };
-    return undefined;
+    const source = this.options.streamObserver
+      ?? (this.options.onTextDelta === undefined ? undefined : { delta: this.options.onTextDelta });
+    if (source === undefined) return undefined;
+    const safely = (action: (() => void) | undefined): void => {
+      try { action?.(); } catch { /* Observability never changes inference. */ }
+    };
+    return {
+      started: (attempt) => safely(() => source.started?.(attempt)),
+      delta: (text) => safely(() => source.delta(text)),
+      reset: () => safely(() => source.reset?.()),
+      committed: () => safely(() => source.committed?.()),
+      failed: (reason) => safely(() => source.failed?.(reason)),
+      usage: (usage) => safely(() => source.usage?.(usage)),
+    };
+  }
+
+  #decode(canonical: JsonValue, status: number): ModelDecision {
+    try {
+      return this.#codec.decode(canonical);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new InferenceError("protocol", detail, status, true);
+    }
+  }
+
+  #failure(kind: InferenceFailureKind, error: unknown, attempt: number): InferenceError {
+    const failure = error instanceof Error ? error.message : String(error);
+    const normalized = new InferenceError(kind, failure);
+    this.#diagnostic(kind, attempt, normalized.message);
+    return normalized;
+  }
+
+  #normalizeFailure(
+    error: unknown,
+    callerSignal: AbortSignal,
+    timeoutSignal: AbortSignal,
+    sensitiveValues: readonly string[] = [],
+  ): InferenceError {
+    if (error instanceof InferenceError) return error;
+    if (callerSignal.aborted) return new InferenceError("cancelled", "Inference request cancelled.");
+    if (timeoutSignal.aborted) {
+      return new InferenceError("timeout", `Inference request timed out after ${this.#timeoutMs}ms.`, undefined, true);
+    }
+    const message = sanitizeDiagnostic(error instanceof Error ? error.message : String(error), 2_000, sensitiveValues);
+    return new InferenceError("transport", message, undefined, true);
+  }
+
+  #backoff(attempt: number): number {
+    return Math.min(this.#maxRetryAfterMs, this.#retryBaseMs * 2 ** Math.max(0, attempt - 1));
+  }
+
+  #diagnostic(
+    kind: InferenceDiagnostic["kind"],
+    attempt: number,
+    message: string,
+    status?: number,
+    retryAfterMs?: number,
+  ): void {
+    try {
+      this.options.onDiagnostic?.({
+        kind,
+        attempt,
+        ...(status === undefined ? {} : { status }),
+        ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+        message: sanitizeDiagnostic(message),
+      });
+    } catch {
+      // Observability must never change inference control flow.
+    }
   }
 }
 
 export class EnvironmentBearerHeaders implements HeaderProvider {
-  constructor(private readonly variable: string) {}
+  constructor(private readonly variable: string, private readonly environment: NodeJS.ProcessEnv = process.env) {}
 
   async headers(): Promise<Readonly<Record<string, string>>> {
-    const secret = process.env[this.variable];
+    const secret = this.environment[this.variable];
     if (secret === undefined || secret.length === 0) {
       throw new Error(`Missing credential environment variable: ${this.variable}`);
     }
     return { authorization: `Bearer ${secret}` };
+  }
+
+  provenance(): Readonly<Record<string, string | boolean>> {
+    return {
+      source: "environment",
+      variable: this.variable,
+      present: typeof this.environment[this.variable] === "string" && this.environment[this.variable]!.length > 0,
+    };
   }
 }
 
@@ -313,16 +491,6 @@ async function consumeServerSentEvents(
   dispatch();
 }
 
-class HttpInferenceError extends Error {
-  constructor(
-    readonly status: number,
-    detail: string,
-    readonly retryAfterMs: number | undefined,
-  ) {
-    super(`Inference endpoint returned HTTP ${status}: ${detail}`);
-  }
-}
-
 class RecoveryHandledError extends Error {
   readonly recoveryHandled = true;
 
@@ -337,13 +505,51 @@ function markRecoveryHandled(error: unknown): Error {
   return error instanceof RecoveryHandledError ? error : new RecoveryHandledError(error);
 }
 
-function retryAfter(headers: Headers): number | undefined {
+export function parseRetryAfter(headers: Headers, maximumMs = 60_000): number | undefined {
   const raw = headers.get("retry-after");
   if (raw === null) return undefined;
   const seconds = Number(raw);
-  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(maximumMs, seconds * 1_000);
   const date = Date.parse(raw);
-  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+  return Number.isNaN(date) ? undefined : Math.min(maximumMs, Math.max(0, date - Date.now()));
+}
+
+function httpFailure(status: number, detail: string, retryAfterMs: number | undefined): InferenceError {
+  const context = status === 413 || /(?:context(?:_| )?(?:length|window)|maximum context|too many tokens|prompt.{0,24}too long|input.{0,24}tokens|request.{0,24}too large)/iu.test(detail);
+  const kind: InferenceFailureKind = context ? "context_length"
+    : status === 401 || status === 403 ? "authentication"
+      : status === 429 ? "rate_limit"
+        : status >= 500 ? "server"
+          : "invalid_request";
+  const retryable = !context && (status === 408 || status === 409 || status === 425 || status === 429 || status >= 500);
+  return new InferenceError(kind, `Inference endpoint returned HTTP ${status}: ${detail}`, status, retryable, retryAfterMs);
+}
+
+export function sanitizeDiagnostic(
+  value: string,
+  maximumLength = 2_000,
+  sensitiveValues: readonly string[] = [],
+): string {
+  let sanitized = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, "?");
+  sanitized = sanitized
+    .replace(/(Bearer\s+)[^\s"',}]+/giu, "$1[REDACTED]")
+    .replace(/(["']?(?:api[_-]?key|authorization|token|password|secret)["']?\s*[:=]\s*["'])[^"']+(["'])/giu, "$1[REDACTED]$2")
+    .replace(/\b(?:sk|key|token)-[A-Za-z0-9_-]{8,}\b/gu, "[REDACTED]");
+  for (const sensitive of [...new Set(sensitiveValues)].sort((left, right) => right.length - left.length)) {
+    if (sensitive.length > 0) sanitized = sanitized.replaceAll(sensitive, "[REDACTED]");
+  }
+  return sanitized.length <= maximumLength ? sanitized : `${sanitized.slice(0, maximumLength)}…`;
+}
+
+function sensitiveHeaderValues(headers: Readonly<Record<string, string>>): string[] {
+  const values: string[] = [];
+  for (const [name, value] of Object.entries(headers)) {
+    if (!/(?:authorization|api-key|token|secret)/iu.test(name)) continue;
+    values.push(value);
+    const bearer = /^Bearer\s+(.+)$/iu.exec(value)?.[1];
+    if (bearer !== undefined) values.push(bearer);
+  }
+  return values;
 }
 
 async function delay(milliseconds: number, signal: AbortSignal): Promise<void> {
