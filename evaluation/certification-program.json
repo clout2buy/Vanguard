@@ -1,32 +1,50 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "status": "awaiting-external-holdout-freeze",
   "program": "Vanguard Elite Engine Certification 1",
   "observedAt": "2026-07-13T00:00:00-04:00",
   "plannedPairedTasks": 192,
   "plannedRepetitions": 3,
   "plannedRuns": 2304,
+  "plannedIndependentRepositoryGroups": 24,
+  "statisticalUnit": "independenceGroupId after repetition-within-task aggregation",
+  "reviewPolicy": {
+    "requiredPrimaryReviewers": 2,
+    "materialDisagreementRequiresThirdAdjudicator": true,
+    "rubric": "freeze digest with external evaluator"
+  },
   "engines": [
     {
       "id": "vanguard",
       "version": "freeze from candidate commit",
       "command": "vanguard",
-      "modelPolicy": "same provider/model and budget as each paired baseline"
+      "modelPolicy": "freeze provider/model/reasoning effort/tool+step+token budgets and exact arguments per track",
+      "executableSha256": "freeze from packaged candidate",
+      "environmentSha256": "freeze from evaluator image"
     },
     {
       "id": "claude-code",
       "version": "2.1.204",
-      "command": "claude"
+      "command": "claude",
+      "modelPolicy": "freeze provider/model/reasoning effort/tool+step+token budgets and exact arguments per track",
+      "executableSha256": "freeze on evaluator host",
+      "environmentSha256": "freeze from evaluator image"
     },
     {
       "id": "codex",
       "version": "codex-cli 0.130.0",
-      "command": "codex"
+      "command": "codex",
+      "modelPolicy": "freeze provider/model/reasoning effort/tool+step+token budgets and exact arguments per track",
+      "executableSha256": "freeze on evaluator host",
+      "environmentSha256": "freeze from evaluator image"
     },
     {
       "id": "opencode",
       "version": "1.1.65",
-      "command": "opencode"
+      "command": "opencode",
+      "modelPolicy": "freeze provider/model/reasoning effort/tool+step+token budgets and exact arguments per track",
+      "executableSha256": "freeze on evaluator host",
+      "environmentSha256": "freeze from evaluator image"
     }
   ],
   "thresholds": {
@@ -42,7 +60,10 @@
     "An evaluator independent of Vanguard implementation",
     "A never-run holdout bundle with frozen source and grader SHA-256 digests",
     "Fresh competitor sessions with pinned CLI versions and identical task/model/budget policy",
+    "Provider, model, reasoning effort, tool/step/token budgets, executable/environment digests, and arguments frozen per engine/track",
     "Provider cost assumptions or complete normalized usage for every run",
-    "Human maintainability scoring performed while engine aliases remain blinded"
+    "Two independent blinded maintainability reviews per run and evidence-bound third-party adjudication above the disagreement threshold",
+    "Signed external container/VM isolation attestation verified against evaluator-owned trust roots",
+    "Cluster bootstrap over independent repository groups, never individual repetitions"
   ]
 }

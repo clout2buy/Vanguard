@@ -35,6 +35,8 @@ export * from "./runtime/changeTransactions.js";
 export * from "./runtime/sessionTimeTravel.js";
 export * from "./runtime/workspace.js";
 export * from "./evaluation/certification.js";
+export * from "./evaluation/certificationRunner.js";
+export * from "./evaluation/certificationCli.js";
 export * from "./runtime/versionLedger.js";
 export * from "./engine/types.js";
 export * from "./engine/security.js";

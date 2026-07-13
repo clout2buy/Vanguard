@@ -2,13 +2,13 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
-  AssignmentBundle,
   CertificationLedgerEntry,
   CertificationManifest,
-  PrivateAssignment,
-  PublicAssignment,
+  PrivateAssignmentArtifact,
+  PublicAssignmentArtifact,
 } from "./certification.js";
 import {
+  authorizeExternalEvaluator,
   createBlindedAssignments,
   estimateCertificationCost,
   evaluateCertificate,
@@ -16,16 +16,14 @@ import {
   validateCertificationLedger,
   validateCertificationManifest,
 } from "./certification.js";
-
-interface PublicAssignmentFile {
-  readonly manifestSha256: string;
-  readonly assignments: readonly PublicAssignment[];
-}
-
-interface PrivateAssignmentFile {
-  readonly manifestSha256: string;
-  readonly assignments: readonly PrivateAssignment[];
-}
+import {
+  CertificationExecutionOrchestrator,
+  DeterministicDryRunAdapter,
+  DeterministicDryRunIsolationVerifier,
+  extractCertificationExecutionProofs,
+  FileCertificationExecutionLedger,
+  validateExecutionLedger,
+} from "./certificationRunner.js";
 
 export async function runCertificationCli(argv: readonly string[]): Promise<JsonOutput> {
   const command = argv[0];
@@ -33,7 +31,14 @@ export async function runCertificationCli(argv: readonly string[]): Promise<Json
   if (command === "validate") {
     const manifest = await readJson<CertificationManifest>(required(options, "manifest"));
     validateCertificationManifest(manifest);
-    return { ok: true, manifestSha256: manifestSha256(manifest), holdoutTasks: manifest.tasks.filter((task) => task.layer === "holdout").length };
+    const holdout = manifest.tasks.filter((task) => task.layer === "holdout");
+    return {
+      ok: true,
+      manifestSha256: manifestSha256(manifest),
+      holdoutTasks: holdout.length,
+      repositories: new Set(holdout.map((task) => task.repositoryId)).size,
+      independentGroups: new Set(holdout.map((task) => task.independenceGroupId)).size,
+    };
   }
   if (command === "blind") {
     const manifest = await readJson<CertificationManifest>(required(options, "manifest"));
@@ -44,42 +49,76 @@ export async function runCertificationCli(argv: readonly string[]): Promise<Json
     const publicFile = path.resolve(required(options, "public-out"));
     const privateFile = path.resolve(required(options, "private-out"));
     if (publicFile === privateFile) throw new Error("Public and private assignment files must be different.");
-    await exclusiveJson(publicFile, { manifestSha256: bundle.manifestSha256, assignments: bundle.publicAssignments });
+    // Write the evaluator-only mapping first. A public artifact is never
+    // published unless its exact private counterpart was durably created.
+    await exclusiveJson(privateFile, bundle.privateArtifact);
     try {
-      await exclusiveJson(privateFile, { manifestSha256: bundle.manifestSha256, assignments: bundle.privateAssignments });
+      await exclusiveJson(publicFile, bundle.publicArtifact);
     } catch (error) {
-      // The public file contains no secret mapping and is safe to leave for
-      // forensic visibility; never overwrite either side implicitly.
+      // Never overwrite either artifact implicitly; the evaluator can inspect
+      // and explicitly remove a partial freeze.
       throw error;
     }
     return {
       ok: true,
-      manifestSha256: bundle.manifestSha256,
-      assignments: bundle.publicAssignments.length,
+      manifestSha256: bundle.publicArtifact.manifestSha256,
+      assignments: bundle.publicArtifact.assignments.length,
       publicFile,
-      privateFile,
+      privateArtifactWritten: true,
     };
   }
   if (command === "evaluate") {
     const manifest = await readJson<CertificationManifest>(required(options, "manifest"));
-    const publicFile = await readJson<PublicAssignmentFile>(required(options, "public"));
-    const privateFile = await readJson<PrivateAssignmentFile>(required(options, "private"));
+    const publicArtifact = await readJson<PublicAssignmentArtifact>(required(options, "public"));
+    const privateArtifact = await readJson<PrivateAssignmentArtifact>(required(options, "private"));
     const ledger = await readJson<readonly CertificationLedgerEntry[]>(required(options, "ledger"));
-    if (publicFile.manifestSha256 !== privateFile.manifestSha256) throw new Error("Public/private assignment manifests differ.");
-    const bundle: AssignmentBundle = {
-      manifestSha256: publicFile.manifestSha256,
-      publicAssignments: publicFile.assignments,
-      privateAssignments: privateFile.assignments,
+    const executionStore = new FileCertificationExecutionLedger(required(options, "execution-ledger"));
+    const executionLedger = await executionStore.load();
+    const authority = authorizeExternalEvaluator(manifest, required(options, "evaluator-id"));
+    validateCertificationLedger(manifest, ledger);
+    const proofs = extractCertificationExecutionProofs(executionLedger, publicArtifact);
+    return evaluateCertificate(manifest, publicArtifact, privateArtifact, ledger, proofs, authority) as unknown as JsonOutput;
+  }
+  if (command === "dry-run") {
+    const manifest = await readJson<CertificationManifest>(required(options, "manifest"));
+    const publicArtifact = await readJson<PublicAssignmentArtifact>(required(options, "public"));
+    const privateArtifact = await readJson<PrivateAssignmentArtifact>(required(options, "private"));
+    const authority = authorizeExternalEvaluator(manifest, required(options, "evaluator-id"));
+    const store = new FileCertificationExecutionLedger(required(options, "execution-ledger"));
+    const adapter = new DeterministicDryRunAdapter();
+    const attestationVerifier = new DeterministicDryRunIsolationVerifier();
+    const orchestrator = new CertificationExecutionOrchestrator(
+      manifest,
+      publicArtifact,
+      privateArtifact,
+      authority,
+      adapter,
+      attestationVerifier,
+      store,
+      { maxInfrastructureAttempts: integerOption(options, "max-attempts", 2) },
+    );
+    const summary = await orchestrator.run();
+    return {
+      ok: true,
+      mode: "dry-run/no-provider",
+      providerCalls: 0,
+      fakeAdapterCalls: adapter.calls,
+      ...summary,
     };
-    validateCertificationLedger(ledger);
-    return evaluateCertificate(manifest, bundle, ledger) as unknown as JsonOutput;
+  }
+  if (command === "audit-execution") {
+    const publicArtifact = await readJson<PublicAssignmentArtifact>(required(options, "public"));
+    const store = new FileCertificationExecutionLedger(required(options, "execution-ledger"));
+    const ledger = await store.load();
+    validateExecutionLedger(ledger, publicArtifact);
+    return { ok: true, entries: ledger.length, ledgerHead: ledger.at(-1)?.hash ?? "0".repeat(64) };
   }
   if (command === "estimate") {
     const manifest = await readJson<CertificationManifest>(required(options, "manifest"));
     const assumptions = await readJson<Readonly<Record<string, { readonly meanCostPerTaskUsd: number }>>>(required(options, "assumptions"));
     return { ok: true, ...estimateCertificationCost(manifest, assumptions) };
   }
-  throw new Error("Usage: certificationCli validate|blind|evaluate|estimate --manifest FILE [command options]");
+  throw new Error("Usage: certificationCli validate|blind|dry-run|audit-execution|evaluate|estimate --manifest FILE [command options]");
 }
 
 type JsonOutput = { readonly [key: string]: unknown };
@@ -103,6 +142,14 @@ function required(options: ReadonlyMap<string, string>, name: string): string {
   const value = options.get(name);
   if (value === undefined) throw new Error(`Missing required option '--${name}'.`);
   return value;
+}
+
+function integerOption(options: ReadonlyMap<string, string>, name: string, fallback: number): number {
+  const value = options.get(name);
+  if (value === undefined) return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) throw new Error(`Option '--${name}' must be an integer.`);
+  return parsed;
 }
 
 async function readJson<T>(file: string): Promise<T> {

@@ -423,3 +423,39 @@ superiority** — the evidence selects the language afterward.
   Vanguard's runtime) not yet built (Phase 13).
 - Canary layer runs on live DeepSeek and spends real credits; runs are
   logged with commit provenance.
+
+## Phase 13 — external certification infrastructure (locally complete; no certificate)
+
+- **Statistical correction:** schema v2 freezes repository/group provenance
+  and resamples independence-group means only after repetitions are averaged
+  within tasks. Reports expose raw paired runs, tasks, repositories, and true
+  independent groups. Individual repetitions can no longer inflate a
+  confidence interval.
+- **Method freeze:** executable and environment digests plus provider, model,
+  reasoning effort, tool/step/token budgets, and exact CLI arguments are
+  mandatory per engine and task track. An omitted effort knob invalidates the
+  manifest instead of inheriting a vendor default.
+- **Blinded patch review:** every result requires two distinct independent
+  blinded reviewers with rubric/evidence/conflict-disclosure bindings. A
+  material score disagreement requires a third distinct blinded adjudicator
+  with rationale and evidence.
+- **Evaluator drivetrain:** public/private assignment artifacts have tagged
+  audiences and exact bindings; only an explicit external-evaluator authority
+  can join identities. The external-run port journals start/interruption/
+  timeout/failure/completion with compare-and-swap persistence, deterministic
+  orphan resume, idempotent completed-run skipping, isolation, interventions,
+  normalized usage, cost, grader, and artifact evidence.
+- **Isolation attestation:** real certification mode requires an independently
+  verified Ed25519 host attestation bound to manifest/run/assignment/source/
+  grader and a validity window. The fake adapter/verifier use a distinct
+  `dry-run` mode whose evidence cannot enter the result ledger.
+- **Local proof only:** the deterministic no-provider dry run exercises all
+  assignments and a second invocation skips every completed run. Tamper,
+  wrong mapping, orphan, timeout/abort, bad isolation binding, forged host
+  signature, reviewer disagreement, and repetition-pseudoreplication tests
+  fail closed. This spends no provider credit and proves no competitive
+  capability.
+- **External gate remains:** the never-run holdout, evaluator trust roots,
+  real competitor adapters, 2,304 planned isolated executions, independent
+  human reviews, and resulting clustered confidence intervals do not exist in
+  this repository. Status remains **not certified** until those occur.
