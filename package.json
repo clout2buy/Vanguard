@@ -21,6 +21,7 @@
     "docs/ENGINE_PROTOCOL.md",
     "docs/PORTABILITY.md",
     "docs/PROVIDERS.md",
+    "docs/ARES_INTEGRATION.md",
     "examples",
     "scripts/vanguard",
     "scripts/vanguard.ps1",

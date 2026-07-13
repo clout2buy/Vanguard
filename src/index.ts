@@ -50,3 +50,7 @@ export * from "./extensions/customTools.js";
 export * from "./extensions/hooks.js";
 export * from "./extensions/mcp.js";
 export * from "./extensions/ports.js";
+export * from "./integration/aresTypes.js";
+export * from "./integration/rollout.js";
+export * from "./integration/betaTelemetry.js";
+export * from "./integration/aresAdapter.js";
