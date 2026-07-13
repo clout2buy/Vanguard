@@ -51,13 +51,23 @@ The runner writes per-case scorecards plus a versioned aggregate under `gauntlet
 
 The runner validates the selected provider credential before creating sessions. Authentication and other pre-inference failures are infrastructure errors, not benchmark failures, and must never be recorded as a zero capability score.
 
-Provider transport, authentication, and protocol/adapter failures are classified as `infrastructure_error`. Schema v4 reports total cases, evaluated cases, and infrastructure errors separately; when no case reaches a capability outcome, aggregate `score` and `executionQuality` are `null`. Exit code `2` denotes infrastructure failure, while exit code `1` denotes an evaluated capability failure.
+Provider transport, authentication, and protocol/adapter failures are classified as `infrastructure_error`. Schema v4 reported total cases, evaluated cases, and infrastructure errors separately; exit code `2` denotes infrastructure failure, while exit code `1` denotes an evaluated capability failure. Schema v8 no longer lets exclusions inflate the headline: every non-verified case, including genuine infrastructure failures, contributes zero to `score`, whose denominator is always `total`; any infrastructure failure also marks the aggregate `complete: false` and `comparable: false`.
 
 Schema v5 adds pre-mutation scope enforcement and distinguishes productive local test failures from malformed test-harness failures. Case graders accept semantically useful error wording rather than requiring one arbitrary phrase.
 
 Schema v6 requires `workspace.changes` review after the final mutation and exposes large patch expansion before completion. Plugin-lifecycle v3 adds prototype-safe status-key behavior.
 
 Schema v7 adds durable context-compaction counts, the long-horizon Ward mod track, fixed trusted project checks across every case, provider/capability outcome separation, and per-case raw-process exposure. Semantically equivalent useful errors are accepted; wording-only grader failures invalidate the benchmark result and require a corrected rerun.
+
+Schema v8 removes candidate self-grading from the measurement boundary. A
+separate evaluator binds the emitted scorecard to its on-disk session,
+configuration, hash-chained journal, and independently observed patch; checks
+edit scope and protected files; and reruns the sealed grader with credentials
+removed from its environment. Only that combined result can pass. Malformed
+engine output and false completion claims are scored engine/capability failures
+instead of being excluded as infrastructure. Canonically proven infrastructure
+failures retain their diagnostic classification but still score zero in the
+total-case headline and make the aggregate non-comparable.
 
 ## Execution-quality score
 

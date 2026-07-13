@@ -34,6 +34,34 @@ function Resolve-CanaryCommit {
   return $Resolved.ToLowerInvariant()
 }
 
+function Get-CanaryGitPathState {
+  param(
+    [Parameter(Mandatory = $true)][string]$RepositoryRoot,
+    [Parameter(Mandatory = $true)][string[]]$RelativePaths
+  )
+
+  $Commit = Resolve-CanaryCommit -RepositoryRoot $RepositoryRoot -Commit HEAD
+  $Arguments = @(
+    "-C", [IO.Path]::GetFullPath($RepositoryRoot),
+    "status", "--porcelain=v1", "--untracked-files=all", "--"
+  ) + $RelativePaths
+  $PreviousErrorPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
+  try {
+    $Output = (& git @Arguments 2>&1 | Out-String).Trim()
+  }
+  finally {
+    $ErrorActionPreference = $PreviousErrorPreference
+  }
+  if ($LASTEXITCODE -ne 0) {
+    throw "Unable to inspect evaluator harness source state: $Output"
+  }
+  return [pscustomobject]@{
+    commit = $Commit
+    changes = if ([string]::IsNullOrWhiteSpace($Output)) { @() } else { @($Output -split "`r?`n") }
+  }
+}
+
 function Get-CanaryFileManifest {
   param(
     [Parameter(Mandatory = $true)][string]$Root,
@@ -199,6 +227,116 @@ function Get-CanaryInvariantViolations {
   }
   if (-not $AggregateExists) {
     $Violations += "the gauntlet did not produce its explicit aggregate output"
+  }
+  return $Violations
+}
+
+function Get-CanaryAggregateViolations {
+  param(
+    [Parameter(Mandatory = $true)]$Aggregate,
+    [Parameter(Mandatory = $true)][bool]$InfrastructureProbe,
+    [Parameter(Mandatory = $true)][string]$PinnedCommit,
+    [Parameter(Mandatory = $true)][string]$ArtifactHash,
+    [string]$Provider = "",
+    [string]$Model = "",
+    [int]$EvaluationExitCode = 0,
+    [string[]]$RequestedCaseIds = @()
+  )
+
+  $Violations = @()
+  try {
+    if ($InfrastructureProbe) {
+      if ($Aggregate.version -ne 1 -or $Aggregate.probe -ne $true) {
+        $Violations += "infrastructure probe aggregate has the wrong schema"
+      }
+      if ($Aggregate.pinnedCommit -ne $PinnedCommit -or $Aggregate.isolatedBuildHash -ne $ArtifactHash) {
+        $Violations += "infrastructure probe aggregate is not bound to the pinned build"
+      }
+      if ($EvaluationExitCode -ne 0) {
+        $Violations += "infrastructure probe returned exit code $EvaluationExitCode"
+      }
+      return $Violations
+    }
+
+    if ($Aggregate.version -ne 8) { $Violations += "gauntlet aggregate version is not 8" }
+    if ($Aggregate.provider -ne $Provider -or $Aggregate.model -ne $Model) {
+      $Violations += "gauntlet aggregate provider/model does not match the request"
+    }
+    $Cases = @($Aggregate.cases)
+    if ($Cases.Count -lt 1 -or $Aggregate.total -ne $Cases.Count) {
+      $Violations += "gauntlet aggregate total does not match its case records"
+    }
+    $Ids = @($Cases | ForEach-Object { [string]$_.id })
+    if (@($Ids | Select-Object -Unique).Count -ne $Ids.Count) {
+      $Violations += "gauntlet aggregate contains duplicate case ids"
+    }
+    if ($RequestedCaseIds.Count -gt 0) {
+      $ExpectedIds = @($RequestedCaseIds | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
+      $ActualIds = @($Ids | ForEach-Object { $_.ToLowerInvariant() } | Sort-Object)
+      if (($ExpectedIds -join "`n") -ne ($ActualIds -join "`n")) {
+        $Violations += "gauntlet aggregate case ids do not match the exact requested selection"
+      }
+    }
+
+    $Passed = @($Cases | Where-Object { $_.verified -eq $true }).Count
+    $InfrastructureErrors = @($Cases | Where-Object { $_.classification -eq "infrastructure_error" }).Count
+    $EngineErrors = @($Cases | Where-Object { $_.classification -eq "engine_error" }).Count
+    $Evaluated = $Cases.Count - $InfrastructureErrors
+    if ($Aggregate.passed -ne $Passed -or $Aggregate.infrastructureErrors -ne $InfrastructureErrors `
+      -or $Aggregate.engineErrors -ne $EngineErrors -or $Aggregate.evaluated -ne $Evaluated) {
+      $Violations += "gauntlet aggregate summary counts do not match its case records"
+    }
+    $ExpectedScore = if ($Cases.Count -eq 0) { 0.0 } else { [double]$Passed / [double]$Cases.Count }
+    if ([math]::Abs([double]$Aggregate.score - $ExpectedScore) -gt 0.000000001) {
+      $Violations += "gauntlet aggregate score is not passed/total"
+    }
+    $ExpectedComparable = $InfrastructureErrors -eq 0
+    if ($Aggregate.complete -ne $ExpectedComparable -or $Aggregate.comparable -ne $ExpectedComparable) {
+      $Violations += "gauntlet aggregate completeness/comparability flags are inconsistent"
+    }
+
+    foreach ($Case in $Cases) {
+      if ($Case.verified -isnot [bool] -or $Case.capabilityEligible -isnot [bool]) {
+        $Violations += "case '$($Case.id)' has non-boolean verification fields"
+        continue
+      }
+      if ($Case.classification -notin @("verified", "capability_failure", "infrastructure_error", "engine_error")) {
+        $Violations += "case '$($Case.id)' has an unknown classification"
+      }
+      if ($Case.verified) {
+        if ($Case.score -ne 1 -or $Case.classification -ne "verified" -or $Case.capabilityEligible -ne $true `
+          -or $Case.exitCode -ne 0 -or $Case.evaluator.bindingPassed -ne $true `
+          -or $Case.evaluator.integrityPassed -ne $true -or $Case.evaluator.graderPassed -ne $true `
+          -or (@($Case.evaluator.violations).Count -ne 0)) {
+          $Violations += "verified case '$($Case.id)' lacks complete independent evidence"
+        }
+      }
+      else {
+        if ($Case.score -ne 0 -or $Case.classification -eq "verified") {
+          $Violations += "non-verified case '$($Case.id)' does not score zero"
+        }
+        if (($Case.classification -eq "infrastructure_error") -ne ($Case.capabilityEligible -eq $false)) {
+          $Violations += "case '$($Case.id)' has inconsistent infrastructure eligibility"
+        }
+      }
+    }
+
+    $BindingFailures = @($Cases | Where-Object { $_.evaluator.bindingPassed -ne $true }).Count
+    $IntegrityFailures = @($Cases | Where-Object { $_.evaluator.integrityPassed -ne $true }).Count
+    $GraderFailures = @($Cases | Where-Object { $_.evaluator.graderPassed -ne $true }).Count
+    if ($Aggregate.externalEvaluation.bindingFailures -ne $BindingFailures `
+      -or $Aggregate.externalEvaluation.integrityFailures -ne $IntegrityFailures `
+      -or $Aggregate.externalEvaluation.graderFailures -ne $GraderFailures) {
+      $Violations += "gauntlet external-evaluation summary does not match its case evidence"
+    }
+
+    $ExpectedExitCode = if ($InfrastructureErrors -gt 0) { 2 } elseif ($Passed -ne $Cases.Count) { 1 } else { 0 }
+    if ($EvaluationExitCode -ne $ExpectedExitCode) {
+      $Violations += "gauntlet exit code $EvaluationExitCode does not match aggregate outcome $ExpectedExitCode"
+    }
+  }
+  catch {
+    $Violations += "gauntlet aggregate schema validation failed: $($_.Exception.Message)"
   }
   return $Violations
 }

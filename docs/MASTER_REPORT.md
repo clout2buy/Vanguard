@@ -51,12 +51,20 @@ Phase 5–6 in this historical execution record.
   below.
 - **Reproducibility boundary:** explicit commit resolved once; exclusive
   process lock; detached disposable worktree; isolated `npm ci` + build;
-  exact GUID-qualified aggregate output; start/end source, harness, and
+  exact GUID-qualified aggregate output; clean committed evaluator source
+  copied into an immutable per-run snapshot; start/end source, harness, and
   artifact manifests; unconditional cleanup; invalidation on any drift.
 - **Automated proof:** a no-inference infrastructure probe builds a historical
   detached commit and records its exact aggregate, while support tests prove
   that lock contention plus simulated commit/artifact/harness drift are
-  rejected. Probe wrappers are deliberately not capability evidence.
+  rejected. Independent-evaluator tests prove that a self-reported pass is
+  rejected for sealed-grader failure, protected/out-of-scope mutation, forged
+  patch metrics, malformed stdout, or broken journal/config/session binding.
+  Engine/protocol failures remain in the denominator rather than being hidden
+  as infrastructure. Even genuine provider infrastructure failures contribute
+  zero to the total-case headline and mark the aggregate incomplete and
+  non-comparable, preventing a partial 1.0. Probe wrappers are deliberately not
+  capability evidence.
 - **Canary baseline:** no valid baseline is currently claimed. A replacement
   must be produced by the hardened runner from an explicitly pinned commit.
 - **Commits:** recorded below as they land.

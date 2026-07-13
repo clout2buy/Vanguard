@@ -16,8 +16,9 @@ param(
   [switch]$InfrastructureProbe
 )
 
-# Gate Zero Layer 1. The evaluator harness is the current committed script set,
-# whose content hash is recorded and guarded for the duration of the run. The
+# Gate Zero Layer 1. The evaluator harness is copied from a clean committed
+# script set into an immutable per-run snapshot whose content hash is guarded.
+# The source commit and source bytes are also checked again after execution. The
 # engine, cases, dependencies, build output, and execution all live in a
 # disposable detached worktree pinned to one commit resolved before any work.
 
@@ -63,11 +64,17 @@ $Worktree = Join-Path $WorktreeBase "vanguard-canary-$RunId"
 $HarnessPaths = @(
   "run-canary.ps1",
   "run-private-gauntlet.ps1",
+  "gauntlet-evaluator.mjs",
   "canary-support.ps1",
   "credential.ps1"
 )
-$HarnessStart = Get-CanaryFileManifest -Root $PSScriptRoot -RelativePaths $HarnessPaths
+$HarnessSnapshot = Join-Path $RunDirectory "evaluator-harness"
+$HarnessStart = $null
 $HarnessEnd = $null
+$HarnessSourceStart = $null
+$HarnessSourceEnd = $null
+$HarnessGitStart = $null
+$HarnessGitEnd = $null
 $ArtifactStart = $null
 $ArtifactEnd = $null
 $DependencyLock = $null
@@ -87,6 +94,19 @@ $AggregateParseAttempted = $false
 
 try {
   New-Item -ItemType Directory -Force -Path $RunDirectory | Out-Null
+  $HarnessGitStart = Get-CanaryGitPathState -RepositoryRoot $Root -RelativePaths ($HarnessPaths | ForEach-Object { "scripts/$_" })
+  if (@($HarnessGitStart.changes).Count -gt 0) {
+    throw "Evaluator harness source is not a clean committed tree: $($HarnessGitStart.changes -join '; ')"
+  }
+  $HarnessSourceStart = Get-CanaryFileManifest -Root $PSScriptRoot -RelativePaths $HarnessPaths
+  New-Item -ItemType Directory -Force -Path $HarnessSnapshot | Out-Null
+  foreach ($HarnessPath in $HarnessPaths) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $HarnessPath) -Destination (Join-Path $HarnessSnapshot $HarnessPath)
+  }
+  $HarnessStart = Get-CanaryFileManifest -Root $HarnessSnapshot -RelativePaths $HarnessPaths
+  if ($HarnessStart.aggregateSha256 -ne $HarnessSourceStart.aggregateSha256) {
+    throw "Evaluator harness snapshot does not match its committed source bytes."
+  }
   if (-not $InfrastructureProbe) {
     Import-VanguardCredential -Provider $Provider -Root $Root
   }
@@ -140,7 +160,7 @@ try {
     $RunnerArguments = @(
       "-NoProfile",
       "-ExecutionPolicy", "Bypass",
-      "-File", (Join-Path $PSScriptRoot "run-private-gauntlet.ps1"),
+      "-File", (Join-Path $HarnessSnapshot "run-private-gauntlet.ps1"),
       "-Provider", $Provider,
       "-Model", $Model,
       "-EngineRoot", $Worktree,
@@ -158,7 +178,9 @@ try {
 
   $EndCommit = Resolve-CanaryCommit -RepositoryRoot $Worktree -Commit HEAD
   $ArtifactEnd = Get-CanaryFileManifest -Root (Join-Path $Worktree "dist")
-  $HarnessEnd = Get-CanaryFileManifest -Root $PSScriptRoot -RelativePaths $HarnessPaths
+  $HarnessEnd = Get-CanaryFileManifest -Root $HarnessSnapshot -RelativePaths $HarnessPaths
+  $HarnessSourceEnd = Get-CanaryFileManifest -Root $PSScriptRoot -RelativePaths $HarnessPaths
+  $HarnessGitEnd = Get-CanaryGitPathState -RepositoryRoot $Root -RelativePaths ($HarnessPaths | ForEach-Object { "scripts/$_" })
   $TrackedChanges = (& git -C $Worktree status --porcelain --untracked-files=no | Out-String).Trim()
   $Violations = @(Get-CanaryInvariantViolations `
     -ExpectedCommit $PinnedCommit `
@@ -169,12 +191,30 @@ try {
     -ActualHarnessHash $HarnessEnd.aggregateSha256 `
     -TrackedChanges $TrackedChanges `
     -AggregateExists (Test-Path -LiteralPath $AggregateFile -PathType Leaf))
+  if ($HarnessGitStart.commit -ne $HarnessGitEnd.commit) {
+    $Violations += "evaluator harness source commit drift: expected $($HarnessGitStart.commit), observed $($HarnessGitEnd.commit)"
+  }
+  if (@($HarnessGitEnd.changes).Count -gt 0) {
+    $Violations += "evaluator harness source gained tracked or untracked changes: $($HarnessGitEnd.changes -join '; ')"
+  }
+  if ($HarnessSourceStart.aggregateSha256 -ne $HarnessSourceEnd.aggregateSha256) {
+    $Violations += "evaluator harness source byte drift: expected $($HarnessSourceStart.aggregateSha256), observed $($HarnessSourceEnd.aggregateSha256)"
+  }
 
   if (Test-Path -LiteralPath $AggregateFile -PathType Leaf) {
     $AggregateParseAttempted = $true
     try {
       $Aggregate = Get-Content -Raw -LiteralPath $AggregateFile | ConvertFrom-Json
       $AggregateHash = (Get-FileHash -LiteralPath $AggregateFile -Algorithm SHA256).Hash.ToLowerInvariant()
+      $Violations += @(Get-CanaryAggregateViolations `
+        -Aggregate $Aggregate `
+        -InfrastructureProbe ([bool]$InfrastructureProbe) `
+        -PinnedCommit $PinnedCommit `
+        -ArtifactHash $ArtifactStart.aggregateSha256 `
+        -Provider $Provider `
+        -Model $Model `
+        -EvaluationExitCode $GauntletExit `
+        -RequestedCaseIds @($CaseId))
     }
     catch {
       $Violations += "explicit aggregate is not valid JSON: $($_.Exception.Message)"
@@ -222,13 +262,14 @@ finally {
       }
     }
     $Wrapped = [pscustomobject]@{
-      schemaVersion = 2
+      schemaVersion = 3
       layer = "development-canary"
       status = $Status
       phase = $Phase
       runId = $RunId
       provider = if ($InfrastructureProbe) { $null } else { $Provider }
       model = if ($InfrastructureProbe) { $null } else { $Model }
+      requestedCaseIds = @($CaseId)
       requestedCommit = $Commit
       pinnedCommit = $PinnedCommit
       sourceCommitStart = $StartCommit
@@ -245,6 +286,16 @@ finally {
         runtimeVersions = $RuntimeVersions
         aggregatePath = $AggregateFile
         aggregateSha256 = $AggregateHash
+        evaluatorHarnessSnapshot = $HarnessSnapshot
+      }
+      evaluatorHarnessSource = [pscustomobject]@{
+        repositoryRoot = $Root
+        commitStart = if ($null -eq $HarnessGitStart) { $null } else { $HarnessGitStart.commit }
+        commitEnd = if ($null -eq $HarnessGitEnd) { $null } else { $HarnessGitEnd.commit }
+        changesStart = if ($null -eq $HarnessGitStart) { @() } else { @($HarnessGitStart.changes) }
+        changesEnd = if ($null -eq $HarnessGitEnd) { @() } else { @($HarnessGitEnd.changes) }
+        manifestStart = $HarnessSourceStart
+        manifestEnd = $HarnessSourceEnd
       }
       evaluatorHarnessStart = $HarnessStart
       evaluatorHarnessEnd = $HarnessEnd

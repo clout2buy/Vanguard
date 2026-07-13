@@ -58,12 +58,26 @@ test("Gate Zero infrastructure probe builds and records only an explicit pinned 
     assert.equal(wrappers.length, 1);
     const wrapper = JSON.parse(await readFile(path.join(outputRoot, wrappers[0]!), "utf8"));
 
+    assert.equal(wrapper.schemaVersion, 3);
     assert.equal(wrapper.status, "infrastructure_probe");
     assert.equal(wrapper.pinnedCommit, wrapper.sourceCommitStart);
     assert.equal(wrapper.pinnedCommit, wrapper.sourceCommitEnd);
     assert.deepEqual(wrapper.invariantViolations, []);
     assert.equal(wrapper.builtArtifactsStart.aggregateSha256, wrapper.builtArtifactsEnd.aggregateSha256);
+    assert.equal(wrapper.evaluatorHarnessSource.commitStart, wrapper.evaluatorHarnessSource.commitEnd);
+    assert.deepEqual(wrapper.evaluatorHarnessSource.changesStart, []);
+    assert.deepEqual(wrapper.evaluatorHarnessSource.changesEnd, []);
+    assert.equal(
+      wrapper.evaluatorHarnessSource.manifestStart.aggregateSha256,
+      wrapper.evaluatorHarnessSource.manifestEnd.aggregateSha256,
+    );
+    assert.equal(wrapper.evaluatorHarnessStart.aggregateSha256, wrapper.evaluatorHarnessEnd.aggregateSha256);
+    assert.equal(
+      wrapper.evaluatorHarnessStart.aggregateSha256,
+      wrapper.evaluatorHarnessSource.manifestStart.aggregateSha256,
+    );
     assert.notEqual(path.resolve(wrapper.isolation.detachedWorktree), path.resolve(root));
+    assert.ok(path.resolve(wrapper.isolation.evaluatorHarnessSnapshot).startsWith(path.resolve(outputRoot)));
     assert.match(wrapper.isolation.aggregatePath, /canary-runs[\\/].*[\\/]aggregate\.json$/);
     assert.equal(wrapper.result.probe, true);
   } finally {

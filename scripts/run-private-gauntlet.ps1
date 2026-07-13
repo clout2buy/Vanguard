@@ -36,6 +36,10 @@ if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
   $PSNativeCommandUseErrorActionPreference = $false
 }
 $CasesRoot = Join-Path $Root "gauntlet\cases"
+$Evaluator = Join-Path $PSScriptRoot "gauntlet-evaluator.mjs"
+if (-not (Test-Path -LiteralPath $Evaluator -PathType Leaf)) {
+  throw "The independent gauntlet evaluator is missing: $Evaluator"
+}
 $ResultsRoot = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
   Join-Path $Root "gauntlet\results"
 }
@@ -43,6 +47,9 @@ else {
   Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))
 }
 New-Item -ItemType Directory -Force -Path $ResultsRoot | Out-Null
+if (-not [string]::IsNullOrWhiteSpace($OutputPath) -and (Test-Path -LiteralPath ([IO.Path]::GetFullPath($OutputPath)))) {
+  throw "Refusing to overwrite an existing aggregate scorecard: $([IO.Path]::GetFullPath($OutputPath))"
+}
 
 Push-Location $Root
 try {
@@ -51,10 +58,49 @@ try {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
   }
 
+  $CaseFiles = @(Get-ChildItem -LiteralPath $CasesRoot -Filter case.json -Recurse | Sort-Object FullName)
+  $CaseCatalog = @{}
+  foreach ($CaseFile in $CaseFiles) {
+    $CandidateCase = Get-Content -Raw -LiteralPath $CaseFile.FullName | ConvertFrom-Json
+    if ([string]$CandidateCase.id -notmatch "^[a-z0-9][a-z0-9_-]*$") {
+      throw "Gauntlet case has an invalid id: $($CaseFile.FullName)"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$CandidateCase.track) `
+      -or [string]::IsNullOrWhiteSpace([string]$CandidateCase.workspace) `
+      -or [string]::IsNullOrWhiteSpace([string]$CandidateCase.task) `
+      -or [string]::IsNullOrWhiteSpace([string]$CandidateCase.grader) `
+      -or $CandidateCase.maxSteps -isnot [int] -or $CandidateCase.maxSteps -lt 1 `
+      -or $null -eq $CandidateCase.publicCheck `
+      -or [string]::IsNullOrWhiteSpace([string]$CandidateCase.publicCheck.command) `
+      -or $CandidateCase.publicCheck.args -isnot [array] `
+      -or $CandidateCase.editableRoots -isnot [array] `
+      -or $CandidateCase.protected -isnot [array]) {
+      throw "Gauntlet case schema is invalid: $($CaseFile.FullName)"
+    }
+    if ($CaseCatalog.ContainsKey([string]$CandidateCase.id)) {
+      throw "Duplicate gauntlet case id '$($CandidateCase.id)'."
+    }
+    $CaseCatalog[[string]$CandidateCase.id] = [pscustomobject]@{
+      file = $CaseFile
+      case = $CandidateCase
+    }
+  }
+  if ($CaseId.Count -gt 0) {
+    $Requested = @($CaseId | ForEach-Object { [string]$_ })
+    if (@($Requested | Select-Object -Unique).Count -ne $Requested.Count) {
+      throw "Duplicate -CaseId values are not allowed."
+    }
+    $Missing = @($Requested | Where-Object { -not $CaseCatalog.ContainsKey($_) })
+    if ($Missing.Count -gt 0) {
+      throw "Unknown -CaseId value(s): $($Missing -join ', ')."
+    }
+  }
+
   $Results = @()
-  foreach ($CaseFile in Get-ChildItem -LiteralPath $CasesRoot -Filter case.json -Recurse | Sort-Object FullName) {
+  foreach ($CatalogEntry in $CaseCatalog.Values | Sort-Object { $_.file.FullName }) {
+    $CaseFile = $CatalogEntry.file
     $CaseRoot = Split-Path -Parent $CaseFile.FullName
-    $Case = Get-Content -Raw -LiteralPath $CaseFile.FullName | ConvertFrom-Json
+    $Case = $CatalogEntry.case
     if ($CaseId.Count -gt 0 -and $Case.id -notin $CaseId) { continue }
     $Workspace = Join-Path $CaseRoot $Case.workspace
     $Task = Get-Content -Raw -LiteralPath (Join-Path $CaseRoot $Case.task)
@@ -87,70 +133,41 @@ try {
     Write-Host "Running $($Case.id) [$($Case.track)]..." -ForegroundColor Cyan
     $Raw = (& node @Arguments | Out-String)
     $ExitCode = $LASTEXITCODE
-    try {
-      $Scorecard = $Raw | ConvertFrom-Json
-      $Results += [pscustomobject]@{
-        id = $Case.id
-        caseVersion = if ($null -eq $Case.version) { 1 } else { [int]$Case.version }
-        track = $Case.track
-        score = $Scorecard.grade.score
-        verified = $Scorecard.grade.verified
-        classification = $Scorecard.grade.classification
-        capabilityEligible = $Scorecard.grade.classification -ne "infrastructure_error"
-        steps = $Scorecard.grade.steps
-        durationMs = $Scorecard.durationMs
-        toolFailures = $Scorecard.trajectory.toolFailures
-        localTestFailures = $Scorecard.trajectory.localTestFailures
-        testHarnessFailures = $Scorecard.trajectory.testHarnessFailures
-        toolFrictionFailures = $Scorecard.trajectory.toolFrictionFailures
-        verificationFailures = $Scorecard.trajectory.verificationFailures
-        completionClaims = $Scorecard.trajectory.completionClaims
-        policyBlocks = $Scorecard.trajectory.policyBlocks
-        contextCompactions = $Scorecard.trajectory.contextCompactions
-        executionQuality = $Scorecard.grade.executionQuality.score
-        changedFiles = $Scorecard.patch.changedFiles.Count
-        filesAdded = $Scorecard.patch.filesAdded
-        filesDeleted = $Scorecard.patch.filesDeleted
-        filesModified = $Scorecard.patch.filesModified
-        beforeLines = $Scorecard.patch.beforeLines
-        afterLines = $Scorecard.patch.afterLines
-        session = $Scorecard.workspaceRoot
-        scorecard = $Scorecard.scorecardFile
-        exitCode = $ExitCode
+    $EngineOutputFile = Join-Path $ResultsRoot "engine-$($Case.id)-$([guid]::NewGuid().ToString('N')).json"
+    [IO.File]::WriteAllText($EngineOutputFile, $Raw, [Text.UTF8Encoding]::new($false))
+    $EvaluationRequest = [pscustomobject]@{
+      caseId = [string]$Case.id
+      caseVersion = if ($null -eq $Case.version) { 1 } else { [int]$Case.version }
+      track = [string]$Case.track
+      candidateOutputFile = $EngineOutputFile
+      engineExitCode = [int]$ExitCode
+      sourceWorkspace = $Workspace
+      grader = $Grader
+      provider = $Provider
+      model = $Model
+      task = $Task
+      maxSteps = [int]$Case.maxSteps
+      graderTimeoutMs = 600000
+      editableRoots = @($Case.editableRoots | ForEach-Object { [string]$_ })
+      protectedPaths = @($Case.protected | ForEach-Object { [string]$_ })
+      publicCheck = [pscustomobject]@{
+        command = [string]$Case.publicCheck.command
+        args = @($Case.publicCheck.args | ForEach-Object { [string]$_ })
       }
     }
+    $EvaluationJson = ConvertTo-Json -Compress -Depth 10 -InputObject $EvaluationRequest
+    $EvaluationPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($EvaluationJson))
+    $EvaluationRaw = (& node $Evaluator --request-base64 $EvaluationPayload | Out-String)
+    $EvaluatorExit = $LASTEXITCODE
+    if ($EvaluatorExit -ne 0) {
+      throw "Independent evaluator failed for '$($Case.id)' with exit code $EvaluatorExit. $EvaluationRaw"
+    }
+    try {
+      $Evaluation = $EvaluationRaw | ConvertFrom-Json
+      $Results += $Evaluation
+    }
     catch {
-      $Results += [pscustomobject]@{
-        id = $Case.id
-        caseVersion = if ($null -eq $Case.version) { 1 } else { [int]$Case.version }
-        track = $Case.track
-        score = 0
-        verified = $false
-        classification = "infrastructure_error"
-        capabilityEligible = $false
-        steps = 0
-        durationMs = 0
-        toolFailures = 0
-        localTestFailures = 0
-        testHarnessFailures = 0
-        toolFrictionFailures = 0
-        verificationFailures = 0
-        completionClaims = 0
-        policyBlocks = 0
-        contextCompactions = 0
-        executionQuality = 0
-        changedFiles = 0
-        filesAdded = 0
-        filesDeleted = 0
-        filesModified = 0
-        beforeLines = 0
-        afterLines = 0
-        session = $null
-        scorecard = $null
-        exitCode = $ExitCode
-        parseError = $_.Exception.Message
-        raw = $Raw
-      }
+      throw "Independent evaluator returned malformed JSON for '$($Case.id)': $($_.Exception.Message)"
     }
   }
 
@@ -161,19 +178,20 @@ try {
   $EvaluatedResults = @($Results | Where-Object capabilityEligible)
   $Evaluated = $EvaluatedResults.Count
   $InfrastructureErrors = $Total - $Evaluated
-  $Passed = @($EvaluatedResults | Where-Object verified).Count
+  $Passed = @($Results | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 7
+    version = 8
     provider = $Provider
     model = $Model
     passed = $Passed
     total = $Total
     evaluated = $Evaluated
     infrastructureErrors = $InfrastructureErrors
-    score = if ($Evaluated -eq 0) { $null } else { $Passed / $Evaluated }
-    executionQuality = if ($Evaluated -eq 0) { $null } else {
-      [math]::Round((($EvaluatedResults | Measure-Object -Property executionQuality -Average).Average), 3)
-    }
+    engineErrors = @($Results | Where-Object classification -eq "engine_error").Count
+    complete = $InfrastructureErrors -eq 0
+    comparable = $InfrastructureErrors -eq 0
+    score = $Passed / $Total
+    executionQuality = [math]::Round((($Results | Measure-Object -Property executionQuality -Average).Average), 3)
     completedAt = (Get-Date).ToUniversalTime().ToString("o")
     trajectory = [pscustomobject]@{
       totalSteps = [int](($Results | Measure-Object -Property steps -Sum).Sum)
@@ -194,6 +212,11 @@ try {
       beforeLines = [int](($Results | Measure-Object -Property beforeLines -Sum).Sum)
       afterLines = [int](($Results | Measure-Object -Property afterLines -Sum).Sum)
     }
+    externalEvaluation = [pscustomobject]@{
+      bindingFailures = @($Results | Where-Object { -not $_.evaluator.bindingPassed }).Count
+      integrityFailures = @($Results | Where-Object { -not $_.evaluator.integrityPassed }).Count
+      graderFailures = @($Results | Where-Object { -not $_.evaluator.graderPassed }).Count
+    }
     cases = $Results
   }
   $Output = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
@@ -210,7 +233,7 @@ try {
   $Aggregate | ConvertTo-Json -Depth 10
   Write-Host "Aggregate scorecard: $Output" -ForegroundColor Green
   if ($InfrastructureErrors -gt 0) { exit 2 }
-  if ($Passed -ne $Evaluated) { exit 1 }
+  if ($Passed -ne $Total) { exit 1 }
 }
 finally {
   Pop-Location

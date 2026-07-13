@@ -19,13 +19,26 @@ eventually certify it. It uses three strictly separated layers.
   that object. Dependencies are installed there with `npm ci`; the engine is
   built and executed from that worktree's private `dist/`. Development builds
   may therefore continue in the active tree without changing the evaluated
-  artifact. The source commit, evaluator-harness hash, dependency-lock object,
-  and complete built-artifact manifest are captured before execution and
-  checked again afterward. Any drift makes the wrapper `invalidated`.
+  artifact. The evaluator harness must be clean and committed before any paid
+  call; its source commit and bytes are recorded, copied into a per-run frozen
+  snapshot, and checked again afterward. The source commit, dependency-lock
+  object, and complete built-artifact manifest are also captured before
+  execution and checked again afterward. Any drift makes the wrapper
+  `invalidated`.
 - **Output rule:** every invocation owns a GUID-qualified run directory and
   passes its exact `aggregate.json` path to the gauntlet. Selecting the
   newest file in a shared directory is forbidden. Cleanup runs in `finally`;
   a cleanup failure also invalidates the run.
+- **Independent scoring rule:** candidate stdout is never a grade. The frozen
+  evaluator binds stdout to the canonical on-disk scorecard, session metadata,
+  guarded run configuration, and independently validated hash-chained journal;
+  compares final patch metrics and edit scope against the sealed source tree;
+  then executes the sealed grader again in a secret-scrubbed child process.
+  A pass requires every one of those checks. Malformed engine output, broken
+  bindings, and false verifier claims remain capability failures in the score
+  denominator. A canonically bound provider/transport failure is diagnosed as
+  infrastructure, but still contributes zero to the headline total-case score
+  and makes the aggregate incomplete/non-comparable.
 
 ## Layer 2 — Shadow regression set (sealed, run at milestones)
 
@@ -72,10 +85,11 @@ eventually certify it. It uses three strictly separated layers.
 ```
 
 `-Commit` defaults to `HEAD`, but is still resolved to a full commit before
-the lock or worktree is created. The runner harness can evaluate historical
-commits because it takes the engine root explicitly; the task corpus and
-engine always come from the pinned worktree, while the harness's own content
-hash is recorded and guarded for the full run.
+  the lock or worktree is created. The runner harness can evaluate historical
+  commits because it takes the engine root explicitly; the task corpus and
+  engine always come from the pinned worktree. The evaluator comes from a
+  separately recorded clean harness commit and runs from its immutable
+  per-run snapshot.
 
 ## Phase KPIs
 

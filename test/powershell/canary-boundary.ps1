@@ -62,6 +62,85 @@ try {
   }
   Assert-CanaryTest $SecondOwnerRejected "A second process handle acquired the exclusive canary lock."
 
+  $VerifiedCase = [pscustomobject]@{
+    id = "verified-case"
+    verified = $true
+    score = 1
+    classification = "verified"
+    capabilityEligible = $true
+    exitCode = 0
+    evaluator = [pscustomobject]@{
+      bindingPassed = $true
+      integrityPassed = $true
+      graderPassed = $true
+      violations = @()
+    }
+  }
+  $ValidAggregate = [pscustomobject]@{
+    version = 8
+    provider = "deepseek"
+    model = "fixture"
+    passed = 1
+    total = 1
+    evaluated = 1
+    infrastructureErrors = 0
+    engineErrors = 0
+    complete = $true
+    comparable = $true
+    score = 1.0
+    externalEvaluation = [pscustomobject]@{
+      bindingFailures = 0
+      integrityFailures = 0
+      graderFailures = 0
+    }
+    cases = @($VerifiedCase)
+  }
+  $ValidAggregateViolations = @(Get-CanaryAggregateViolations `
+    -Aggregate $ValidAggregate -InfrastructureProbe $false `
+    -PinnedCommit $Pinned -ArtifactHash "artifact" `
+    -Provider "deepseek" -Model "fixture" -EvaluationExitCode 0 `
+    -RequestedCaseIds @("verified-case"))
+  Assert-CanaryTest ($ValidAggregateViolations.Count -eq 0) "A valid independently scored aggregate was rejected: $($ValidAggregateViolations -join '; ')"
+
+  $InfrastructureCase = [pscustomobject]@{
+    id = "infrastructure-case"
+    verified = $false
+    score = 0
+    classification = "infrastructure_error"
+    capabilityEligible = $false
+    exitCode = 1
+    evaluator = [pscustomobject]@{
+      bindingPassed = $true
+      integrityPassed = $true
+      graderPassed = $false
+      violations = @("provider unavailable")
+    }
+  }
+  $InflatedAggregate = [pscustomobject]@{
+    version = 8
+    provider = "deepseek"
+    model = "fixture"
+    passed = 1
+    total = 2
+    evaluated = 1
+    infrastructureErrors = 1
+    engineErrors = 0
+    complete = $false
+    comparable = $false
+    score = 1.0
+    externalEvaluation = [pscustomobject]@{
+      bindingFailures = 0
+      integrityFailures = 0
+      graderFailures = 1
+    }
+    cases = @($VerifiedCase, $InfrastructureCase)
+  }
+  $InflatedViolations = @(Get-CanaryAggregateViolations `
+    -Aggregate $InflatedAggregate -InfrastructureProbe $false `
+    -PinnedCommit $Pinned -ArtifactHash "artifact" `
+    -Provider "deepseek" -Model "fixture" -EvaluationExitCode 2)
+  Assert-CanaryTest (($InflatedViolations -join "`n") -match "passed/total") "Infrastructure exclusion inflated the headline score."
+
   Write-Output "Gate Zero support boundary assertions passed."
 }
 finally {
