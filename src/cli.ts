@@ -40,6 +40,8 @@ import {
   PlanLedger,
   PlanTool,
   PublicRunEventPresenter,
+  StickyContextPolicy,
+  UsageLedger,
   createStreamLifecyclePresenter,
   encodePublicRunEvent,
   type CodingSession,
@@ -120,7 +122,7 @@ async function runCommand(resuming: boolean, args: readonly string[]): Promise<v
     runtime.kernel.run(runtimeTask, signal, priorEvents));
   await writeScorecard({
     session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
-    startedAt, resumed: resuming,
+    startedAt, resumed: resuming, usage: runtime.usage,
   });
   if (outcome.status !== "completed") process.exitCode = 1;
 }
@@ -207,7 +209,7 @@ async function advanceSession(
     if (outcome.status === "completed" || outcome.status === "failed") {
       await writeScorecard({
         session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
-        startedAt, resumed: true,
+        startedAt, resumed: true, usage: runtime.usage,
       });
     } else {
       printAdvanceOutcome(outcome, session, container, journalFile);
@@ -224,6 +226,23 @@ interface ExecutionRuntime {
   readonly kernel: AgentKernelType;
   readonly mutationPolicyDescription: string;
   readonly journalActivity: () => number;
+  readonly usage?: UsageLedger;
+}
+
+/** Merges the public-event stream presenter with usage accounting. */
+function combinedObserver(presenter: StreamObserver, usage: UsageLedger): StreamObserver {
+  const ledger = usage.observer();
+  return {
+    started: (attempt) => presenter.started?.(attempt),
+    delta: (text) => presenter.delta(text),
+    reset: () => presenter.reset?.(),
+    committed: () => presenter.committed?.(),
+    failed: (reason) => presenter.failed?.(reason),
+    usage: (value) => {
+      ledger.usage?.(value);
+      presenter.usage?.(value);
+    },
+  };
 }
 
 function buildConversationRuntime(
@@ -312,12 +331,17 @@ async function buildExecutionRuntime(
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const checkpoint = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const plan = await PlanLedger.open(path.join(container, "plan.json"));
+  const usage = new UsageLedger(options.model);
   // Both durable states ride into every request as runtime-owned context.
   const workingState = {
     snapshot: () => ({ checkpoint: checkpoint.snapshot(), plan: plan.snapshot() }),
   };
+  const observer: StreamObserver = interactive
+    ? combinedObserver(createStreamPresenter(markActivity), usage)
+    : { delta: () => {}, usage: (value) => usage.record(value) };
   const kernel = new AgentKernel({
-    model: createModel(options, interactive ? createStreamPresenter(markActivity) : undefined),
+    model: createModel(options, observer),
+    contextPolicy: new StickyContextPolicy(),
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
@@ -346,7 +370,7 @@ async function buildExecutionRuntime(
       interactive,
     },
   });
-  return { kernel, mutationPolicyDescription: mutationPolicy.describe(), journalActivity };
+  return { kernel, mutationPolicyDescription: mutationPolicy.describe(), journalActivity, usage };
 }
 
 function taskAddendum(options: CliOptions, mutationPolicy: WorkspaceMutationPolicy): string {
@@ -386,6 +410,7 @@ interface ScorecardContext {
   readonly configurationFile: string;
   readonly startedAt: number;
   readonly resumed: boolean;
+  readonly usage?: UsageLedger | undefined;
 }
 
 async function writeScorecard(context: ScorecardContext): Promise<void> {
@@ -422,6 +447,9 @@ async function writeScorecard(context: ScorecardContext): Promise<void> {
       executionQuality,
       steps: outcome.steps,
     },
+    usage: context.usage?.usage() ?? null,
+    estimatedCost: context.usage?.estimatedCost() ?? null,
+    latency: context.usage?.latencyMs() ?? null,
     durationMs: Date.now() - context.startedAt,
     journalFile: context.journalFile,
     completedAt: new Date().toISOString(),

@@ -132,9 +132,11 @@ function interpretTranscript(
   render: TranscriptRenderer,
 ): void {
   // The task must survive even when context compaction drops its transcript
-  // entry; re-anchor it as the opening message in that case.
+  // entry; re-anchor it as the opening message in that case. Working state is
+  // no longer injected here — it rides a tail message (see renderTail) so the
+  // stable prefix is never rewritten by a checkpoint or plan revision.
   if (task.length > 0 && !transcript.some((entry) => entry.role === "task")) {
-    render.task(task, workingState);
+    render.task(task, null);
   }
   /** Results still owed for calls the model has made, in call order. */
   let expected: { id: string; name: string }[] = [];
@@ -153,7 +155,7 @@ function interpretTranscript(
 
     if (entry.role === "task") {
       flushExpected();
-      render.task(typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content), workingState);
+      render.task(typeof entry.content === "string" ? entry.content : JSON.stringify(entry.content), null);
       continue;
     }
 
@@ -238,6 +240,11 @@ function interpretTranscript(
   }
   if (pendingComplete !== undefined) {
     render.toolResult(pendingComplete.id, CONTROL_TOOL_NAMES.complete, "(Verification is pending.)", false);
+  }
+  // Runtime-owned state rides a tail message: being last, a checkpoint or
+  // plan revision never invalidates the cached stable prefix.
+  if (workingState !== null) {
+    render.user(`[Vanguard runtime state]\n${JSON.stringify(workingState)}`);
   }
 }
 
@@ -329,7 +336,7 @@ export class OpenAIResponsesCodec implements ModelWireCodec {
     const input: JsonValue[] = [];
     interpretTranscript(request.task, request.transcript, request.workingState, {
       user: (text) => input.push({ role: "user", content: text }),
-      task: (text, workingState) => input.push({ role: "user", content: taskWithState(text, workingState) }),
+      task: (text) => input.push({ role: "user", content: text }),
       assistantContinuation: (continuation) => {
         if (Array.isArray(continuation)) input.push(...continuation);
         else input.push(continuation);
@@ -416,14 +423,19 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
       messages.push({ role: "user", content: resultBlocks });
       resultBlocks = [];
     };
+    // Cache breakpoint at the end of the immutable task/contract message: the
+    // system prompt and everything up to and including the task stay
+    // byte-stable across turns, so Anthropic reuses the cached prefix.
+    let taskMessageIndex = -1;
     interpretTranscript(request.task, request.transcript, request.workingState, {
       user: (text) => {
         flushResults();
         messages.push({ role: "user", content: text });
       },
-      task: (text, workingState) => {
+      task: (text) => {
         flushResults();
-        messages.push({ role: "user", content: taskWithState(text, workingState) });
+        messages.push({ role: "user", content: [{ type: "text", text }] });
+        taskMessageIndex = messages.length - 1;
       },
       assistantContinuation: (continuation) => {
         flushResults();
@@ -454,10 +466,11 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
       },
     });
     flushResults();
+    markCacheBreakpoint(messages, taskMessageIndex);
     return {
       model: this.model,
       max_tokens: this.maxTokens,
-      system: systemPrompt(request.mode),
+      system: [{ type: "text", text: systemPrompt(request.mode), cache_control: { type: "ephemeral" } }],
       messages,
       tools: request.tools.map(anthropicTool),
       tool_choice: { type: "auto" },
@@ -516,7 +529,7 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
     const messages: JsonValue[] = [{ role: "system", content: systemPrompt(request.mode) }];
     interpretTranscript(request.task, request.transcript, request.workingState, {
       user: (text) => messages.push({ role: "user", content: text }),
-      task: (text, workingState) => messages.push({ role: "user", content: taskWithState(text, workingState) }),
+      task: (text) => messages.push({ role: "user", content: text }),
       assistantContinuation: (continuation) => messages.push(continuation),
       assistantText: (text) => messages.push({ role: "assistant", content: text }),
       assistantCalls: (calls) => {
@@ -787,10 +800,23 @@ function anthropicTool(tool: ToolDefinition): JsonValue {
   return { name: tool.name, description: tool.description, input_schema: tool.inputSchema };
 }
 
-function taskWithState(task: string, workingState: JsonValue): string {
-  return workingState === null
-    ? task
-    : `${task}\n\nPersistent Vanguard working state (runtime-owned):\n${JSON.stringify(workingState)}`;
+/**
+ * Adds an Anthropic cache_control breakpoint to the last text block of a
+ * message, marking the stable prefix boundary. No-op when the index is out
+ * of range or the message content is not block-shaped.
+ */
+function markCacheBreakpoint(messages: JsonValue[], index: number): void {
+  if (index < 0 || index >= messages.length) return;
+  const message = optionalObject(messages[index]);
+  if (message === undefined || !Array.isArray(message.content)) return;
+  const blocks = message.content;
+  for (let position = blocks.length - 1; position >= 0; position -= 1) {
+    const block = optionalObject(blocks[position]);
+    if (block?.type === "text") {
+      blocks[position] = { ...block, cache_control: { type: "ephemeral" } };
+      return;
+    }
+  }
 }
 
 function asText(content: JsonValue): string {

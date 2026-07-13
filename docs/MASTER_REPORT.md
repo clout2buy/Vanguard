@@ -77,6 +77,35 @@ superiority** — the evidence selects the language afterward.
   Phase 1 engine (no plan tool was wired). Rule added going forward: canary
   runs only from committed trees.
 
+### Phase 3 — Durable context architecture + usage/cost
+
+- **Intended KPI:** bounded context across 500 turns; byte-stable prefix
+  (prefix-cache preservation); no orphan tool calls at any boundary; user
+  corrections survive; usage/cost reproduced from fixtures. Trend metric:
+  canary cost and context-compaction counts.
+- **Implemented:** `StickyContextPolicy` (monotonic forward-only boundary
+  with hysteresis, oldest-first folding into one elided-history digest with
+  source indices, verbatim preservation of task/user/verification chunks,
+  causal chunking so a decision is never split from its observations);
+  working state moved out of the task message into a tail `[Vanguard runtime
+  state]` message across all three codecs (the stable prefix no longer churns
+  when a checkpoint or plan revises); Anthropic `cache_control` breakpoints on
+  the system prompt and the task/contract message; `UsageLedger` normalizing
+  DeepSeek/OpenAI/Anthropic usage into input/cached/output/reasoning tokens
+  with a per-model price table (unknown models → null cost, never fabricated);
+  scorecards gain `usage`, `estimatedCost`, and `latency`. Execution runtime
+  now uses the sticky policy; conversation keeps the evidence policy.
+- **Adversarial proof:** 500-turn budget bound; prefix byte-stability across
+  appended turns; orphan-free property test across boundary placements ×
+  budgets; early-correction survival over 150 turns; resume determinism
+  (interrupted vs uninterrupted journals select byte-identical context);
+  working-state-in-tail and cache-breakpoint placement; usage fixtures for all
+  three shapes; cost reproduction + null-for-unknown-model.
+- **Risk:** the byte-stability guarantee holds between boundary advances; a
+  boundary advance still costs one cache miss (by design — one per advance,
+  not one per turn). Live cache-hit-rate measurement against real providers
+  is deferred to Phase 11 conformance.
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development
