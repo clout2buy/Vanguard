@@ -43,6 +43,7 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Mandatory post-test change-scope/growth review after the latest mutation
 - Editable-root filesystem permissions for restricted Node subprocesses
 - Allowlisted no-shell process execution and command-based verification
+- Model-independent BMP/PNG artifact inspection with regional visual metrics, luminance maps, HUD evidence, and pixel comparisons
 - Persistent hash-chained run journals
 - Runtime-owned working-state checkpoints that survive transcript compaction
 - Durable session resume from validated journals without replaying completed tool calls
