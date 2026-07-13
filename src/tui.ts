@@ -79,6 +79,7 @@ const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 export async function runTui(startDirectory: string): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The Vanguard TUI requires an interactive terminal.");
   const config = await promptConfiguration(startDirectory);
+  if (config === undefined) return;
   const credential = loadCredential(config.provider);
   const credentialName = credentialVariable(config.provider);
   const state: UiState = {
@@ -147,7 +148,7 @@ export async function runTui(startDirectory: string): Promise<void> {
   await printHandoff(state, config);
 }
 
-async function promptConfiguration(startDirectory: string): Promise<TuiConfig> {
+async function promptConfiguration(startDirectory: string): Promise<TuiConfig | undefined> {
   const workspace = await realpath(path.resolve(startDirectory));
   if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory.");
   const provider = configuredProvider();
@@ -161,7 +162,17 @@ async function promptConfiguration(startDirectory: string): Promise<TuiConfig> {
   try {
     let task = "";
     while (task.length === 0) {
-      task = (await prompt.question(`${ansi.violet}❯${ansi.reset} `)).trim();
+      const input = (await prompt.question(`${ansi.violet}❯${ansi.reset} `)).trim();
+      if (isExitRequest(input)) {
+        process.stdout.write(`${ansi.dim}See you next time.${ansi.reset}\n`);
+        return undefined;
+      }
+      const conversation = launchConversationResponse(input);
+      if (conversation !== undefined) {
+        process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${conversation}\n\n`);
+        continue;
+      }
+      task = input;
       if (task.length === 0) process.stdout.write(`${ansi.amber}Tell Vanguard the outcome you want.${ansi.reset}\n`);
     }
     return {
@@ -387,6 +398,10 @@ export function renderWelcomeForTest(workspace = "C:\\projects\\preview", model 
   return renderWelcome(workspace, model);
 }
 
+export function launchConversationResponseForTest(input: string): string | undefined {
+  return launchConversationResponse(input);
+}
+
 function renderWelcome(workspace: string, model: string): string {
   return `${ansi.violet}${ansi.bold}◆ VANGUARD${ansi.reset}\n`
     + `${ansi.dim}Expert coding  ·  ${path.basename(workspace)}  ·  ${model}${ansi.reset}\n`
@@ -442,6 +457,23 @@ function configuredProvider(): Provider {
   const provider = parseProvider(configured);
   if (provider === undefined) throw new Error("VANGUARD_PROVIDER must be deepseek, openai, or anthropic.");
   return provider;
+}
+
+function launchConversationResponse(input: string): string | undefined {
+  const normalized = input.trim().toLowerCase().replace(/[,.!?]+/g, " ").replace(/\s+/g, " ").trim();
+  if (/^(hi|hello|hey|yo|howdy)( there| vanguard)?$/.test(normalized)
+    || /^(good morning|good afternoon|good evening|how are you|what'?s up)$/.test(normalized)) {
+    return "Hey. What are we building, fixing, or investigating?";
+  }
+  if (/^(help|what can you do|what do you do)$/.test(normalized)) {
+    return "Give me a coding outcome in plain English. I can inspect, build, repair, test, and verify the project in this folder.";
+  }
+  if (/^(thanks|thank you|thx)$/.test(normalized)) return "Anytime. What should we work on?";
+  return undefined;
+}
+
+function isExitRequest(input: string): boolean {
+  return /^(exit|quit|\/exit|\/quit)$/i.test(input.trim());
 }
 
 function configuredMaxSteps(): number {
