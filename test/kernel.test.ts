@@ -102,8 +102,8 @@ test("opens the circuit breaker on an identical repeated failure", async () => {
     },
   };
   const repeatedCall: ModelDecision = {
-    kind: "tool",
-    call: { id: "call", name: "shell", input: { command: "bad" } },
+    kind: "tools",
+    calls: [{ id: "call", name: "shell", input: { command: "bad" } }],
   };
   const kernel = new AgentKernel({
     model: new ScriptedModel([repeatedCall, repeatedCall]),
@@ -139,13 +139,13 @@ test("a successful mutation resets repeated execution failure history", async ()
     async execute() { return { ok: true, output: "workspace changed" }; },
   };
   const repeatedTest: ModelDecision = {
-    kind: "tool",
-    call: { id: "test", name: "test", input: { command: "npm test" } },
+    kind: "tools",
+    calls: [{ id: "test", name: "test", input: { command: "npm test" } }],
   };
   const kernel = new AgentKernel({
     model: new ScriptedModel([
       repeatedTest,
-      { kind: "tool", call: { id: "write", name: "write", input: {} } },
+      { kind: "tools", calls: [{ id: "write", name: "write", input: {} }] },
       repeatedTest,
       { kind: "complete", answer: "stop after proving the retry was accepted" },
     ]),
@@ -169,7 +169,7 @@ test("executes a successful tool action and completes", async () => {
   };
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tool", call: { id: "one", name: "read", input: { path: "README.md" } } },
+      { kind: "tools", calls: [{ id: "one", name: "read", input: { path: "README.md" } }] },
       { kind: "complete", answer: "verified result" },
     ]),
     tools: [tool],
@@ -180,6 +180,87 @@ test("executes a successful tool action and completes", async () => {
   const outcome = await kernel.run("inspect then answer");
   assert.equal(outcome.status, "completed");
   assert.equal(outcome.steps, 2);
+});
+
+test("independent reads in one decision all execute and journal in call order", async () => {
+  const running = new Set<string>();
+  let sawConcurrency = false;
+  const read: ToolPort = {
+    name: "read",
+    definition: { ...toolDefinition("read"), effect: "observe" },
+    async execute(input) {
+      const path = (input as { path: string }).path;
+      running.add(path);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      if (running.size > 1) sawConcurrency = true;
+      running.delete(path);
+      return { ok: true, output: { path, contents: `contents of ${path}` } };
+    },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      {
+        kind: "tools",
+        calls: [
+          { id: "a", name: "read", input: { path: "a.ts" } },
+          { id: "b", name: "read", input: { path: "b.ts" } },
+          { id: "c", name: "read", input: { path: "c.ts" } },
+        ],
+      },
+      { kind: "complete", answer: "read all three" },
+    ]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal,
+  });
+  const outcome = await kernel.run("survey the project");
+  assert.equal(outcome.status, "completed");
+  assert.equal(sawConcurrency, true, "observe-only batches must run concurrently");
+  const observations = journal.events.filter((event) => event.type === "tool.completed");
+  assert.deepEqual(
+    observations.map((event) => (event.data as { callId: string }).callId),
+    ["a", "b", "c"],
+    "observations must be journaled in call order",
+  );
+});
+
+test("a batch containing a mutation runs strictly sequentially", async () => {
+  const order: string[] = [];
+  let concurrent = 0;
+  let sawConcurrency = false;
+  const makeTool = (name: string, effect: ToolDefinition["effect"]): ToolPort => ({
+    name,
+    definition: { ...toolDefinition(name), ...(effect === undefined ? {} : { effect }) },
+    async execute() {
+      concurrent += 1;
+      if (concurrent > 1) sawConcurrency = true;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      order.push(name);
+      concurrent -= 1;
+      return { ok: true, output: name };
+    },
+  });
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      {
+        kind: "tools",
+        calls: [
+          { id: "1", name: "read", input: {} },
+          { id: "2", name: "write", input: {} },
+          { id: "3", name: "test", input: {} },
+        ],
+      },
+      { kind: "complete", answer: "done" },
+    ]),
+    tools: [makeTool("read", "observe"), makeTool("write", "mutate"), makeTool("test", "execute")],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  });
+  const outcome = await kernel.run("mixed batch");
+  assert.equal(outcome.status, "completed");
+  assert.equal(sawConcurrency, false, "mutating batches must be serialized");
+  assert.deepEqual(order, ["read", "write", "test"]);
 });
 
 test("rejects completion until fresh execution evidence follows the latest mutation", async () => {
@@ -196,9 +277,9 @@ test("rejects completion until fresh execution evidence follows the latest mutat
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tool", call: { id: "write", name: "write", input: {} } },
+      { kind: "tools", calls: [{ id: "write", name: "write", input: {} }] },
       { kind: "complete", answer: "too early" },
-      { kind: "tool", call: { id: "test", name: "test", input: {} } },
+      { kind: "tools", calls: [{ id: "test", name: "test", input: {} }] },
       { kind: "complete", answer: "verified" },
     ]),
     tools: [mutation, execution],
@@ -227,9 +308,9 @@ test("premature evidence claims do not consume the sealed verification budget", 
   };
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tool", call: { id: "write", name: "write", input: {} } },
+      { kind: "tools", calls: [{ id: "write", name: "write", input: {} }] },
       { kind: "complete", answer: "premature" },
-      { kind: "tool", call: { id: "test", name: "test", input: {} } },
+      { kind: "tools", calls: [{ id: "test", name: "test", input: {} }] },
       { kind: "complete", answer: "verified" },
     ]),
     tools: [mutation, execution],
@@ -255,10 +336,10 @@ test("requires change review after mutation when a review tool is available", as
   };
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tool", call: { id: "write", name: "write", input: {} } },
-      { kind: "tool", call: { id: "test", name: "test", input: {} } },
+      { kind: "tools", calls: [{ id: "write", name: "write", input: {} }] },
+      { kind: "tools", calls: [{ id: "test", name: "test", input: {} }] },
       { kind: "complete", answer: "not reviewed" },
-      { kind: "tool", call: { id: "review", name: "changes", input: {} } },
+      { kind: "tools", calls: [{ id: "review", name: "changes", input: {} }] },
       { kind: "complete", answer: "reviewed" },
     ]),
     tools: [mutation, execution, review],
@@ -269,13 +350,111 @@ test("requires change review after mutation when a review tool is available", as
   assert.equal(outcome.status === "completed" ? outcome.answer : "", "reviewed");
 });
 
+test("plain narration during execution never triggers verification", async () => {
+  let verifierRuns = 0;
+  const countingVerifier: VerifierPort = {
+    name: "tests",
+    async verify() {
+      verifierRuns += 1;
+      return { verifier: "tests", passed: true, evidence: "ok" };
+    },
+  };
+  const read: ToolPort = {
+    name: "read",
+    definition: { ...toolDefinition("read"), effect: "observe" },
+    async execute() { return { ok: true, output: "evidence" }; },
+  };
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "respond", message: "Let me look around before changing anything." },
+      { kind: "tools", calls: [{ id: "r", name: "read", input: {} }] },
+      { kind: "complete", answer: "done" },
+    ]),
+    tools: [read],
+    verifiers: [countingVerifier],
+    journal: new MemoryJournal(),
+  });
+  const outcome = await kernel.run("narrate then act");
+  assert.equal(outcome.status, "completed");
+  assert.equal(verifierRuns, 1, "only the completion claim may invoke verifiers");
+});
+
+test("execution stalls out after repeated narration without tool actions", async () => {
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "respond", message: "thinking" },
+      { kind: "respond", message: "still thinking" },
+      { kind: "respond", message: "hmm" },
+    ]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  });
+  const outcome = await kernel.run("do the work");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /narration/);
+});
+
+test("ask_user in a headless run is rejected with recoverable feedback", async () => {
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "ask_user", question: "Which database do you use?" },
+      { kind: "complete", answer: "assumed sqlite and finished" },
+    ]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { interactive: false },
+  });
+  const outcome = await kernel.run("headless work");
+  assert.equal(outcome.status, "completed");
+});
+
+test("ask_user pauses durably and resumes with the user's answer", async () => {
+  const firstJournal = new MemoryJournal();
+  const first = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "ask_user", question: "Should the CLI support JSON output?" },
+    ]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: firstJournal,
+    options: { interactive: true },
+  });
+  const paused = await first.run("build the CLI");
+  assert.equal(paused.status, "waiting_for_user");
+  assert.equal(paused.status === "waiting_for_user" ? paused.question : "", "Should the CLI support JSON output?");
+
+  const resumedModel = new CapturingModel([{ kind: "complete", answer: "built with JSON output" }]);
+  const resumed = new AgentKernel({
+    model: resumedModel,
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { interactive: true },
+  });
+  // Resuming without an answer is refused.
+  await assert.rejects(
+    () => resumed.advance({}, new AbortController().signal, firstJournal.events),
+    /waiting for the user/,
+  );
+  const outcome = await resumed.advance(
+    { userMessage: "Yes, JSON output please." },
+    new AbortController().signal,
+    firstJournal.events,
+  );
+  assert.equal(outcome.status, "completed");
+  assert.equal(resumedModel.requests[0]?.transcript.some((entry) => entry.role === "user"
+    && JSON.stringify(entry.content).includes("JSON output please")), true);
+});
+
 test("kernel injects runtime-owned checkpoint state independently of transcript compaction", async () => {
   const ledger = new RunCheckpointLedger();
   const checkpoint = new CheckpointTool(ledger);
   const model = new CapturingModel([
     {
-      kind: "tool",
-      call: {
+      kind: "tools",
+      calls: [{
         id: "checkpoint",
         name: "run.checkpoint",
         input: {
@@ -285,7 +464,7 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
           evidence: ["read src/index.ts"],
           risks: ["edge-case escaping"],
         },
-      },
+      }],
     },
     { kind: "complete", answer: "done" },
   ]);
@@ -323,7 +502,7 @@ test("kernel resumes journaled transcript and sequence without replaying complet
   const firstJournal = new MemoryJournal();
   const first = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tool", call: { id: "read-1", name: "read", input: { path: "state.txt" } } },
+      { kind: "tools", calls: [{ id: "read-1", name: "read", input: { path: "state.txt" } }] },
     ]),
     tools: [readTool],
     verifiers: [passingVerifier],

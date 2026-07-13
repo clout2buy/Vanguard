@@ -4,6 +4,7 @@ export type OutcomeClassification = "verified" | "capability_failure" | "infrast
 
 export function classifyOutcome(outcome: RunOutcome): OutcomeClassification {
   if (outcome.status === "completed") return "verified";
+  if (outcome.status !== "failed") return "capability_failure";
   const infrastructureMarkers = [
     "inference endpoint returned http",
     "missing credential environment variable",

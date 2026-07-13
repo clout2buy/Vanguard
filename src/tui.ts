@@ -12,7 +12,6 @@ type Phase = "starting" | "running" | "verifying" | "completed" | "failed" | "ca
 
 interface TuiConfig {
   readonly workspace: string;
-  readonly task: string;
   readonly provider: Provider;
   readonly model: string;
   readonly verification: CommandSpec;
@@ -53,6 +52,7 @@ interface UiState {
   startedAt: number;
   frame: number;
   quietDetail: string;
+  task: string;
   agents: Map<string, AgentState>;
   activity: ActivityItem[];
   chat: ChatItem[];
@@ -60,6 +60,16 @@ interface UiState {
   session?: SessionState;
   finalResult?: Record<string, unknown>;
   error?: string;
+  /** True once a task contract exists; execution renders in the animated screen. */
+  contracted: boolean;
+  screenActive: boolean;
+  conversationMessages: string[];
+}
+
+interface TurnOutcome {
+  readonly status: string;
+  readonly message?: string;
+  readonly question?: string;
 }
 
 const ansi = {
@@ -78,77 +88,178 @@ const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 
 export async function runTui(startDirectory: string): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The Vanguard TUI requires an interactive terminal.");
-  const config = await promptConfiguration(startDirectory);
-  if (config === undefined) return;
+  const config = await resolveConfiguration(startDirectory);
   const credential = loadCredential(config.provider);
   const credentialName = credentialVariable(config.provider);
+
+  process.stdout.write(`\x1b[2J\x1b[H${renderWelcome(config.workspace, config.model)}`);
+  let sessionRoot: string | undefined;
+  let contracted = false;
+
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    while (true) {
+      const input = (await prompt.question(`${ansi.violet}❯${ansi.reset} `)).trim();
+      if (isExitRequest(input)) {
+        process.stdout.write(`${ansi.dim}See you next time.${ansi.reset}\n`);
+        return;
+      }
+      if (input.length === 0) {
+        process.stdout.write(`${ansi.amber}Tell Vanguard what you need.${ansi.reset}\n`);
+        continue;
+      }
+      prompt.pause();
+      const turn = await runTurn(input, config, credentialName, credential, sessionRoot, contracted);
+      prompt.resume();
+      sessionRoot = turn.sessionRoot ?? sessionRoot;
+      contracted = turn.contracted;
+
+      if (turn.outcome?.status === "responded") {
+        continue;
+      }
+      if (turn.outcome?.status === "waiting_for_user") {
+        const question = turn.outcome.question ?? "Vanguard needs your answer to continue.";
+        process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${question}\n\n`);
+        continue;
+      }
+      if (turn.outcome?.status === "completed") {
+        // A finished contract closes the session; the next message starts fresh.
+        sessionRoot = undefined;
+        contracted = false;
+        continue;
+      }
+      if (turn.outcome?.status === "failed") {
+        process.stdout.write(`${ansi.dim}You can keep talking to steer this session, or type exit to leave.${ansi.reset}\n`);
+        continue;
+      }
+    }
+  } finally {
+    prompt.close();
+  }
+}
+
+interface TurnResult {
+  readonly outcome: TurnOutcome | undefined;
+  readonly sessionRoot: string | undefined;
+  readonly contracted: boolean;
+}
+
+async function runTurn(
+  message: string,
+  config: TuiConfig,
+  credentialName: string,
+  credential: string,
+  sessionRoot: string | undefined,
+  alreadyContracted: boolean,
+): Promise<TurnResult> {
   const state: UiState = {
-    phase: "starting",
+    phase: alreadyContracted ? "running" : "starting",
     startedAt: Date.now(),
     frame: 0,
-    quietDetail: "Preparing isolated workspace",
-    agents: new Map([["main", { id: "main", turn: 0, action: "starting", status: "active" }]]),
+    quietDetail: alreadyContracted ? "Continuing contracted execution" : "Understanding your request",
+    task: message,
+    agents: new Map([["main", { id: "main", turn: 0, action: alreadyContracted ? "resuming" : "listening", status: "active" }]]),
     activity: [],
-    chat: [{ agentId: "you", message: config.task }],
+    chat: [{ agentId: "you", message }],
     verifiers: new Map(),
+    contracted: alreadyContracted,
+    screenActive: false,
+    conversationMessages: [],
   };
 
-  enterScreen();
-  let child: ChildProcessWithoutNullStreams | undefined;
+  const child = startAgent(message, config, credentialName, credential, sessionRoot);
   let cancelled = false;
   const onKeypress = (_text: string, key: { name?: string; ctrl?: boolean }): void => {
-    if ((key.ctrl === true && key.name === "c") || key.name === "q") {
+    if (key.ctrl === true && key.name === "c") {
       if (state.phase === "completed" || state.phase === "failed" || state.phase === "cancelled") return;
       cancelled = true;
       state.phase = "cancelling";
       state.quietDetail = "Stopping after the current process boundary";
-      child?.kill("SIGTERM");
+      child.kill("SIGTERM");
     }
   };
-  emitKeypressEvents(process.stdin);
-  process.stdin.setRawMode(true);
-  process.stdin.resume();
-  process.stdin.on("keypress", onKeypress);
+  const onSigint = (): void => {
+    cancelled = true;
+    child.kill("SIGTERM");
+  };
+  process.on("SIGINT", onSigint);
 
-  const animation = setInterval(() => {
-    state.frame += 1;
-    render(state, config);
-  }, 120);
-  animation.unref();
-
-  try {
-    child = startAgent(config, credentialName, credential);
-    state.phase = "running";
-    state.quietDetail = "Waiting for the first model decision";
-    const exitCode = await consumeChild(child, state);
-    if (cancelled) {
-      state.phase = "cancelled";
-      state.quietDetail = "Run interrupted; the session journal can be resumed";
-    } else if (exitCode === 0 && resultCompleted(state.finalResult)) {
-      state.phase = "completed";
-      state.quietDetail = "Independent verification accepted the result";
-      const main = state.agents.get("main");
-      if (main !== undefined) main.status = "done";
-    } else {
-      state.phase = "failed";
-      state.quietDetail = state.error ?? "Run stopped before verified completion";
-      const main = state.agents.get("main");
-      if (main !== undefined) main.status = "failed";
-    }
-    render(state, config);
-    await delay(500);
-  } finally {
-    clearInterval(animation);
+  const enterExecutionScreen = (): void => {
+    if (state.screenActive) return;
+    state.screenActive = true;
+    emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("keypress", onKeypress);
+    enterScreen();
+  };
+  const leaveExecutionScreen = (): void => {
+    if (!state.screenActive) return;
+    state.screenActive = false;
     process.stdin.off("keypress", onKeypress);
     process.stdin.setRawMode(false);
     process.stdin.pause();
     leaveScreen();
+  };
+
+  if (alreadyContracted) enterExecutionScreen();
+  else process.stdout.write(`${ansi.dim}…${ansi.reset}\n`);
+
+  const animation = setInterval(() => {
+    state.frame += 1;
+    if (state.screenActive) render(state, config);
+    if (!state.contracted && state.phase === "starting") state.phase = "running";
+  }, 120);
+  animation.unref();
+
+  let exitCode: number | null = null;
+  try {
+    exitCode = await consumeChild(child, state, enterExecutionScreen);
+    if (state.screenActive) {
+      if (cancelled) {
+        state.phase = "cancelled";
+        state.quietDetail = "Run interrupted; send another message to resume this session";
+      } else if (exitCode === 0 && resultCompleted(state.finalResult)) {
+        state.phase = "completed";
+        state.quietDetail = "Independent verification accepted the result";
+        const main = state.agents.get("main");
+        if (main !== undefined) main.status = "done";
+      } else if (outcomeStatus(state.finalResult) === "waiting_for_user") {
+        state.phase = "running";
+        state.quietDetail = "Vanguard is waiting for your answer";
+      } else {
+        state.phase = "failed";
+        state.quietDetail = state.error ?? "Run stopped before verified completion";
+        const main = state.agents.get("main");
+        if (main !== undefined) main.status = "failed";
+      }
+      render(state, config);
+      await delay(400);
+    }
+  } finally {
+    clearInterval(animation);
+    process.removeListener("SIGINT", onSigint);
+    leaveExecutionScreen();
   }
 
-  await printHandoff(state, config);
+  const outcome = extractOutcome(state.finalResult);
+  if (state.contracted || outcomeStatus(state.finalResult) === "completed") {
+    await printHandoff(state, config, cancelled);
+  } else if (outcome?.status === "responded" && outcome.message !== undefined
+    && !state.conversationMessages.includes(outcome.message)) {
+    process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${outcome.message}\n\n`);
+  } else if (outcome === undefined && !cancelled) {
+    process.stdout.write(`${ansi.red}${state.error ?? "Vanguard stopped unexpectedly. The session journal has the details."}${ansi.reset}\n`);
+  }
+
+  return {
+    outcome: cancelled ? { status: "failed" } : outcome,
+    sessionRoot: state.session?.sessionRoot,
+    contracted: state.contracted,
+  };
 }
 
-async function promptConfiguration(startDirectory: string): Promise<TuiConfig | undefined> {
+async function resolveConfiguration(startDirectory: string): Promise<TuiConfig> {
   const workspace = await realpath(path.resolve(startDirectory));
   if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory.");
   const provider = configuredProvider();
@@ -156,59 +267,45 @@ async function promptConfiguration(startDirectory: string): Promise<TuiConfig | 
   const maxSteps = configuredMaxSteps();
   const detectedVerification = await detectProjectVerification(workspace);
   const verification = detectedVerification ?? automaticVerificationCommand();
-
-  process.stdout.write(`\x1b[2J\x1b[H${renderWelcome(workspace, model)}`);
-  const prompt = createInterface({ input: process.stdin, output: process.stdout });
-  try {
-    let task = "";
-    while (task.length === 0) {
-      const input = (await prompt.question(`${ansi.violet}❯${ansi.reset} `)).trim();
-      if (isExitRequest(input)) {
-        process.stdout.write(`${ansi.dim}See you next time.${ansi.reset}\n`);
-        return undefined;
-      }
-      const conversation = launchConversationResponse(input);
-      if (conversation !== undefined) {
-        process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${conversation}\n\n`);
-        continue;
-      }
-      task = input;
-      if (task.length === 0) process.stdout.write(`${ansi.amber}Tell Vanguard the outcome you want.${ansi.reset}\n`);
-    }
-    return {
-      workspace,
-      task,
-      provider,
-      model,
-      verification,
-      adaptiveVerification: detectedVerification === undefined,
-      maxSteps,
-    };
-  } finally {
-    prompt.close();
-  }
+  return {
+    workspace,
+    provider,
+    model,
+    verification,
+    adaptiveVerification: detectedVerification === undefined,
+    maxSteps,
+  };
 }
 
-function startAgent(config: TuiConfig, credentialName: string, credential: string): ChildProcessWithoutNullStreams {
+function startAgent(
+  message: string,
+  config: TuiConfig,
+  credentialName: string,
+  credential: string,
+  sessionRoot: string | undefined,
+): ChildProcessWithoutNullStreams {
   const entry = path.join(import.meta.dirname, "cli.js");
-  const args = [
-    entry,
-    "run",
-    "--workspace", config.workspace,
-    "--task", expertTask(config),
-    "--provider", config.provider,
-    "--model", config.model,
-    "--verify-command", config.verification.command,
-    ...config.verification.args.flatMap((argument) => ["--verify-arg", argument]),
-    "--check-command", config.verification.command,
-    ...config.verification.args.flatMap((argument) => ["--check-arg", argument]),
-    "--verifier-evidence", "summary",
-    "--max-steps", String(config.maxSteps),
-    "--max-duration-ms", "7200000",
-    "--command-timeout-ms", "1800000",
-    "--max-context-bytes", "300000",
-    "--max-verification-attempts", "3",
-  ];
+  const args = sessionRoot !== undefined
+    ? [entry, "advance", "--session", sessionRoot, "--message", message]
+    : [
+      entry,
+      "advance",
+      "--workspace", config.workspace,
+      "--message", message,
+      "--provider", config.provider,
+      "--model", config.model,
+      "--verify-command", config.verification.command,
+      ...config.verification.args.flatMap((argument) => ["--verify-arg", argument]),
+      "--check-command", config.verification.command,
+      ...config.verification.args.flatMap((argument) => ["--check-arg", argument]),
+      "--verifier-evidence", "summary",
+      "--adaptive-verification", String(config.adaptiveVerification),
+      "--max-steps", String(config.maxSteps),
+      "--max-duration-ms", "7200000",
+      "--command-timeout-ms", "1800000",
+      "--max-context-bytes", "300000",
+      "--max-verification-attempts", "3",
+    ];
   return spawn(process.execPath, args, {
     cwd: repositoryRoot(),
     windowsHide: true,
@@ -217,7 +314,11 @@ function startAgent(config: TuiConfig, credentialName: string, credential: strin
   });
 }
 
-async function consumeChild(child: ChildProcessWithoutNullStreams, state: UiState): Promise<number | null> {
+async function consumeChild(
+  child: ChildProcessWithoutNullStreams,
+  state: UiState,
+  enterExecutionScreen: () => void,
+): Promise<number | null> {
   let stdout = "";
   let stderrBuffer = "";
   child.stdout.setEncoding("utf8");
@@ -227,13 +328,13 @@ async function consumeChild(child: ChildProcessWithoutNullStreams, state: UiStat
     stderrBuffer += chunk;
     const lines = stderrBuffer.split(/\r?\n/);
     stderrBuffer = lines.pop() ?? "";
-    for (const line of lines) consumeLine(line, state);
+    for (const line of lines) consumeLine(line, state, enterExecutionScreen);
   });
   const exitCode = await new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", resolve);
   });
-  if (stderrBuffer.length > 0) consumeLine(stderrBuffer, state);
+  if (stderrBuffer.length > 0) consumeLine(stderrBuffer, state, enterExecutionScreen);
   try {
     state.finalResult = JSON.parse(stdout) as Record<string, unknown>;
   } catch {
@@ -242,10 +343,10 @@ async function consumeChild(child: ChildProcessWithoutNullStreams, state: UiStat
   return exitCode;
 }
 
-function consumeLine(line: string, state: UiState): void {
+function consumeLine(line: string, state: UiState, enterExecutionScreen: () => void): void {
   if (line.startsWith(PUBLIC_EVENT_PREFIX)) {
     try {
-      consumeEvent(JSON.parse(line.slice(PUBLIC_EVENT_PREFIX.length)) as PublicRunEvent, state);
+      consumeEvent(JSON.parse(line.slice(PUBLIC_EVENT_PREFIX.length)) as PublicRunEvent, state, enterExecutionScreen);
     } catch {
       state.quietDetail = "Received an unreadable UI event; full evidence remains in the journal";
     }
@@ -258,7 +359,7 @@ function consumeLine(line: string, state: UiState): void {
   }
 }
 
-function consumeEvent(event: PublicRunEvent, state: UiState): void {
+function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScreen: () => void): void {
   const agent = state.agents.get(event.agentId) ?? {
     id: event.agentId,
     turn: 0,
@@ -281,14 +382,28 @@ function consumeEvent(event: PublicRunEvent, state: UiState): void {
     state.quietDetail = "Session ready; source project remains untouched";
     return;
   }
+  if (event.type === "run.contracted") {
+    state.contracted = true;
+    if (event.detail !== undefined) state.task = event.detail;
+    enterExecutionScreen();
+    state.quietDetail = "Task contract accepted; isolated workspace prepared";
+  }
   if (event.type === "agent.message" && event.message !== undefined) {
     state.chat.push({ agentId: event.agentId, message: event.message, ...(event.turn === undefined ? {} : { turn: event.turn }) });
     trimTo(state.chat, 30);
+    if (!state.screenActive && !state.contracted) {
+      // During conversation observation, surface narration inline as it streams.
+      state.conversationMessages.push(event.message);
+      process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${event.message}\n\n`);
+    }
   }
   if (event.type === "tool.started") {
     agent.action = event.title;
     agent.status = "active";
     state.quietDetail = event.detail === undefined ? `Running ${event.title}` : `${event.title} · ${event.detail}`;
+    if (!state.screenActive && !state.contracted) {
+      process.stdout.write(`${ansi.dim}  · ${event.title}${event.detail === undefined ? "" : ` ${bounded(event.detail, 60)}`}${ansi.reset}\n`);
+    }
   } else if (event.type === "completion.claimed") {
     agent.action = "verification";
     state.phase = "verifying";
@@ -300,8 +415,12 @@ function consumeEvent(event: PublicRunEvent, state: UiState): void {
     agent.status = "done";
   } else if (event.type === "run.failed") {
     agent.status = "failed";
+  } else if (event.type === "run.waiting_for_user") {
+    agent.status = "idle";
+    state.quietDetail = "Vanguard asked you a question";
   }
-  if (event.type !== "agent.message" && event.type !== "session.ready" && event.type !== "context.compacted") {
+  if (event.type !== "agent.message" && event.type !== "session.ready" && event.type !== "context.compacted"
+    && event.type !== "run.contracted" && event.type !== "run.waiting_for_user") {
     state.activity.push({
       status: event.status ?? "info",
       title: event.title,
@@ -310,6 +429,23 @@ function consumeEvent(event: PublicRunEvent, state: UiState): void {
     });
     trimTo(state.activity, 60);
   }
+}
+
+function extractOutcome(finalResult: Record<string, unknown> | undefined): TurnOutcome | undefined {
+  if (finalResult === undefined) return undefined;
+  const outcome = finalResult.outcome;
+  if (outcome === null || typeof outcome !== "object" || Array.isArray(outcome)) return undefined;
+  const record = outcome as Record<string, unknown>;
+  if (typeof record.status !== "string") return undefined;
+  return {
+    status: record.status,
+    ...(typeof record.message === "string" ? { message: record.message } : {}),
+    ...(typeof record.question === "string" ? { question: record.question } : {}),
+  };
+}
+
+function outcomeStatus(finalResult: Record<string, unknown> | undefined): string | undefined {
+  return extractOutcome(finalResult)?.status;
 }
 
 function render(state: UiState, config: TuiConfig): void {
@@ -323,7 +459,7 @@ function renderFrame(state: UiState, config: TuiConfig, width: number, height: n
   const lines: string[] = [];
   const phase = phaseAppearance(state.phase, state.frame);
   lines.push(padAnsi(` ${ansi.violet}${ansi.bold}◆ VANGUARD${ansi.reset}  ${ansi.dim}${path.basename(config.workspace)}  ·  ${config.model}${ansi.reset}`, width));
-  lines.push(padAnsi(` ${phase.icon} ${phase.label.toLowerCase()}  ${ansi.dim}${elapsed(state.startedAt)}  ·  ${bounded(config.task, Math.max(16, inner - 24))}${ansi.reset}`, width));
+  lines.push(padAnsi(` ${phase.icon} ${phase.label.toLowerCase()}  ${ansi.dim}${elapsed(state.startedAt)}  ·  ${bounded(state.task, Math.max(16, inner - 24))}${ansi.reset}`, width));
   lines.push(" ".repeat(width));
 
   const agents = [...state.agents.values()];
@@ -368,6 +504,7 @@ export function renderTuiPreviewForTest(width = 100, height = 34): string {
     startedAt: Date.now() - 65_000,
     frame: 3,
     quietDetail: "project.check · trusted project verification",
+    task: "Repair the project and prove it works.",
     agents: new Map([
       ["main", { id: "main", turn: 7, action: "project.check", status: "active" }],
       ["scout", { id: "scout", turn: 3, action: "workspace.search", status: "active" }],
@@ -381,10 +518,12 @@ export function renderTuiPreviewForTest(width = 100, height = 34): string {
       { status: "pending", title: "project.check", detail: "trusted project verification", turn: 7 },
     ],
     verifiers: new Map([["workspace integrity", true]]),
+    contracted: true,
+    screenActive: true,
+    conversationMessages: [],
   };
   const config: TuiConfig = {
     workspace: "C:\\projects\\preview",
-    task: "preview",
     provider: "deepseek",
     model: "deepseek-v4-pro",
     verification: { command: "npm", args: ["test"] },
@@ -398,26 +537,24 @@ export function renderWelcomeForTest(workspace = "C:\\projects\\preview", model 
   return renderWelcome(workspace, model);
 }
 
-export function launchConversationResponseForTest(input: string): string | undefined {
-  return launchConversationResponse(input);
-}
-
 function renderWelcome(workspace: string, model: string): string {
   return `${ansi.violet}${ansi.bold}◆ VANGUARD${ansi.reset}\n`
     + `${ansi.dim}Expert coding  ·  ${path.basename(workspace)}  ·  ${model}${ansi.reset}\n`
-    + `${ansi.dim}Isolated execution; your original project stays untouched.${ansi.reset}\n\n`
-    + `${ansi.bold}What should I build or fix?${ansi.reset}\n`;
+    + `${ansi.dim}Talk to Vanguard. Coding starts only when you ask for it; your original project stays untouched.${ansi.reset}\n\n`
+    + `${ansi.bold}What should we work on?${ansi.reset}\n`;
 }
 
-async function printHandoff(state: UiState, config: TuiConfig): Promise<void> {
+async function printHandoff(state: UiState, config: TuiConfig, cancelled: boolean): Promise<void> {
   const passed = state.phase === "completed";
-  process.stdout.write(`\n${passed ? ansi.green : ansi.amber}${ansi.bold}${passed ? "Vanguard verified the result." : "Vanguard stopped before verified completion."}${ansi.reset}\n`);
+  const waiting = outcomeStatus(state.finalResult) === "waiting_for_user";
+  if (waiting) return;
+  process.stdout.write(`\n${passed ? ansi.green : ansi.amber}${ansi.bold}${passed ? "Vanguard verified the result." : cancelled ? "Vanguard was interrupted." : "Vanguard stopped before verified completion."}${ansi.reset}\n`);
   process.stdout.write(`Original:  ${config.workspace}\n`);
   if (state.session !== undefined) {
     process.stdout.write(`Workspace: ${state.session.workspaceRoot}\n`);
     process.stdout.write(`Journal:   ${state.session.journalFile}\n`);
     process.stdout.write(`Scorecard: ${state.session.scorecardFile}\n`);
-    if (!passed) process.stdout.write(`Resume:    vanguard resume --session "${state.session.sessionRoot}"\n`);
+    if (!passed) process.stdout.write(`Resume:    vanguard advance --session "${state.session.sessionRoot}"\n`);
     process.stdout.write(`Open:      explorer "${state.session.workspaceRoot}"\n`);
   } else if (state.error !== undefined) {
     process.stdout.write(`${ansi.red}${state.error}${ansi.reset}\n`);
@@ -459,19 +596,6 @@ function configuredProvider(): Provider {
   return provider;
 }
 
-function launchConversationResponse(input: string): string | undefined {
-  const normalized = input.trim().toLowerCase().replace(/[,.!?]+/g, " ").replace(/\s+/g, " ").trim();
-  if (/^(hi|hello|hey|yo|howdy)( there| vanguard)?$/.test(normalized)
-    || /^(good morning|good afternoon|good evening|how are you|what'?s up)$/.test(normalized)) {
-    return "Hey. What are we building, fixing, or investigating?";
-  }
-  if (/^(help|what can you do|what do you do)$/.test(normalized)) {
-    return "Give me a coding outcome in plain English. I can inspect, build, repair, test, and verify the project in this folder.";
-  }
-  if (/^(thanks|thank you|thx)$/.test(normalized)) return "Anytime. What should we work on?";
-  return undefined;
-}
-
 function isExitRequest(input: string): boolean {
   return /^(exit|quit|\/exit|\/quit)$/i.test(input.trim());
 }
@@ -493,11 +617,6 @@ function defaultModel(provider: Provider): string {
 
 function automaticVerificationCommand(): CommandSpec {
   return { command: "node", args: [path.join(import.meta.dirname, "autoVerify.js")] };
-}
-
-function expertTask(config: TuiConfig): string {
-  if (!config.adaptiveVerification) return config.task;
-  return `${config.task}\n\nVanguard expert-mode contract: own the implementation end to end. This project did not have a recognized verification contract at launch. Establish an appropriate deterministic build/test contract as part of the work, use project.check throughout, and finish only when the automatic trusted verifier passes.`;
 }
 
 function parseProvider(value: string): Provider | undefined {
@@ -574,9 +693,7 @@ function elapsed(startedAt: number): string {
 }
 
 function resultCompleted(result: Record<string, unknown> | undefined): boolean {
-  if (result === undefined) return false;
-  const outcome = result.outcome;
-  return outcome !== null && typeof outcome === "object" && "status" in outcome && outcome.status === "completed";
+  return outcomeStatus(result) === "completed";
 }
 
 function lastLine(value: string): string {

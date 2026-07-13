@@ -2,6 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { JournalPort, RunEvent, VerifierPort } from "./kernel/contracts.js";
+import type { AgentKernel as AgentKernelType, RunOutcome } from "./kernel/run.js";
 import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
 import {
   AgentKernel,
@@ -10,6 +11,7 @@ import {
   DeleteFileTool,
   FileJournal,
   HttpModelAdapter,
+  ImageInspectionTool,
   ListFilesTool,
   ProcessTool,
   ReadFileTool,
@@ -26,15 +28,17 @@ import {
   createCodingSession,
   createDeepSeekModel,
   createOpenAIModel,
+  createSessionShell,
+  materializeSessionWorkspace,
   analyzeTrajectory,
   analyzePatch,
   scoreExecutionQuality,
   classifyOutcome,
   openCodingSession,
   FixedCommandTool,
-  ImageInspectionTool,
   PublicRunEventPresenter,
   encodePublicRunEvent,
+  type CodingSession,
 } from "./index.js";
 
 interface CliOptions {
@@ -44,6 +48,7 @@ interface CliOptions {
   readonly model: string;
   readonly endpoint?: string;
   readonly verification: CommandSpec;
+  readonly adaptiveVerification?: boolean;
   readonly allowedCommands: readonly string[];
   readonly maxSteps: number;
   readonly maxDurationMs: number;
@@ -69,26 +74,172 @@ async function main(): Promise<void> {
     printUsage();
     return;
   }
+  if (command === "advance") {
+    await advanceCommand(process.argv.slice(3));
+    return;
+  }
   if (command !== "run" && command !== "resume") {
     printUsage();
     process.exitCode = 2;
     return;
   }
-  const resuming = command === "resume";
+  await runCommand(command === "resume", process.argv.slice(3));
+}
+
+async function runCommand(resuming: boolean, args: readonly string[]): Promise<void> {
   const session = resuming
-    ? await openCodingSession(parseResumeSession(process.argv.slice(3)))
-    : await createCodingSession(requiredArgument(process.argv.slice(3), "--workspace"));
+    ? await openCodingSession(parseResumeSession(args))
+    : await createCodingSession(requiredArgument(args, "--workspace"));
   const container = path.dirname(session.workspaceRoot);
   const configurationFile = path.join(container, "run-config.json");
   const options = resuming
     ? await readRunConfiguration(configurationFile)
-    : await parseOptions(process.argv.slice(3));
+    : await parseOptions(args);
+  if (resuming && options.task.length === 0) {
+    // Sessions created by `advance` carry their task in the journal contract.
+    await advanceSession(session, options, undefined);
+    return;
+  }
   if (!resuming) {
     await writeFile(configurationFile, JSON.stringify({ version: 1, options }, null, 2));
   }
+  const journalFile = path.join(container, "run.jsonl");
+  const scorecardFile = path.join(container, "scorecard.json");
+  const fileJournal = await FileJournal.open(journalFile);
+  emitSessionReady(session, container, journalFile, scorecardFile, resuming);
+  const priorEvents = resuming ? await fileJournal.readValidated() : [];
+  const runtime = await buildExecutionRuntime(session, options, fileJournal, false);
+  const startedAt = Date.now();
+  const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${runtime.mutationPolicyDescription}`;
+  const outcome = await runWithBudgets(options, runtime.journalActivity, (signal) =>
+    runtime.kernel.run(runtimeTask, signal, priorEvents));
+  await writeScorecard({
+    session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
+    startedAt, resumed: resuming,
+  });
+  if (outcome.status !== "completed") process.exitCode = 1;
+}
+
+async function advanceCommand(args: readonly string[]): Promise<void> {
+  const values = parseArgumentMap(args);
+  const sessionPath = single(values, "--session");
+  const message = single(values, "--message");
+  let session: CodingSession;
+  let options: CliOptions;
+  if (sessionPath === undefined) {
+    session = await createSessionShell(required(values, "--workspace"));
+    options = await parseOptions(args, { requireTask: false });
+    const configurationFile = path.join(path.dirname(session.workspaceRoot), "run-config.json");
+    await writeFile(configurationFile, JSON.stringify({ version: 1, options }, null, 2));
+  } else {
+    session = await openCodingSession(sessionPath);
+    options = await readRunConfiguration(path.join(path.dirname(session.workspaceRoot), "run-config.json"));
+  }
+  await advanceSession(session, options, message);
+}
+
+/**
+ * Advances a conversational session: conversation turns run against the
+ * read-only original project; when the model contracts execution, the
+ * disposable workspace is materialized and execution continues in it.
+ */
+async function advanceSession(
+  session: CodingSession,
+  options: CliOptions,
+  message: string | undefined,
+): Promise<void> {
+  const container = path.dirname(session.workspaceRoot);
+  const journalFile = path.join(container, "run.jsonl");
+  const scorecardFile = path.join(container, "scorecard.json");
+  const configurationFile = path.join(container, "run-config.json");
+  const fileJournal = await FileJournal.open(journalFile);
+  emitSessionReady(session, container, journalFile, scorecardFile, session.materialized);
+  let priorEvents = await fileJournal.readValidated();
+  const startedAt = Date.now();
+  let contracted = priorEvents.some((event) => event.type === "run.contracted" || event.type === "run.started");
+  let pendingMessage = message;
+
+  if (!contracted) {
+    const conversation = buildConversationRuntime(session, options, fileJournal);
+    const outcome = await runWithBudgets(options, conversation.journalActivity, (signal) =>
+      conversation.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
+    pendingMessage = undefined;
+    if (outcome.status !== "contracted") {
+      printAdvanceOutcome(outcome, session, container, journalFile);
+      if (outcome.status === "failed") process.exitCode = 1;
+      return;
+    }
+    priorEvents = await fileJournal.readValidated();
+    contracted = true;
+  }
+
+  // Materialize unconditionally whenever a contract exists but the copy does
+  // not: an interruption between journaling run.contracted and copying the
+  // workspace must not strand the session on resume.
+  if (!session.materialized) {
+    session = await materializeSessionWorkspace(session);
+    emitSessionReady(session, container, journalFile, scorecardFile, true);
+  }
+
+  const runtime = await buildExecutionRuntime(session, options, fileJournal, true);
+  const outcome = await runWithBudgets(options, runtime.journalActivity, (signal) =>
+    runtime.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
+  if (outcome.status === "completed" || outcome.status === "failed") {
+    await writeScorecard({
+      session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
+      startedAt, resumed: true,
+    });
+  } else {
+    printAdvanceOutcome(outcome, session, container, journalFile);
+  }
+  if (outcome.status === "failed") process.exitCode = 1;
+}
+
+interface ExecutionRuntime {
+  readonly kernel: AgentKernelType;
+  readonly mutationPolicyDescription: string;
+  readonly journalActivity: () => number;
+}
+
+function buildConversationRuntime(
+  session: CodingSession,
+  options: CliOptions,
+  fileJournal: FileJournal,
+): ExecutionRuntime {
+  const source = new WorkspaceBoundary(session.sourceRoot);
+  const versions = new WorkspaceVersionLedger();
+  const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
+  const { journal, journalActivity } = instrumentJournal(fileJournal);
+  const kernel = new AgentKernel({
+    model: createModel(options),
+    tools: [
+      new ListFilesTool(source),
+      new SearchTextTool(source),
+      new ReadFileTool(source, 1_000_000, versions),
+      new ImageInspectionTool(source),
+    ],
+    verifiers: [],
+    journal,
+    taskAddendum: taskAddendum(options, mutationPolicy),
+    options: {
+      maxSteps: options.maxSteps,
+      maxContextBytes: options.maxContextBytes,
+      maxRepeatedAction: 3,
+      interactive: true,
+    },
+  });
+  return { kernel, mutationPolicyDescription: mutationPolicy.describe(), journalActivity };
+}
+
+async function buildExecutionRuntime(
+  session: CodingSession,
+  options: CliOptions,
+  fileJournal: FileJournal,
+  interactive: boolean,
+): Promise<ExecutionRuntime> {
+  const container = path.dirname(session.workspaceRoot);
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
   const versions = new WorkspaceVersionLedger();
-  const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
   const commandTimeoutMs = Math.min(options.commandTimeoutMs, options.maxDurationMs);
   const agentAllowedCommands = options.restrictProcess
@@ -119,24 +270,6 @@ async function main(): Promise<void> {
     }),
     options.publicCheck,
   );
-  const journalFile = path.join(container, "run.jsonl");
-  const scorecardFile = path.join(container, "scorecard.json");
-  const fileJournal = await FileJournal.open(journalFile);
-  streamPublicEvent({
-    type: "session.ready",
-    agentId: "main",
-    status: "info",
-    title: resuming ? "Session resumed" : "Session created",
-    sessionId: session.id,
-    sessionRoot: container,
-    workspaceRoot: session.workspaceRoot,
-    journalFile,
-    scorecardFile,
-  });
-  const priorEvents = resuming ? await fileJournal.readValidated() : [];
-  let lastProgressAt = Date.now();
-  const journal = progressJournal(fileJournal, () => { lastProgressAt = Date.now(); });
-  const model = createModel(options);
   const verifiers: VerifierPort[] = [
     new CommandVerifier("required command", verifierProcessTool, options.verification, options.verifierEvidence),
   ];
@@ -148,8 +281,10 @@ async function main(): Promise<void> {
       editableRoots: options.editableRoots,
     }));
   }
+  const { journal, journalActivity } = instrumentJournal(fileJournal);
+  const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const kernel = new AgentKernel({
-    model,
+    model: createModel(options),
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
@@ -166,31 +301,63 @@ async function main(): Promise<void> {
     verifiers,
     journal,
     workingState,
+    taskAddendum: taskAddendum(options, mutationPolicy),
     options: {
       maxSteps: options.maxSteps,
       maxContextBytes: options.maxContextBytes,
       maxRepeatedAction: 3,
       maxFailedVerificationAttempts: options.maxFailedVerificationAttempts,
+      interactive,
     },
   });
+  return { kernel, mutationPolicyDescription: mutationPolicy.describe(), journalActivity };
+}
 
-  const startedAt = Date.now();
+function taskAddendum(options: CliOptions, mutationPolicy: WorkspaceMutationPolicy): string {
+  const adaptive = options.adaptiveVerification === true
+    ? "\nVanguard expert-mode contract: own the implementation end to end. This project did not have a recognized verification contract at launch. Establish an appropriate deterministic build/test contract as part of the work, use project.check throughout, and finish only when the automatic trusted verifier passes."
+    : "";
+  return `Vanguard runtime mutation policy: ${mutationPolicy.describe()}${adaptive}`;
+}
+
+async function runWithBudgets(
+  options: CliOptions,
+  journalActivity: () => number,
+  run: (signal: AbortSignal) => Promise<RunOutcome>,
+): Promise<RunOutcome> {
   const controller = new AbortController();
   const durationTimer = setTimeout(() => controller.abort(), options.maxDurationMs);
   const heartbeatTimer = setInterval(() => {
-    const quietMs = Date.now() - lastProgressAt;
+    const quietMs = Date.now() - journalActivity();
     if (quietMs >= 45_000) {
       process.stderr.write(`[Vanguard] working: provider or tool response pending (${formatDuration(quietMs)} since last event)\n`);
     }
   }, 45_000);
   heartbeatTimer.unref();
-  const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${mutationPolicy.describe()}`;
-  const outcome = await kernel.run(runtimeTask, controller.signal, priorEvents).finally(() => {
+  return run(controller.signal).finally(() => {
     clearTimeout(durationTimer);
     clearInterval(heartbeatTimer);
   });
-  const trajectory = analyzeTrajectory(await fileJournal.readValidated());
-  const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
+}
+
+interface ScorecardContext {
+  readonly session: CodingSession;
+  readonly options: CliOptions;
+  readonly outcome: RunOutcome;
+  readonly fileJournal: FileJournal;
+  readonly scorecardFile: string;
+  readonly journalFile: string;
+  readonly configurationFile: string;
+  readonly startedAt: number;
+  readonly resumed: boolean;
+}
+
+async function writeScorecard(context: ScorecardContext): Promise<void> {
+  const { session, options, outcome } = context;
+  const trajectory = analyzeTrajectory(await context.fileJournal.readValidated());
+  const patch = session.materialized
+    ? await analyzePatch(session.sourceRoot, session.workspaceRoot)
+    : emptyPatchMetrics();
   const verified = outcome.status === "completed";
   const classification = classifyOutcome(outcome);
   const executionQuality = scoreExecutionQuality(verified, trajectory, patch);
@@ -213,16 +380,63 @@ async function main(): Promise<void> {
       executionQuality,
       steps: outcome.steps,
     },
-    durationMs: Date.now() - startedAt,
-    journalFile,
+    durationMs: Date.now() - context.startedAt,
+    journalFile: context.journalFile,
     completedAt: new Date().toISOString(),
-    resumed: resuming,
+    resumed: context.resumed,
     sessionFile: session.metadataFile,
-    configurationFile,
+    configurationFile: context.configurationFile,
   };
-  await writeFile(scorecardFile, JSON.stringify(scorecard, null, 2));
-  process.stdout.write(`${JSON.stringify({ ...scorecard, scorecardFile }, null, 2)}\n`);
-  if (outcome.status !== "completed") process.exitCode = 1;
+  await writeFile(context.scorecardFile, JSON.stringify(scorecard, null, 2));
+  process.stdout.write(`${JSON.stringify({ ...scorecard, scorecardFile: context.scorecardFile }, null, 2)}\n`);
+}
+
+function emptyPatchMetrics(): Awaited<ReturnType<typeof analyzePatch>> {
+  return {
+    changedFiles: [],
+    filesAdded: 0,
+    filesDeleted: 0,
+    filesModified: 0,
+    beforeBytes: 0,
+    afterBytes: 0,
+    beforeLines: 0,
+    afterLines: 0,
+  };
+}
+
+function printAdvanceOutcome(
+  outcome: RunOutcome,
+  session: CodingSession,
+  container: string,
+  journalFile: string,
+): void {
+  process.stdout.write(`${JSON.stringify({
+    outcome,
+    sessionId: session.id,
+    sessionRoot: container,
+    workspaceRoot: session.workspaceRoot,
+    journalFile,
+  }, null, 2)}\n`);
+}
+
+function emitSessionReady(
+  session: CodingSession,
+  container: string,
+  journalFile: string,
+  scorecardFile: string,
+  resumed: boolean,
+): void {
+  streamPublicEvent({
+    type: "session.ready",
+    agentId: "main",
+    status: "info",
+    title: resumed ? "Session resumed" : "Session created",
+    sessionId: session.id,
+    sessionRoot: container,
+    workspaceRoot: session.workspaceRoot,
+    journalFile,
+    scorecardFile,
+  });
 }
 
 function createModel(options: CliOptions) {
@@ -234,7 +448,7 @@ function createModel(options: CliOptions) {
   return new HttpModelAdapter({ endpoint: options.endpoint, timeoutMs: common.timeoutMs, maxAttempts: common.maxAttempts });
 }
 
-async function parseOptions(args: readonly string[]): Promise<CliOptions> {
+function parseArgumentMap(args: readonly string[]): Map<string, string[]> {
   const values = new Map<string, string[]>();
   for (let index = 0; index < args.length; index += 2) {
     const key = args[index];
@@ -246,8 +460,17 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     existing.push(value);
     values.set(key, existing);
   }
+  return values;
+}
+
+async function parseOptions(
+  args: readonly string[],
+  behavior: { requireTask?: boolean } = {},
+): Promise<CliOptions> {
+  const requireTask = behavior.requireTask !== false;
+  const values = parseArgumentMap(args);
   const workspace = required(values, "--workspace");
-  const task = required(values, "--task");
+  const task = requireTask ? required(values, "--task") : single(values, "--task") ?? "";
   const provider = required(values, "--provider");
   if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "http") {
     throw new Error("--provider must be openai, anthropic, deepseek, or http.");
@@ -272,8 +495,9 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     throw new Error("--command-timeout-ms must be a positive integer.");
   }
   const explicitCommand = single(values, "--verify-command");
+  const detected = explicitCommand === undefined ? await detectProjectVerification(workspace) : undefined;
   const verification = explicitCommand === undefined
-    ? await detectProjectVerification(workspace)
+    ? detected
     : { command: explicitCommand, args: values.get("--verify-arg") ?? [] };
   if (verification === undefined) {
     throw new Error("Could not detect project verification. Supply --verify-command and repeat --verify-arg for its arguments.");
@@ -285,12 +509,14 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   const publicCheck = publicCheckCommand === undefined
     ? explicitCommand === undefined ? verification : undefined
     : { command: publicCheckCommand, args: values.get("--check-arg") ?? [] };
+  const adaptiveVerification = single(values, "--adaptive-verification");
   return {
     workspace,
     task,
     provider,
     model,
     verification,
+    ...(adaptiveVerification === undefined ? {} : { adaptiveVerification: parseBoolean(adaptiveVerification, "--adaptive-verification") }),
     allowedCommands: values.get("--allow-command") ?? [],
     protectedPaths: values.get("--protect") ?? [],
     editableRoots: values.get("--editable-root") ?? [],
@@ -375,18 +601,23 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
   return all?.[0];
 }
 
-function progressJournal(fileJournal: FileJournal, onActivity: () => void): JournalPort {
+function instrumentJournal(fileJournal: FileJournal): { journal: JournalPort; journalActivity: () => number } {
+  let lastProgressAt = Date.now();
   let modelTurns = 0;
   const presenter = new PublicRunEventPresenter();
-  return {
+  const journal: JournalPort = {
     async append(event: RunEvent): Promise<void> {
       await fileJournal.append(event);
-      onActivity();
+      lastProgressAt = Date.now();
       for (const publicEvent of presenter.present(event)) streamPublicEvent(publicEvent);
       if (event.type === "model.decided") {
         modelTurns += 1;
-        const decision = event.data as { kind?: string; call?: { name?: string } };
-        const action = decision.kind === "tool" ? decision.call?.name ?? "unknown tool" : "completion claim";
+        const decision = event.data as { kind?: string; calls?: { name?: string }[]; call?: { name?: string } };
+        const action = decision.kind === "tools"
+          ? (decision.calls ?? []).map((call) => call.name ?? "unknown tool").join(", ")
+          : decision.kind === "tool" ? decision.call?.name ?? "unknown tool"
+            : decision.kind === "complete" ? "completion claim"
+              : decision.kind ?? "decision";
         process.stderr.write(`[Vanguard] turn ${modelTurns}: ${action}\n`);
       } else if (event.type === "verification.completed") {
         const verification = event.data as { verifier?: string; passed?: boolean };
@@ -399,6 +630,7 @@ function progressJournal(fileJournal: FileJournal, onActivity: () => void): Jour
       }
     },
   };
+  return { journal, journalActivity: () => lastProgressAt };
 }
 
 function streamPublicEvent(event: Parameters<typeof encodePublicRunEvent>[0]): void {
@@ -414,7 +646,7 @@ function formatDuration(durationMs: number): string {
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard expert coding agent\n\nUsage:\n  vanguard                         Start expert coding in the current directory\n  vanguard tui                     Start expert coding in the current directory\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nDefault TUI overrides:\n  VANGUARD_PROVIDER                deepseek, openai, or anthropic\n  VANGUARD_MODEL                   Provider model ID\n  VANGUARD_MAX_STEPS               Expert turn budget (default: 240)\n\nAdvanced run options:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard expert coding agent\n\nUsage:\n  vanguard                         Start the conversational agent in the current directory\n  vanguard tui                     Start the conversational agent in the current directory\n  vanguard advance --workspace PATH --provider P --model M [options] [--message TEXT]\n                                   Create a conversational session and advance it one turn\n  vanguard advance --session SESSION_PATH [--message TEXT]\n                                   Continue an existing conversational session\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nDefault TUI overrides:\n  VANGUARD_PROVIDER                deepseek, openai, or anthropic\n  VANGUARD_MODEL                   Provider model ID\n  VANGUARD_MAX_STEPS               Expert turn budget (default: 240)\n\nAdvanced run options:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --adaptive-verification BOOL  Blank-project mode requiring the agent to establish a build/test contract\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {

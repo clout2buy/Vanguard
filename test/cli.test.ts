@@ -106,6 +106,201 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
   }
 });
 
+test("compiled CLI advance flows from conversation to contracted execution", async () => {
+  const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-advance-source-"));
+  await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 41;\n");
+  await writeFile(path.join(source, "test.mjs"), "import {answer} from './answer.mjs'; if(answer()!==42) process.exit(1);\n");
+
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => { body += chunk; });
+    request.on("end", () => {
+      const payload = JSON.parse(body) as { mode: string; transcript: Array<{ role: string; content: unknown }> };
+      const decisions = payload.transcript.filter((entry) => entry.role === "decision").length;
+      const observation = [...payload.transcript].reverse().find((entry) => entry.role === "observation")?.content as {
+        output?: { sha256?: string };
+      } | undefined;
+      const decision = payload.mode === "conversation"
+        ? decisions === 0
+          ? { kind: "respond", message: "Hey. What are we building, fixing, or investigating?" }
+          : {
+              kind: "execute",
+              contract: {
+                objective: "Make answer() return 42 with the existing test as proof.",
+                successCriteria: ["node test.mjs exits 0"],
+              },
+            }
+        : decisions === 2
+          ? { kind: "tools", calls: [{ id: "read", name: "workspace.read", input: { path: "answer.mjs" } }] }
+          : decisions === 3
+            ? {
+                kind: "tools",
+                calls: [{
+                  id: "edit",
+                  name: "workspace.replace",
+                  input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
+                }],
+              }
+            : decisions === 4
+              ? { kind: "tools", calls: [{ id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } }] }
+              : decisions === 5
+                ? { kind: "tools", calls: [{ id: "review", name: "workspace.changes", input: {} }] }
+                : { kind: "complete", answer: "Fixed and tested." };
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(decision));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  let sessionRoot: string | undefined;
+  try {
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Mock server failed to bind.");
+    const cli = path.resolve("dist", "src", "cli.js");
+    const creationArgs = [
+      cli, "advance",
+      "--workspace", source,
+      "--message", "hi",
+      "--provider", "http",
+      "--model", "mock",
+      "--endpoint", `http://127.0.0.1:${address.port}`,
+      "--verify-command", "node",
+      "--verify-arg", "test.mjs",
+      "--max-steps", "20",
+    ];
+    const greeting = await executeFile(process.execPath, creationArgs, { maxBuffer: 5_000_000 });
+    const greeted = JSON.parse(greeting.stdout) as {
+      outcome: { status: string; message?: string };
+      sessionRoot: string;
+      workspaceRoot: string;
+      journalFile: string;
+    };
+    sessionRoot = greeted.sessionRoot;
+    assert.equal(greeted.outcome.status, "responded");
+    assert.match(greeted.outcome.message ?? "", /What are we building/);
+    // A greeting must not materialize a workspace copy or a contract.
+    await assert.rejects(readFile(path.join(greeted.workspaceRoot, "answer.mjs"), "utf8"));
+    const journalAfterGreeting = await readFile(greeted.journalFile, "utf8");
+    assert.match(journalAfterGreeting, /"type":"user.message"/);
+    assert.doesNotMatch(journalAfterGreeting, /"type":"run.contracted"/);
+
+    const work = await executeFile(process.execPath, [
+      cli, "advance",
+      "--session", sessionRoot,
+      "--message", "Please make answer() return 42 and prove it with the test.",
+    ], { maxBuffer: 5_000_000 });
+    const scorecard = JSON.parse(work.stdout) as {
+      outcome: { status: string };
+      workspaceRoot: string;
+      journalFile: string;
+    };
+    assert.equal(scorecard.outcome.status, "completed");
+    assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
+    assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
+    const journal = await readFile(scorecard.journalFile, "utf8");
+    assert.match(journal, /"type":"run.contracted"/);
+    assert.match(journal, /Make answer\(\) return 42/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(source, { recursive: true, force: true });
+    if (sessionRoot !== undefined) await rm(sessionRoot, { recursive: true, force: true });
+  }
+});
+
+test("compiled CLI advance recovers a contracted session whose workspace copy never happened", async () => {
+  // Simulates an interruption in the window between journaling run.contracted
+  // and materializing the disposable workspace: resume must copy the
+  // workspace before building the execution runtime instead of ENOENTing.
+  const { FileJournal, createSessionShell } = await import("../src/index.js");
+  const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-seam-source-"));
+  await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 41;\n");
+  await writeFile(path.join(source, "test.mjs"), "import {answer} from './answer.mjs'; if(answer()!==42) process.exit(1);\n");
+
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => { body += chunk; });
+    request.on("end", () => {
+      const payload = JSON.parse(body) as { transcript: Array<{ role: string; content: unknown }> };
+      const decisions = payload.transcript.filter((entry) => entry.role === "decision").length;
+      const observation = [...payload.transcript].reverse().find((entry) => entry.role === "observation")?.content as {
+        output?: { sha256?: string };
+      } | undefined;
+      const decision = decisions === 1
+        ? { kind: "tools", calls: [{ id: "read", name: "workspace.read", input: { path: "answer.mjs" } }] }
+        : decisions === 2
+          ? {
+              kind: "tools",
+              calls: [{
+                id: "edit",
+                name: "workspace.replace",
+                input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
+              }],
+            }
+          : decisions === 3
+            ? { kind: "tools", calls: [{ id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } }] }
+            : decisions === 4
+              ? { kind: "tools", calls: [{ id: "review", name: "workspace.changes", input: {} }] }
+              : { kind: "complete", answer: "Recovered, fixed, and tested." };
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(decision));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  let sessionRoot: string | undefined;
+  try {
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Mock server failed to bind.");
+    const session = await createSessionShell(source);
+    sessionRoot = path.dirname(session.workspaceRoot);
+    const contract = {
+      objective: "Make answer() return 42 with the existing test as proof.",
+      successCriteria: ["node test.mjs exits 0"],
+    };
+    const journal = await FileJournal.open(path.join(sessionRoot, "run.jsonl"));
+    await journal.append({ sequence: 1, type: "user.message", data: { text: "Please make answer() return 42." } });
+    await journal.append({ sequence: 2, type: "model.decided", data: { kind: "execute", contract } });
+    await journal.append({ sequence: 3, type: "run.contracted", data: { contract, task: contract.objective } });
+    await writeFile(path.join(sessionRoot, "run-config.json"), JSON.stringify({
+      version: 1,
+      options: {
+        workspace: source,
+        task: "",
+        provider: "http",
+        model: "mock",
+        endpoint: `http://127.0.0.1:${address.port}`,
+        verification: { command: "node", args: ["test.mjs"] },
+        allowedCommands: [],
+        maxSteps: 20,
+        maxDurationMs: 120_000,
+        commandTimeoutMs: 60_000,
+        maxContextBytes: 2_000_000,
+        maxFailedVerificationAttempts: 3,
+        protectedPaths: [],
+        editableRoots: [],
+        restrictProcess: false,
+        verifierEvidence: "full",
+        exposeRawProcess: true,
+      },
+    }, null, 2));
+
+    const cli = path.resolve("dist", "src", "cli.js");
+    const { stdout } = await executeFile(process.execPath, [cli, "advance", "--session", sessionRoot], {
+      maxBuffer: 5_000_000,
+    });
+    const scorecard = JSON.parse(stdout) as { outcome: { status: string }; workspaceRoot: string };
+    assert.equal(scorecard.outcome.status, "completed");
+    assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
+    assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(source, { recursive: true, force: true });
+    if (sessionRoot !== undefined) await rm(sessionRoot, { recursive: true, force: true });
+  }
+});
+
 test("compiled CLI resumes a failed session from its durable journal", async () => {
   const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-resume-source-"));
   await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 40;\n");

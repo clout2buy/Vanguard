@@ -1,7 +1,9 @@
 import type { JsonValue, ModelDecision, ModelPort, ModelRequest } from "../kernel/contracts.js";
+import { normalizeDecision } from "../kernel/contracts.js";
 
 export interface SerializableModelRequest {
   readonly task: string;
+  readonly mode: ModelRequest["mode"];
   readonly transcript: ModelRequest["transcript"];
   readonly tools: ModelRequest["tools"];
   readonly remainingSteps: number;
@@ -51,6 +53,7 @@ export class HttpModelAdapter implements ModelPort {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(this.#timeoutMs)]);
     const body = JSON.stringify(this.#codec.encode({
       task: request.task,
+      mode: request.mode,
       transcript: request.transcript,
       tools: request.tools,
       remainingSteps: request.remainingSteps,
@@ -112,23 +115,9 @@ export class VanguardJsonCodec implements ModelWireCodec {
     if (response === null || Array.isArray(response) || typeof response !== "object") {
       throw new Error("Inference response must be an object.");
     }
-    if (response.kind === "complete" && typeof response.answer === "string") {
-      return { kind: "complete", answer: response.answer };
-    }
-    if (response.kind === "tool") {
-      const call = response.call;
-      if (
-        call !== null
-        && !Array.isArray(call)
-        && typeof call === "object"
-        && typeof call.id === "string"
-        && typeof call.name === "string"
-        && "input" in call
-      ) {
-        return { kind: "tool", call: { id: call.id, name: call.name, input: call.input } };
-      }
-    }
-    throw new Error("Inference response is not a valid Vanguard decision.");
+    const decision = normalizeDecision(response);
+    if (decision === undefined) throw new Error("Inference response is not a valid Vanguard decision.");
+    return decision;
   }
 }
 

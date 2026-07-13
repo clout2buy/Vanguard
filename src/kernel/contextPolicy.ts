@@ -50,80 +50,122 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
   const chunks: ContextChunk[] = [];
   for (let index = 0; index < transcript.length; index += 1) {
     const entry = transcript[index]!;
-    const next = transcript[index + 1];
-    if (isToolDecision(entry) && next?.role === "observation") {
-      chunks.push({ entries: [entry, next], priority: 2, toolExchange: true });
-      index += 1;
+    if (isToolDecision(entry)) {
+      const entries: TranscriptEntry[] = [entry];
+      while (transcript[index + 1]?.role === "observation") {
+        entries.push(transcript[index + 1]!);
+        index += 1;
+      }
+      chunks.push({ entries, priority: 2, toolExchange: entries.length > 1 });
       continue;
     }
     if (entry.role === "observation") continue;
-    chunks.push({ entries: [entry], priority: entry.role === "verification" ? 3 : 1, toolExchange: false });
+    const priority = entry.role === "verification" || entry.role === "user" || entry.role === "task" ? 3 : 1;
+    chunks.push({ entries: [entry], priority, toolExchange: false });
   }
   return chunks;
 }
 
 function compactToolExchange(chunk: ContextChunk): ContextChunk {
-  const [decision, observation] = chunk.entries;
-  if (decision === undefined || observation === undefined || decision.role !== "decision") return chunk;
+  const [decision, ...observations] = chunk.entries;
+  if (decision === undefined || decision.role !== "decision") return chunk;
   const content = record(decision.content);
-  const call = record(content?.call);
-  if (content?.kind !== "tool" || call === undefined) return chunk;
-  const compactedInput = compactJson(call.input);
-  const compactedContent: Record<string, TranscriptEntry["content"]> = {
-    kind: "tool",
-    call: {
-      id: typeof call.id === "string" ? call.id : "historical-call",
-      name: typeof call.name === "string" ? call.name : "unknown",
+  if (content === undefined) return chunk;
+  const compactedInputByCallId = new Map<string, TranscriptEntry["content"]>();
+  const compactedContent: Record<string, unknown> = { ...content };
+
+  const legacyCall = record(content.call);
+  if (content.kind === "tool" && legacyCall !== undefined) {
+    const compactedInput = compactJson(legacyCall.input);
+    if (typeof legacyCall.id === "string") compactedInputByCallId.set(legacyCall.id, compactedInput);
+    compactedContent.call = {
+      id: typeof legacyCall.id === "string" ? legacyCall.id : "historical-call",
+      name: typeof legacyCall.name === "string" ? legacyCall.name : "unknown",
       input: compactedInput,
-    },
-  };
+    };
+  } else if (content.kind === "tools" && Array.isArray(content.calls)) {
+    compactedContent.calls = content.calls.map((value) => {
+      const call = record(value);
+      if (call === undefined) return compactJson(value);
+      const compactedInput = compactJson(call.input);
+      if (typeof call.id === "string") compactedInputByCallId.set(call.id, compactedInput);
+      return {
+        id: typeof call.id === "string" ? call.id : "historical-call",
+        name: typeof call.name === "string" ? call.name : "unknown",
+        input: compactedInput,
+      };
+    });
+  } else {
+    return chunk;
+  }
+
   if (content.continuation !== undefined) {
-    compactedContent.continuation = compactContinuation(content.continuation, compactedInput);
+    compactedContent.continuation = compactContinuation(content.continuation, compactedInputByCallId);
   }
   return {
     priority: chunk.priority,
     toolExchange: true,
     entries: [
-      {
-        role: "decision",
-        content: compactedContent,
-      },
-      { role: "observation", content: compactJson(observation.content) },
+      { role: "decision", content: compactedContent as TranscriptEntry["content"] },
+      ...observations.map((observation): TranscriptEntry => ({
+        role: "observation",
+        content: compactJson(observation.content),
+      })),
     ],
   };
 }
 
-function compactContinuation(value: unknown, compactedInput: TranscriptEntry["content"]): TranscriptEntry["content"] {
+function compactContinuation(
+  value: unknown,
+  compactedInputByCallId: ReadonlyMap<string, TranscriptEntry["content"]>,
+): TranscriptEntry["content"] {
   if (Array.isArray(value)) {
-    return value.map((item) => compactContinuationItem(item, compactedInput));
+    return value.map((item) => compactContinuationItem(item, compactedInputByCallId));
   }
   const object = record(value);
   if (object === undefined) return compactJson(value);
   return Object.fromEntries(Object.entries(object).map(([key, nested]) => [
     key,
     key === "tool_calls" && Array.isArray(nested)
-      ? nested.map((item) => compactContinuationItem(item, compactedInput))
+      ? nested.map((item) => compactContinuationItem(item, compactedInputByCallId))
       : nested as TranscriptEntry["content"],
   ]));
 }
 
-function compactContinuationItem(value: unknown, compactedInput: TranscriptEntry["content"]): TranscriptEntry["content"] {
+function compactContinuationItem(
+  value: unknown,
+  compactedInputByCallId: ReadonlyMap<string, TranscriptEntry["content"]>,
+): TranscriptEntry["content"] {
   const item = record(value);
   if (item === undefined) return compactJson(value);
+  const compactedFor = (id: unknown): TranscriptEntry["content"] | undefined =>
+    typeof id === "string" ? compactedInputByCallId.get(id) : undefined;
   if (item.type === "function_call") {
-    return { ...item, arguments: JSON.stringify(compactedInput) } as TranscriptEntry["content"];
+    const compacted = compactedFor(item.call_id) ?? compactJson(parseMaybeJson(item.arguments));
+    return { ...item, arguments: JSON.stringify(compacted) } as TranscriptEntry["content"];
   }
   if (item.type === "tool_use") {
-    return { ...item, input: compactedInput } as TranscriptEntry["content"];
+    const compacted = compactedFor(item.id) ?? compactJson(item.input);
+    return { ...item, input: compacted } as TranscriptEntry["content"];
   }
   const fn = record(item.function);
   if (fn !== undefined) {
+    const compacted = compactedFor(item.id) ?? compactJson(parseMaybeJson(fn.arguments));
     return {
       ...item,
-      function: { ...fn, arguments: JSON.stringify(compactedInput) },
+      function: { ...fn, arguments: JSON.stringify(compacted) },
     } as TranscriptEntry["content"];
   }
   return item as TranscriptEntry["content"];
+}
+
+function parseMaybeJson(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
 }
 
 function compactJson(value: unknown): TranscriptEntry["content"] {
@@ -153,5 +195,5 @@ function isToolDecision(entry: TranscriptEntry): boolean {
     && entry.content !== null
     && !Array.isArray(entry.content)
     && typeof entry.content === "object"
-    && entry.content.kind === "tool";
+    && (entry.content.kind === "tool" || entry.content.kind === "tools");
 }

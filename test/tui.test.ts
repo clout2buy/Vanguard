@@ -1,21 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { launchConversationResponseForTest, renderTuiPreviewForTest, renderWelcomeForTest } from "../src/tui.js";
+import { renderTuiPreviewForTest, renderWelcomeForTest } from "../src/tui.js";
 
-test("default terminal launch asks only for the coding task", () => {
+test("default terminal launch opens a single conversational prompt", () => {
   const welcome = renderWelcomeForTest().replace(/\x1b\[[0-9;]*m/g, "");
   assert.match(welcome, /VANGUARD/);
   assert.match(welcome, /Expert coding/);
-  assert.match(welcome, /What should I build or fix\?/);
+  assert.match(welcome, /What should we work on\?/);
+  assert.match(welcome, /Coding starts only when you ask for it/);
   assert.doesNotMatch(welcome, /Provider|Maximum agent turns|Verification command|Start isolated run|Workspace.*>/);
-});
-
-test("greetings stay conversational instead of launching coding tools", () => {
-  assert.match(launchConversationResponseForTest("hi") ?? "", /What are we building/);
-  assert.match(launchConversationResponseForTest("Hello, Vanguard!") ?? "", /What are we building/);
-  assert.match(launchConversationResponseForTest("help") ?? "", /coding outcome/);
-  assert.equal(launchConversationResponseForTest("Build a tested Node CLI"), undefined);
-  assert.equal(launchConversationResponseForTest("Fix the failing parser"), undefined);
 });
 
 test("terminal UI renders agent chat, tool activity, and verifier state within bounds", () => {

@@ -35,6 +35,12 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 
 ## Implemented foundation
 
+- Stateful conversational kernel: one loop owns conversation, observation, clarification, contracted execution, waiting-for-user, and verification as journal-restored modes
+- Typed decisions — respond / ask_user / execute (task contract) / tools / complete — where bare model text is a reply or narration and can never trigger verification
+- Completion claimed only through the explicit task.complete control tool; task.execute contracts gate all mutation/execution tools; a blank workspace is never scaffolded without an actionable contract
+- Durable ask/answer pauses (run.waiting_for_user + journaled user messages) that survive interruption and resume
+- Batched tool decisions: independent read-only calls execute concurrently, mutating calls stay strictly serialized, observations journal in call order with call attribution
+- Conversation runs read-only against the original project; the disposable workspace copy materializes only when a contract is accepted
 - Deterministic agent kernel with bounded steps and repeated-failure circuit breaking
 - Explicit model/tool/verifier contracts and evidence-focused context budgeting
 - SDK-free native HTTP inference with bounded transient retry

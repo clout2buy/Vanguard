@@ -28,19 +28,22 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   let policyBlocks = 0;
   let contextCompactions = 0;
   const toolCallsByName: Record<string, number> = {};
-  let pendingToolName: string | undefined;
+  let pendingToolNames: string[] = [];
 
   for (const event of events) {
     const data = record(event.data);
     if (event.type === "model.decided") {
       modelDecisions += 1;
-      if (data?.kind === "tool") {
+      pendingToolNames = [];
+      const calls = data?.kind === "tools" && Array.isArray(data.calls)
+        ? data.calls
+        : data?.kind === "tool" ? [data.call] : [];
+      for (const value of calls) {
+        const call = record(value);
+        if (typeof call?.name !== "string") continue;
         toolCalls += 1;
-        const call = record(data.call);
-        if (typeof call?.name === "string") {
-          pendingToolName = call.name;
-          toolCallsByName[call.name] = (toolCallsByName[call.name] ?? 0) + 1;
-        }
+        pendingToolNames.push(call.name);
+        toolCallsByName[call.name] = (toolCallsByName[call.name] ?? 0) + 1;
       }
       if (data?.kind === "complete") completionClaims += 1;
     }
@@ -48,7 +51,8 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       toolFailures += 1;
       const serialized = JSON.stringify(event.data).toLocaleLowerCase();
       const output = record(data?.output);
-      const isLocalTestFailure = (pendingToolName === "process.run" || pendingToolName === "project.check")
+      const failedToolName = typeof data?.tool === "string" ? data.tool : pendingToolNames[0];
+      const isLocalTestFailure = (failedToolName === "process.run" || failedToolName === "project.check")
         && typeof output?.exitCode === "number";
       const isHarnessFailure = isLocalTestFailure && (
         serialized.includes("syntaxerror") && serialized.includes("[eval")
@@ -66,7 +70,12 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
         || serialized.includes("outside the declared editable roots")
       ) policyBlocks += 1;
     }
-    if (event.type === "tool.completed" || event.type === "tool.failed") pendingToolName = undefined;
+    if (event.type === "tool.completed" || event.type === "tool.failed") {
+      const completedName = typeof data?.tool === "string" ? data.tool : undefined;
+      const index = completedName === undefined ? 0 : pendingToolNames.indexOf(completedName);
+      if (index >= 0) pendingToolNames.splice(index, 1);
+      else pendingToolNames.shift();
+    }
     if (event.type === "verification.completed") {
       verificationAttempts += 1;
       if (data?.passed === false) verificationFailures += 1;

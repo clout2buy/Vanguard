@@ -1,4 +1,5 @@
 import type { JsonValue, RunEvent } from "../kernel/contracts.js";
+import { normalizeDecision } from "../kernel/contracts.js";
 
 export const PUBLIC_EVENT_PREFIX = "@@VANGUARD_EVENT@@";
 
@@ -21,17 +22,20 @@ export interface PublicRunEvent {
 
 export class PublicRunEventPresenter {
   #modelTurns = 0;
-  #pendingTool: { name: string; detail?: string } | undefined;
+  readonly #pendingTools = new Map<string, { name: string; detail?: string }>();
+  #pendingOrder: string[] = [];
   #lastMessage = "";
 
   present(event: RunEvent): PublicRunEvent[] {
     const agentId = agentIdFrom(event.data);
     if (event.type === "model.decided") {
       this.#modelTurns += 1;
+      this.#pendingTools.clear();
+      this.#pendingOrder = [];
+      const decision = normalizeDecision(event.data);
       const data = objectValue(event.data);
-      const kind = typeof data.kind === "string" ? data.kind : "unknown";
-      const message = assistantMessage(data);
       const presented: PublicRunEvent[] = [];
+      const message = decision === undefined ? undefined : decisionMessage(decision, data);
       if (message !== undefined && message !== this.#lastMessage) {
         this.#lastMessage = message;
         presented.push({
@@ -44,23 +48,23 @@ export class PublicRunEventPresenter {
           message,
         });
       }
-      if (kind === "tool") {
-        const call = objectValue(data.call);
-        const name = typeof call.name === "string" ? call.name : "unknown tool";
-        const detail = toolDetail(name, call.input);
-        this.#pendingTool = { name, ...(detail === undefined ? {} : { detail }) };
-        presented.push({
-          type: "tool.started",
-          agentId,
-          sequence: event.sequence,
-          turn: this.#modelTurns,
-          status: "pending",
-          title: name,
-          tool: name,
-          ...(detail === undefined ? {} : { detail }),
-        });
-      } else {
-        this.#pendingTool = undefined;
+      if (decision?.kind === "tools") {
+        for (const call of decision.calls) {
+          const detail = toolDetail(call.name, call.input);
+          this.#pendingTools.set(call.id, { name: call.name, ...(detail === undefined ? {} : { detail }) });
+          this.#pendingOrder.push(call.id);
+          presented.push({
+            type: "tool.started",
+            agentId,
+            sequence: event.sequence,
+            turn: this.#modelTurns,
+            status: "pending",
+            title: call.name,
+            tool: call.name,
+            ...(detail === undefined ? {} : { detail }),
+          });
+        }
+      } else if (decision?.kind === "complete") {
         presented.push({
           type: "completion.claimed",
           agentId,
@@ -77,9 +81,15 @@ export class PublicRunEventPresenter {
     if (event.type === "tool.completed" || event.type === "tool.failed") {
       const data = objectValue(event.data);
       const ok = event.type === "tool.completed" && data.ok !== false;
-      const tool = this.#pendingTool?.name ?? "tool";
-      const detail = resultDetail(data, this.#pendingTool?.detail);
-      this.#pendingTool = undefined;
+      const callId = stringValue(data.callId);
+      const pendingKey = callId !== undefined && this.#pendingTools.has(callId) ? callId : this.#pendingOrder[0];
+      const pending = pendingKey === undefined ? undefined : this.#pendingTools.get(pendingKey);
+      if (pendingKey !== undefined) {
+        this.#pendingTools.delete(pendingKey);
+        this.#pendingOrder = this.#pendingOrder.filter((id) => id !== pendingKey);
+      }
+      const tool = stringValue(data.tool) ?? pending?.name ?? "tool";
+      const detail = resultDetail(data, pending?.detail);
       return [{
         type: event.type === "tool.completed" ? "tool.completed" : "tool.failed",
         agentId,
@@ -88,6 +98,33 @@ export class PublicRunEventPresenter {
         title: tool,
         tool,
         ...(detail === undefined ? {} : { detail }),
+      }];
+    }
+
+    if (event.type === "run.contracted") {
+      const data = objectValue(event.data);
+      const contract = objectValue(data.contract);
+      const objective = boundedText(stringValue(contract.objective), 220);
+      return [{
+        type: "run.contracted",
+        agentId,
+        sequence: event.sequence,
+        status: "info",
+        title: "Task contract accepted",
+        ...(objective === undefined ? {} : { detail: objective }),
+      }];
+    }
+
+    if (event.type === "run.waiting_for_user") {
+      const data = objectValue(event.data);
+      const question = boundedText(stringValue(data.question));
+      return [{
+        type: "run.waiting_for_user",
+        agentId,
+        sequence: event.sequence,
+        status: "info",
+        title: "Waiting for your answer",
+        ...(question === undefined ? {} : { message: question }),
       }];
     }
 
@@ -149,8 +186,14 @@ export function encodePublicRunEvent(event: PublicRunEvent): string {
   return `${PUBLIC_EVENT_PREFIX}${JSON.stringify(event)}\n`;
 }
 
-function assistantMessage(data: Record<string, JsonValue>): string | undefined {
-  if (data.kind === "complete") return boundedText(stringValue(data.answer));
+function decisionMessage(
+  decision: NonNullable<ReturnType<typeof normalizeDecision>>,
+  data: Record<string, JsonValue>,
+): string | undefined {
+  if (decision.kind === "respond") return boundedText(decision.message);
+  if (decision.kind === "ask_user") return boundedText(decision.question);
+  if (decision.kind === "execute") return boundedText(`Starting: ${decision.contract.objective}`);
+  if (decision.kind === "complete") return boundedText(decision.answer);
   const continuation = objectValue(data.continuation);
   return boundedText(contentText(continuation.content));
 }
