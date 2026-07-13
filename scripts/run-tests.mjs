@@ -6,12 +6,13 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const testRoot = path.join(root, "dist", "test");
 const files = await collectTests(testRoot);
+const testConcurrency = boundedTestConcurrency(process.env.VANGUARD_TEST_CONCURRENCY);
 
 if (files.length === 0) {
   throw new Error(`No compiled tests were found under ${testRoot}. Run the build first.`);
 }
 
-const child = spawn(process.execPath, ["--test", ...files], {
+const child = spawn(process.execPath, ["--test", `--test-concurrency=${testConcurrency}`, ...files], {
   cwd: root,
   env: process.env,
   stdio: "inherit",
@@ -41,4 +42,12 @@ async function collectTests(directory) {
     else if (entry.isFile() && entry.name.endsWith(".test.js")) discovered.push(absolute);
   }
   return discovered;
+}
+
+function boundedTestConcurrency(configured) {
+  if (configured === undefined || configured.trim().length === 0) return 4;
+  if (!/^[1-9][0-9]*$/u.test(configured)) {
+    throw new Error("VANGUARD_TEST_CONCURRENCY must be a positive integer.");
+  }
+  return Math.min(Number(configured), 4);
 }
