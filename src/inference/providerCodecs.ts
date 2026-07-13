@@ -14,6 +14,7 @@ import {
   type ModelWireCodec,
   type SerializableModelRequest,
   type StreamAccumulator,
+  type StreamObserver,
 } from "./httpModel.js";
 
 const EXECUTION_PROMPT = `You are Vanguard, an expert autonomous coding agent. Own the requested outcome end to end and work from observable repository evidence.
@@ -49,6 +50,8 @@ export interface ProviderModelOptions {
   readonly maxAttempts?: number;
   /** Receives user-visible response text as it streams. */
   readonly onTextDelta?: (text: string) => void;
+  /** Full provisional-stream lifecycle observer. Supersedes onTextDelta when set. */
+  readonly streamObserver?: StreamObserver;
 }
 
 export function createOpenAIModel(options: ProviderModelOptions): HttpModelAdapter {
@@ -59,6 +62,7 @@ export function createOpenAIModel(options: ProviderModelOptions): HttpModelAdapt
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
     ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
+    ...(options.streamObserver === undefined ? {} : { streamObserver: options.streamObserver }),
   });
 }
 
@@ -70,6 +74,7 @@ export function createAnthropicModel(options: ProviderModelOptions): HttpModelAd
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
     ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
+    ...(options.streamObserver === undefined ? {} : { streamObserver: options.streamObserver }),
   });
 }
 
@@ -81,6 +86,7 @@ export function createDeepSeekModel(options: ProviderModelOptions): HttpModelAda
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
     ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
+    ...(options.streamObserver === undefined ? {} : { streamObserver: options.streamObserver }),
   });
 }
 
@@ -544,7 +550,11 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
   }
 
   encodeStreaming(request: SerializableModelRequest): JsonValue {
-    return { ...object(this.encode(request), "Chat Completions request"), stream: true };
+    return {
+      ...object(this.encode(request), "Chat Completions request"),
+      stream: true,
+      stream_options: { include_usage: true },
+    };
   }
 
   createStreamAccumulator(onTextDelta?: (text: string) => void): StreamAccumulator {
@@ -594,12 +604,14 @@ class ChatCompletionsStreamAccumulator implements StreamAccumulator {
   #content: string | null = null;
   #reasoningContent: string | undefined;
   #finishReason: string | null = null;
+  #usage: JsonValue = null;
   readonly #toolCalls = new Map<number, { id: string; type: string; name: string; arguments: string }>();
 
   constructor(private readonly onTextDelta?: (text: string) => void) {}
 
   feed(data: string): void {
     const parsed = JSON.parse(data) as Record<string, JsonValue>;
+    if (parsed.usage !== undefined && parsed.usage !== null) this.#usage = parsed.usage;
     const choice = optionalObject(Array.isArray(parsed.choices) ? parsed.choices[0] : undefined);
     if (choice === undefined) return;
     if (typeof choice.finish_reason === "string") this.#finishReason = choice.finish_reason;
@@ -642,6 +654,7 @@ class ChatCompletionsStreamAccumulator implements StreamAccumulator {
           ...(toolCalls.length === 0 ? {} : { tool_calls: toolCalls }),
         },
       }],
+      ...(this.#usage === null ? {} : { usage: this.#usage }),
     };
   }
 }
@@ -655,11 +668,17 @@ class AnthropicStreamAccumulator implements StreamAccumulator {
   readonly #blocks = new Map<number, Record<string, JsonValue>>();
   readonly #partialJson = new Map<number, string>();
   #stopReason: JsonValue = null;
+  #usage: Record<string, JsonValue> = {};
 
   constructor(private readonly onTextDelta?: (text: string) => void) {}
 
   feed(data: string): void {
     const parsed = JSON.parse(data) as Record<string, JsonValue>;
+    if (parsed.type === "message_start") {
+      const usage = optionalObject(optionalObject(parsed.message)?.usage);
+      if (usage !== undefined) this.#usage = { ...this.#usage, ...usage };
+      return;
+    }
     if (parsed.type === "content_block_start" && typeof parsed.index === "number") {
       const block = optionalObject(parsed.content_block);
       if (block !== undefined) this.#blocks.set(parsed.index, { ...block });
@@ -692,6 +711,8 @@ class AnthropicStreamAccumulator implements StreamAccumulator {
     if (parsed.type === "message_delta") {
       const delta = optionalObject(parsed.delta);
       if (delta?.stop_reason !== undefined) this.#stopReason = delta.stop_reason;
+      const usage = optionalObject(parsed.usage);
+      if (usage !== undefined) this.#usage = { ...this.#usage, ...usage };
     }
   }
 
@@ -699,7 +720,11 @@ class AnthropicStreamAccumulator implements StreamAccumulator {
     const content = [...this.#blocks.entries()]
       .sort(([left], [right]) => left - right)
       .map(([, block]) => block);
-    return { content, stop_reason: this.#stopReason };
+    return {
+      content,
+      stop_reason: this.#stopReason,
+      ...(Object.keys(this.#usage).length === 0 ? {} : { usage: this.#usage }),
+    };
   }
 }
 

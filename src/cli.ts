@@ -38,8 +38,10 @@ import {
   openCodingSession,
   FixedCommandTool,
   PublicRunEventPresenter,
+  createStreamLifecyclePresenter,
   encodePublicRunEvent,
   type CodingSession,
+  type StreamObserver,
 } from "./index.js";
 
 interface CliOptions {
@@ -233,7 +235,7 @@ function buildConversationRuntime(
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const kernel = new AgentKernel({
-    model: createModel(options, createDeltaEmitter(markActivity)),
+    model: createModel(options, createStreamPresenter(markActivity)),
     tools: [
       new ListFilesTool(source),
       new SearchTextTool(source),
@@ -308,7 +310,7 @@ async function buildExecutionRuntime(
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const kernel = new AgentKernel({
-    model: createModel(options, interactive ? createDeltaEmitter(markActivity) : undefined),
+    model: createModel(options, interactive ? createStreamPresenter(markActivity) : undefined),
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
@@ -470,12 +472,12 @@ function emitSessionReady(
   });
 }
 
-function createModel(options: CliOptions, onTextDelta?: (text: string) => void) {
+function createModel(options: CliOptions, streamObserver?: StreamObserver) {
   const common = {
     model: options.model,
     timeoutMs: 600_000,
     maxAttempts: 4,
-    ...(onTextDelta === undefined ? {} : { onTextDelta }),
+    ...(streamObserver === undefined ? {} : { streamObserver }),
   };
   if (options.provider === "openai") return createOpenAIModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "anthropic") return createAnthropicModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
@@ -552,30 +554,8 @@ class StdinUserChannel implements UserChannelPort {
   }
 }
 
-/** Coalesces streamed text into bounded agent.delta public events. */
-function createDeltaEmitter(markActivity: () => void): (text: string) => void {
-  let buffer = "";
-  let timer: NodeJS.Timeout | undefined;
-  const flush = (): void => {
-    timer = undefined;
-    if (buffer.length === 0) return;
-    const text = buffer;
-    buffer = "";
-    streamPublicEvent({ type: "agent.delta", agentId: "main", status: "info", title: "Agent", message: text });
-  };
-  return (text: string): void => {
-    markActivity();
-    buffer += text;
-    if (buffer.length >= 400) {
-      if (timer !== undefined) clearTimeout(timer);
-      flush();
-      return;
-    }
-    if (timer === undefined) {
-      timer = setTimeout(flush, 150);
-      timer.unref();
-    }
-  };
+function createStreamPresenter(markActivity: () => void): StreamObserver {
+  return createStreamLifecyclePresenter(streamPublicEvent, markActivity);
 }
 
 function parseArgumentMap(args: readonly string[]): Map<string, string[]> {

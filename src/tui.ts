@@ -425,6 +425,17 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     state.liveDelta = `${state.liveDelta}${event.message}`.slice(-600);
     return;
   }
+  if (event.type === "agent.stream_started" || event.type === "agent.stream_reset") {
+    // A fresh or replayed attempt owns the provisional line from here on.
+    state.liveDelta = "";
+    return;
+  }
+  if (event.type === "agent.stream_committed") return;
+  if (event.type === "agent.stream_failed") {
+    state.liveDelta = "";
+    if (event.detail !== undefined) state.quietDetail = `Model stream failed: ${event.detail}`;
+    return;
+  }
   if (event.type === "agent.message" && event.message !== undefined) {
     state.liveDelta = "";
     state.chat.push({ agentId: event.agentId, message: event.message, ...(event.turn === undefined ? {} : { turn: event.turn }) });

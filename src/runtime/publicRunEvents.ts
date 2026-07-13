@@ -1,5 +1,6 @@
 import type { JsonValue, RunEvent } from "../kernel/contracts.js";
 import { normalizeDecision } from "../kernel/contracts.js";
+import type { StreamObserver } from "../inference/httpModel.js";
 
 export const PUBLIC_EVENT_PREFIX = "@@VANGUARD_EVENT@@";
 
@@ -184,6 +185,70 @@ export class PublicRunEventPresenter {
 
 export function encodePublicRunEvent(event: PublicRunEvent): string {
   return `${PUBLIC_EVENT_PREFIX}${JSON.stringify(event)}\n`;
+}
+
+/**
+ * Presents the provisional-stream lifecycle as public events. Deltas are
+ * coalesced; pending text always flushes before the stream commits, so the
+ * canonical agent.message never precedes its own provisional tail. A reset
+ * discards provisional text instead of flushing it, preventing duplicated
+ * output after a retry.
+ */
+export function createStreamLifecyclePresenter(
+  emit: (event: PublicRunEvent) => void,
+  markActivity: () => void = () => {},
+  coalesceMs = 150,
+): StreamObserver {
+  let buffer = "";
+  let timer: NodeJS.Timeout | undefined;
+  const send = (type: string, extra: { message?: string; detail?: string } = {}): void => {
+    emit({ type, agentId: "main", status: "info", title: "Agent", ...extra });
+  };
+  const clearTimer = (): void => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+  };
+  const flush = (): void => {
+    clearTimer();
+    if (buffer.length === 0) return;
+    const text = buffer;
+    buffer = "";
+    send("agent.delta", { message: text });
+  };
+  const discard = (): void => {
+    clearTimer();
+    buffer = "";
+  };
+  return {
+    started(attempt: number): void {
+      markActivity();
+      send("agent.stream_started", { detail: `attempt ${attempt}` });
+    },
+    delta(text: string): void {
+      markActivity();
+      buffer += text;
+      if (buffer.length >= 400) {
+        flush();
+        return;
+      }
+      if (timer === undefined) {
+        timer = setTimeout(flush, coalesceMs);
+        timer.unref?.();
+      }
+    },
+    reset(): void {
+      discard();
+      send("agent.stream_reset");
+    },
+    committed(): void {
+      flush();
+      send("agent.stream_committed");
+    },
+    failed(reason: string): void {
+      discard();
+      send("agent.stream_failed", { detail: reason.slice(0, 220) });
+    },
+  };
 }
 
 function decisionMessage(

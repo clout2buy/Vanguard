@@ -37,6 +37,26 @@ export interface HeaderProvider {
   headers(): Promise<Readonly<Record<string, string>>>;
 }
 
+/**
+ * Observes the provisional-stream lifecycle of one model decision. Deltas
+ * are provisional until committed; a reset means previously observed text
+ * must be discarded because the attempt is being replayed.
+ */
+export interface StreamObserver {
+  /** A streaming attempt has begun; any provisional text belongs to it. */
+  started?(attempt: number): void;
+  /** User-visible provisional text. Never reasoning or thinking. */
+  delta(text: string): void;
+  /** Discard all provisional text; the response is being retried. */
+  reset?(): void;
+  /** The decision decoded successfully; provisional text is now final. */
+  committed?(): void;
+  /** The decision failed after all retries; provisional text is void. */
+  failed?(reason: string): void;
+  /** Provider-reported usage metadata for the successful attempt. */
+  usage?(usage: JsonValue): void;
+}
+
 export interface HttpModelOptions {
   readonly endpoint: string;
   readonly codec?: ModelWireCodec;
@@ -47,6 +67,8 @@ export interface HttpModelOptions {
   readonly fetchImplementation?: typeof fetch;
   /** Receives user-visible text as it streams. Enables SSE when the codec supports it. */
   readonly onTextDelta?: (text: string) => void;
+  /** Full provisional-stream lifecycle observer. Supersedes onTextDelta when set. */
+  readonly streamObserver?: StreamObserver;
   /** Forces the non-streaming request path even when the codec supports SSE. */
   readonly disableStreaming?: boolean;
 }
@@ -81,6 +103,7 @@ export class HttpModelAdapter implements ModelPort {
       remainingSteps: request.remainingSteps,
       workingState: request.workingState,
     };
+    const observer = this.#observer();
     const streaming = this.#codec.encodeStreaming !== undefined
       && this.#codec.createStreamAccumulator !== undefined
       && this.options.disableStreaming !== true
@@ -89,6 +112,15 @@ export class HttpModelAdapter implements ModelPort {
       ? this.#codec.encodeStreaming!(serializable)
       : this.#codec.encode(serializable));
     let lastError: unknown;
+    // Provisional text already shown to the observer; a retry after visible
+    // output must reset the provisional stream before replaying.
+    let visibleText = false;
+
+    const fail = (error: unknown): Error => {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      observer?.failed?.(failure.message);
+      return failure;
+    };
 
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
       try {
@@ -109,14 +141,32 @@ export class HttpModelAdapter implements ModelPort {
           }
           throw error;
         }
-        if (streaming) {
-          const accumulator = this.#codec.createStreamAccumulator!(this.options.onTextDelta);
-          await consumeServerSentEvents(response, accumulator);
-          return this.#codec.decode(accumulator.finish());
+        if (streaming && isEventStream(response)) {
+          if (visibleText) {
+            observer?.reset?.();
+            visibleText = false;
+          }
+          observer?.started?.(attempt);
+          const accumulator = this.#codec.createStreamAccumulator!((text) => {
+            visibleText = true;
+            observer?.delta(text);
+          });
+          await consumeServerSentEvents(response, accumulator, signal);
+          const canonical = accumulator.finish();
+          const decision = this.#codec.decode(canonical);
+          reportUsage(canonical, observer);
+          observer?.committed?.();
+          return decision;
         }
-        return this.#codec.decode(await response.json() as JsonValue);
+        // Either a plain request, or a compatible endpoint that ignored the
+        // stream flag and answered with a complete JSON body.
+        const canonical = await response.json() as JsonValue;
+        const decision = this.#codec.decode(canonical);
+        reportUsage(canonical, observer);
+        observer?.committed?.();
+        return decision;
       } catch (error) {
-        if (signal.aborted || error instanceof HttpInferenceError && !error.retryable) throw error;
+        if (signal.aborted || error instanceof HttpInferenceError && !error.retryable) throw fail(error);
         lastError = error;
         if (attempt < this.#maxAttempts) {
           await delay(this.#retryBaseMs * 2 ** (attempt - 1), signal);
@@ -124,7 +174,13 @@ export class HttpModelAdapter implements ModelPort {
         }
       }
     }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    throw fail(lastError);
+  }
+
+  #observer(): StreamObserver | undefined {
+    if (this.options.streamObserver !== undefined) return this.options.streamObserver;
+    if (this.options.onTextDelta !== undefined) return { delta: this.options.onTextDelta };
+    return undefined;
   }
 }
 
@@ -155,11 +211,37 @@ export class VanguardJsonCodec implements ModelWireCodec {
   }
 }
 
+/** Whether a compatible endpoint actually honored the stream flag. */
+function isEventStream(response: Response): boolean {
+  const contentType = response.headers.get("content-type") ?? "";
+  return contentType.includes("text/event-stream");
+}
+
+/** Surfaces provider usage metadata from a canonical response object. */
+function reportUsage(canonical: JsonValue, observer: StreamObserver | undefined): void {
+  if (observer?.usage === undefined) return;
+  if (canonical === null || Array.isArray(canonical) || typeof canonical !== "object") return;
+  const direct = canonical.usage;
+  if (direct !== undefined && direct !== null) {
+    observer.usage(direct);
+    return;
+  }
+  const nested = canonical.response;
+  if (nested !== null && nested !== undefined && !Array.isArray(nested) && typeof nested === "object"
+    && nested.usage !== undefined && nested.usage !== null) {
+    observer.usage(nested.usage);
+  }
+}
+
 /**
  * Reads an SSE response body, feeding each event's data payload to the
  * accumulator. Handles multi-line data fields and the [DONE] terminator.
  */
-async function consumeServerSentEvents(response: Response, accumulator: StreamAccumulator): Promise<void> {
+async function consumeServerSentEvents(
+  response: Response,
+  accumulator: StreamAccumulator,
+  signal?: AbortSignal,
+): Promise<void> {
   if (response.body === null) throw new Error("Streaming response has no body.");
   const decoder = new TextDecoder();
   let buffer = "";
@@ -180,6 +262,7 @@ async function consumeServerSentEvents(response: Response, accumulator: StreamAc
     // event:/id:/retry:/comment lines carry no payload we need.
   };
   for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    if (signal?.aborted) throw new Error("Streaming response cancelled.");
     buffer += decoder.decode(chunk, { stream: true });
     let boundary = buffer.indexOf("\n");
     while (boundary !== -1) {
