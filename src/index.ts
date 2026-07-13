@@ -2,6 +2,7 @@ export * from "./kernel/contracts.js";
 export * from "./kernel/contextPolicy.js";
 export * from "./kernel/stickyContext.js";
 export * from "./kernel/checkpoint.js";
+export * from "./kernel/durableState.js";
 export * from "./kernel/plan.js";
 export * from "./kernel/fileJournal.js";
 export * from "./kernel/memoryJournal.js";

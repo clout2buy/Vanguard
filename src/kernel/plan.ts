@@ -12,6 +12,7 @@ import type {
   ToolResult,
 } from "./contracts.js";
 import { PLAN_TOOL_NAME } from "./contracts.js";
+import { durableStateSha256, type DurableStateAnchorRequirement } from "./durableState.js";
 
 export type MilestoneStatus = "pending" | "active" | "blocked" | "proven" | "invalidated";
 export type EvidenceKind = "tool" | "verification" | "user";
@@ -134,12 +135,20 @@ export class PlanLedger implements PlanStatusPort {
     file: string,
     requiredCriteria: readonly string[] = [],
     evidenceResolver?: EvidenceResolverPort,
+    anchor?: DurableStateAnchorRequirement,
   ): Promise<PlanLedger> {
     const absolute = path.resolve(file);
     try {
       const parsed = JSON.parse(await readFile(absolute, "utf8")) as unknown;
       const state = migratePersistedPlan(parsed, requiredCriteria);
       validatePlanState(state);
+      const actualSha256 = planStateSha256(state);
+      if (anchor?.required === true && anchor.expectedSha256 === undefined) {
+        throw new Error("Persisted plan has no committed journal anchor.");
+      }
+      if (anchor?.expectedSha256 !== undefined && actualSha256 !== anchor.expectedSha256) {
+        throw new Error("Persisted plan does not match its committed journal anchor.");
+      }
       if (evidenceResolver !== undefined) await validatePersistedEvidence(state, evidenceResolver);
       const requested = uniqueStrings(requiredCriteria, "required criteria", 100);
       if (requested.length > 0 && JSON.stringify(requested) !== JSON.stringify(state.requiredCriteria)) {
@@ -148,6 +157,7 @@ export class PlanLedger implements PlanStatusPort {
       return new PlanLedger(state, absolute);
     } catch (error) {
       if (!isMissing(error)) throw error;
+      if (anchor?.expectedSha256 !== undefined) throw new Error("Committed plan state is missing from disk.");
       return new PlanLedger(undefined, absolute, requiredCriteria);
     }
   }
@@ -299,6 +309,7 @@ export class PlanTool implements ToolPort {
       ok: true,
       output: {
         revision: state.revision,
+        stateSha256: planStateSha256(state),
         milestones: state.milestones.length,
         unproven: [...this.ledger.unproven()],
       },
@@ -325,6 +336,10 @@ export class PlanTool implements ToolPort {
     }
     return reference as EvidenceRef & { kind: "user" };
   }
+}
+
+export function planStateSha256(state: PlanState): string {
+  return durableStateSha256(state as unknown as JsonValue);
 }
 
 interface MilestoneDraft extends Omit<PlanMilestone, "evidence" | "invalidation"> {

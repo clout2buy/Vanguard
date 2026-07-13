@@ -57,6 +57,7 @@ import {
   undoAppliedTransaction,
   createSessionCheckpoint,
   listSessionCheckpoints,
+  latestDurableStateAnchor,
   restoreSessionCheckpoint,
   forkSessionCheckpoint,
   encodePublicRunEvent,
@@ -431,8 +432,12 @@ async function buildExecutionRuntime(
     }));
   }
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
-  const checkpoint = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const priorEvents = await fileJournal.readValidated();
+  const checkpointAnchor = latestDurableStateAnchor(priorEvents, "run.checkpoint");
+  const checkpoint = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"), {
+    required: true,
+    ...(checkpointAnchor === undefined ? {} : { expectedSha256: checkpointAnchor.sha256 }),
+  });
   const contractedEvent = [...priorEvents].reverse().find((event) => event.type === "run.contracted");
   const contractedData = contractedEvent?.data;
   const contract = contractedData !== null && contractedData !== undefined
@@ -444,6 +449,12 @@ async function buildExecutionRuntime(
     path.join(container, "plan.json"),
     contract === undefined ? [] : contractCriterionIds(contract),
     evidenceResolver,
+    {
+      required: true,
+      ...(latestDurableStateAnchor(priorEvents, "plan.update") === undefined
+        ? {}
+        : { expectedSha256: latestDurableStateAnchor(priorEvents, "plan.update")!.sha256 }),
+    },
   );
   const usage = new UsageLedger(options.model);
   // Both durable states ride into every request as runtime-owned context.

@@ -204,6 +204,33 @@ test("resume revalidates persisted evidence hashes against the journal", async (
   }
 });
 
+test("journal-anchored plan state rejects semantic tampering and uncommitted files", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "vanguard-plan-anchor-"));
+  try {
+    const file = path.join(directory, "plan.json");
+    const ledger = await PlanLedger.open(file);
+    const result = await new PlanTool(ledger).execute({
+      summary: "initial", milestones: [milestone("m1", "active")],
+    }, { task: "t", step: 1, signal: new AbortController().signal });
+    const output = result.output as { stateSha256?: string };
+    assert.ok(output.stateSha256 !== undefined && /^[a-f0-9]{64}$/.test(output.stateSha256));
+    const stateSha256 = output.stateSha256;
+    const anchored = await PlanLedger.open(file, [], undefined, { required: true, expectedSha256: stateSha256 });
+    assert.deepEqual(anchored.unproven(), ["m1 — Implement and prove the change"]);
+
+    const tampered = JSON.parse(await readFile(file, "utf8")) as { milestones: Array<{ title: string }> };
+    tampered.milestones[0]!.title = "Silently weakened milestone";
+    await writeFile(file, JSON.stringify(tampered));
+    await assert.rejects(
+      () => PlanLedger.open(file, [], undefined, { required: true, expectedSha256: stateSha256 }),
+      /committed journal anchor/,
+    );
+    await assert.rejects(() => PlanLedger.open(file, [], undefined, { required: true }), /no committed journal anchor/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("invalidation requires latest exact user instruction and an active superseding milestone", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "vanguard-plan-"));
   try {

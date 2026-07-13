@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { CheckpointTool, FileJournal, RunCheckpointLedger } from "../src/index.js";
+import { CheckpointTool, FileJournal, RunCheckpointLedger, latestDurableStateAnchor } from "../src/index.js";
 
 test("file journal survives reopening and validates its hash chain", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-journal-"));
@@ -74,4 +74,40 @@ test("checkpoint accepts JSON-encoded string arrays from schema-imperfect provid
     evidence: [],
     risks: ["compatibility"],
   });
+});
+
+test("checkpoint state is bound to the successful journaled tool result", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-checkpoint-anchor-"));
+  const file = path.join(root, "checkpoint.json");
+  try {
+    const ledger = await RunCheckpointLedger.open(file);
+    const result = await new CheckpointTool(ledger).execute({
+      summary: "safe state",
+      completed: [],
+      next: ["verify"],
+      evidence: [],
+      risks: [],
+    }, { task: "t", step: 1, signal: new AbortController().signal });
+    const output = result.output as { stateSha256?: string };
+    const journal = await FileJournal.open(path.join(root, "run.jsonl"));
+    await journal.append({
+      sequence: 1,
+      type: "tool.completed",
+      data: { callId: "checkpoint-1", tool: "run.checkpoint", ok: true, output: result.output },
+    });
+    const anchor = latestDurableStateAnchor(await journal.readValidated(), "run.checkpoint");
+    assert.notEqual(anchor, undefined);
+    assert.equal(anchor?.sha256, output.stateSha256);
+    await RunCheckpointLedger.open(file, { required: true, expectedSha256: anchor!.sha256 });
+
+    const tampered = JSON.parse(await readFile(file, "utf8")) as { summary: string };
+    tampered.summary = "forged progress";
+    await writeFile(file, JSON.stringify(tampered));
+    await assert.rejects(
+      () => RunCheckpointLedger.open(file, { required: true, expectedSha256: anchor!.sha256 }),
+      /committed journal anchor/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

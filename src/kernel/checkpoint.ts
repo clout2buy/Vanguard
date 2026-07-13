@@ -9,6 +9,7 @@ import type {
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { durableStateSha256, type DurableStateAnchorRequirement } from "./durableState.js";
 
 export interface CheckpointState {
   readonly revision: number;
@@ -28,14 +29,22 @@ export class RunCheckpointLedger implements WorkingStatePort {
     this.#file = file;
   }
 
-  static async open(file: string): Promise<RunCheckpointLedger> {
+  static async open(file: string, anchor?: DurableStateAnchorRequirement): Promise<RunCheckpointLedger> {
     const absolute = path.resolve(file);
     try {
       const state = JSON.parse(await readFile(absolute, "utf8")) as CheckpointState;
       validateState(state);
+      const actualSha256 = checkpointStateSha256(state);
+      if (anchor?.required === true && anchor.expectedSha256 === undefined) {
+        throw new Error("Persisted checkpoint has no committed journal anchor.");
+      }
+      if (anchor?.expectedSha256 !== undefined && actualSha256 !== anchor.expectedSha256) {
+        throw new Error("Persisted checkpoint does not match its committed journal anchor.");
+      }
       return new RunCheckpointLedger(state, absolute);
     } catch (error) {
       if (!isMissing(error)) throw error;
+      if (anchor?.expectedSha256 !== undefined) throw new Error("Committed checkpoint state is missing from disk.");
       return new RunCheckpointLedger(undefined, absolute);
     }
   }
@@ -88,8 +97,12 @@ export class CheckpointTool implements ToolPort {
       evidence: stringList(input.evidence, "evidence"),
       risks: stringList(input.risks, "risks"),
     });
-    return { ok: true, output: state as unknown as JsonValue };
+    return { ok: true, output: { ...state, stateSha256: checkpointStateSha256(state) } as unknown as JsonValue };
   }
+}
+
+export function checkpointStateSha256(state: CheckpointState): string {
+  return durableStateSha256(state as unknown as JsonValue);
 }
 
 function validateState(state: CheckpointState): void {
