@@ -327,11 +327,23 @@ export function validateCertificationManifest(manifest: CertificationManifest): 
   }
   unique(isolationPolicy.allowedMechanisms, "isolation mechanism");
   unique(isolationPolicy.trustedIssuers.map((issuer) => issuer.issuerId), "isolation issuer id");
+  unique(isolationPolicy.trustedIssuers.map((issuer) => issuer.keyId), "isolation issuer key id");
+  const evaluatorSpki = canonicalEd25519Spki(evaluatorKey.publicKeyPem, "external evaluator");
+  const isolationSpkis = new Set<string>();
   for (const issuer of isolationPolicy.trustedIssuers) {
     assertExactKeys(issuer as unknown as Record<string, unknown>,
       ["issuerId", "keyId", "publicKeyPem"], "trusted isolation issuer");
     if (issuer.keyId.trim().length === 0) throw new Error("Isolation issuer key id cannot be empty.");
     validateEd25519PublicKey(issuer.publicKeyPem, `isolation issuer '${issuer.issuerId}'`);
+    const issuerSpki = canonicalEd25519Spki(issuer.publicKeyPem, `isolation issuer '${issuer.issuerId}'`);
+    if (issuer.issuerId === evaluatorKey.evaluatorId || issuer.keyId === evaluatorKey.keyId
+      || issuerSpki === evaluatorSpki) {
+      throw new Error("The external evaluator and isolation issuer must use independent identities and Ed25519 keys.");
+    }
+    if (isolationSpkis.has(issuerSpki)) {
+      throw new Error("Trusted isolation issuers must not reuse the same Ed25519 key.");
+    }
+    isolationSpkis.add(issuerSpki);
   }
   if (!GIT_OBJECT_ID.test(manifest.vanguardCommit)) throw new Error("Vanguard candidate commit must be a full Git object id.");
   if (!Number.isFinite(Date.parse(manifest.frozenAt))) throw new Error("Certification freeze time is invalid.");
@@ -1313,6 +1325,16 @@ function validateEd25519PublicKey(publicKeyPem: string, name: string): void {
   try {
     const key = createPublicKey(publicKeyPem);
     if (key.asymmetricKeyType !== "ed25519") throw new Error("wrong key type");
+  } catch {
+    throw new Error(`Certification ${name} key must be a valid Ed25519 public key.`);
+  }
+}
+
+function canonicalEd25519Spki(publicKeyPem: string, name: string): string {
+  try {
+    const key = createPublicKey(publicKeyPem);
+    if (key.asymmetricKeyType !== "ed25519") throw new Error("wrong key type");
+    return (key.export({ type: "spki", format: "der" }) as Buffer).toString("hex");
   } catch {
     throw new Error(`Certification ${name} key must be a valid Ed25519 public key.`);
   }

@@ -135,6 +135,13 @@ dry-run adapter and verifier have a distinct `dry-run` mode, cannot be paired
 with a real adapter, and their evidence is rejected by the certification
 result ledger.
 
+The external evaluator and every trusted isolation issuer must use distinct
+identities, key IDs, and Ed25519 public keys. Equality is checked on canonical
+SPKI bytes, so PEM reformatting or relabeling cannot let one signer attest both
+an execution result and the isolation boundary that supposedly constrained it.
+Separate keys are a technical separation; the external policy must also name
+independent key custodians.
+
 ## Blinded maintainability review
 
 One scalar is not evidence. Every run requires exactly two distinct blinded,

@@ -246,6 +246,19 @@ test("manifest validation rejects contamination, weak independent coverage, and 
     tasks: contaminated.tasks.map((task, index) => index === 0 ? { ...task, priorRunCount: 1 } : task),
   }), /contaminated/);
   assert.throws(() => validateCertificationManifest(manifest({ externalEvaluator: false })), /external evaluator/);
+  const sharedTrustKey = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...sharedTrustKey,
+    isolationPolicy: {
+      ...sharedTrustKey.isolationPolicy,
+      trustedIssuers: [{
+        issuerId: "separately-labelled-host",
+        keyId: "separately-labelled-host-key",
+        // PEM reformatting must not turn one SPKI into two trust domains.
+        publicKeyPem: evaluatorPublicKeyPem.replaceAll("\n", "\r\n"),
+      }],
+    },
+  }), /independent identities and Ed25519 keys/);
   assert.throws(() => validateCertificationManifest(manifest({ minPairedTasks: 10 })), /at least 30/);
   const unpinned = manifest();
   assert.throws(() => validateCertificationManifest({
