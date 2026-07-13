@@ -364,7 +364,13 @@ interface ScorecardContext {
 
 async function writeScorecard(context: ScorecardContext): Promise<void> {
   const { session, options, outcome } = context;
-  const trajectory = analyzeTrajectory(await context.fileJournal.readValidated());
+  const events = await context.fileJournal.readValidated();
+  const trajectory = analyzeTrajectory(events);
+  // Sessions contracted through conversation carry their task in the journal.
+  const contracted = events.find((event) => event.type === "run.contracted")?.data;
+  const contractedTask = contracted !== null && typeof contracted === "object" && !Array.isArray(contracted)
+    && typeof contracted.task === "string" ? contracted.task : undefined;
+  const task = options.task.length > 0 ? options.task : contractedTask ?? "";
   const patch = session.materialized
     ? await analyzePatch(session.sourceRoot, session.workspaceRoot)
     : emptyPatchMetrics();
@@ -378,7 +384,7 @@ async function writeScorecard(context: ScorecardContext): Promise<void> {
     workspaceRoot: session.workspaceRoot,
     provider: options.provider,
     model: options.model,
-    task: options.task,
+    task,
     verification: options.verification,
     outcome,
     trajectory,
