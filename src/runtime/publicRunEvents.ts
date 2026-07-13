@@ -157,6 +157,43 @@ export class PublicRunEventPresenter {
       }];
     }
 
+    if (event.type === "recovery.delayed") {
+      const data = objectValue(event.data);
+      const delayMs = typeof data.delayMs === "number" ? data.delayMs : undefined;
+      const code = stringValue(data.failureCode) ?? "transient failure";
+      return [{
+        type: "recovery.scheduled",
+        agentId,
+        sequence: event.sequence,
+        status: "info",
+        title: "Safe retry scheduled",
+        detail: delayMs === undefined ? code : `${code} · ${delayMs} ms backoff`,
+      }];
+    }
+
+    if (event.type === "recovery.exhausted") {
+      const data = objectValue(event.data);
+      return [{
+        type: "recovery.exhausted",
+        agentId,
+        sequence: event.sequence,
+        status: "failed",
+        title: "Recovery budget exhausted",
+        detail: stringValue(data.reason) ?? "No safe retry remains",
+      }];
+    }
+
+    if (event.type === "recovery.replan_required") {
+      return [{
+        type: "recovery.replan_required",
+        agentId,
+        sequence: event.sequence,
+        status: "info",
+        title: "Replan required",
+        detail: "Repeated deterministic failure; identical replay is blocked by the circuit breaker",
+      }];
+    }
+
     if (event.type === "run.failed") {
       const data = objectValue(event.data);
       return [{

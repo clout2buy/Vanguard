@@ -18,7 +18,7 @@ The same surface is available in TypeScript through `VanguardEngine`. See
 
 1. A model proposes actions; it does not decide whether its own work succeeded.
 2. Every action and observation is recorded in an append-only run journal.
-3. Tool failures are observations that can be recovered from, but repeated identical failures trip a circuit breaker.
+3. Failures are classified before action: only safe, idempotent transient operations retry; mutations and completion verifiers never do, and repeated deterministic failures trip a replan-oriented circuit breaker.
 4. A final answer is provisional until independent verifiers accept it.
 5. Model providers, tools, context policy, and verification are replaceable ports—not hard-coded product assumptions.
 

@@ -56,8 +56,9 @@ payloads outside the public protocol. See `docs/ENGINE_PROTOCOL.md`.
 - Provider SSE streaming that rebuilds each canonical response from deltas — user-visible text streams to the terminal while reasoning and thinking stay private and are preserved only for continuation replay
 - Conversation runs read-only against the original project; the disposable workspace copy materializes only when a contract is accepted
 - Deterministic agent kernel with bounded steps and repeated-failure circuit breaking
+- Durable adaptive recovery: a versioned provider/tool/process/verifier/policy/context failure taxonomy; one journal-restored global/per-class retry budget; capped exponential backoff with jitter and Retry-After support; automatic retry only for provider requests and read-only tool operations that are both transient and idempotent; mutations, process execution, and completion verifiers are always single-attempt
 - Explicit model/tool/verifier contracts and evidence-focused context budgeting
-- SDK-free native HTTP inference with bounded transient retry
+- SDK-free native HTTP inference whose provisional stream is reset before a safe retry, so a disconnected attempt cannot duplicate visible text or tool decisions
 - Workspace-confined file operations with version-bound guarded edits
 - Pre-mutation editable-root/protected-path enforcement and hash-guarded deletion
 - Mandatory post-test change-scope/growth review after the latest mutation
@@ -78,7 +79,7 @@ payloads outside the public protocol. See `docs/ENGINE_PROTOCOL.md`.
 - Restricted-process evidence policy rejecting non-failing assertion constructs
 - Provider-neutral checkpoint injection for OpenAI, Anthropic, and DeepSeek protocols
 - Sealed v2 cases for multi-file lifecycle work and asynchronous greenfield implementation
-- Trajectory and patch-scope scorecard metrics for quality audits beyond pass/fail
+- Trajectory, recovery, and patch-scope scorecard metrics for quality audits beyond pass/fail
 - Versioned case contracts and transparent execution-quality scoring separate from correctness
 - Outcome classification separating infrastructure failures from capability scores
 - Separate productive-test, test-harness, and tool-friction trajectory signals

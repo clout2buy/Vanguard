@@ -540,7 +540,7 @@ async function writeScorecard(context: ScorecardContext): Promise<void> {
   const classification = classifyOutcome(outcome);
   const executionQuality = scoreExecutionQuality(verified, trajectory, patch);
   const scorecard = {
-    version: 2,
+    version: 3,
     sessionId: session.id,
     sourceRoot: session.sourceRoot,
     workspaceRoot: session.workspaceRoot,

@@ -12,6 +12,13 @@ export interface TrajectoryMetrics {
   readonly verificationFailures: number;
   readonly policyBlocks: number;
   readonly contextCompactions: number;
+  readonly recoveryDecisions: number;
+  readonly retriesScheduled: number;
+  readonly retriesExhausted: number;
+  readonly replansRequired: number;
+  readonly recoveryDelayMs: number;
+  readonly failuresByCode: Readonly<Record<string, number>>;
+  readonly failuresByDisposition: Readonly<Record<string, number>>;
   readonly toolCallsByName: Readonly<Record<string, number>>;
 }
 
@@ -27,6 +34,13 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   let verificationFailures = 0;
   let policyBlocks = 0;
   let contextCompactions = 0;
+  let recoveryDecisions = 0;
+  let retriesScheduled = 0;
+  let retriesExhausted = 0;
+  let replansRequired = 0;
+  let recoveryDelayMs = 0;
+  const failuresByCode: Record<string, number> = {};
+  const failuresByDisposition: Record<string, number> = {};
   const toolCallsByName: Record<string, number> = {};
   let pendingToolNames: string[] = [];
 
@@ -81,6 +95,22 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       if (data?.passed === false) verificationFailures += 1;
     }
     if (event.type === "context.compacted") contextCompactions += 1;
+    if (event.type === "recovery.decided") {
+      recoveryDecisions += 1;
+      if (data?.retry === true) retriesScheduled += 1;
+      const failure = record(data?.failure);
+      if (typeof failure?.code === "string") {
+        failuresByCode[failure.code] = (failuresByCode[failure.code] ?? 0) + 1;
+      }
+      if (typeof failure?.disposition === "string") {
+        failuresByDisposition[failure.disposition] = (failuresByDisposition[failure.disposition] ?? 0) + 1;
+      }
+    }
+    if (event.type === "recovery.delayed" && typeof data?.delayMs === "number") {
+      recoveryDelayMs += data.delayMs;
+    }
+    if (event.type === "recovery.exhausted") retriesExhausted += 1;
+    if (event.type === "recovery.replan_required") replansRequired += 1;
   }
 
   return {
@@ -95,6 +125,13 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     verificationFailures,
     policyBlocks,
     contextCompactions,
+    recoveryDecisions,
+    retriesScheduled,
+    retriesExhausted,
+    replansRequired,
+    recoveryDelayMs,
+    failuresByCode,
+    failuresByDisposition,
     toolCallsByName,
   };
 }

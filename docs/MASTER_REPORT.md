@@ -219,6 +219,54 @@ superiority** — the evidence selects the language afterward.
 - **Tests:** full suite 144 cases on Windows: 143 passed, with the one
   POSIX-only executable-mode assertion correctly skipped.
 
+### Phase 6 — Adaptive execution and recovery
+
+- **Intended KPI:** transient infrastructure faults recover without duplicate
+  work or user-visible stream corruption; deterministic/policy/environment
+  failures change the agent's next action instead of creating replay storms.
+  Recovery cost and delay are auditable in every scorecard.
+- **Implemented:** a versioned stable failure taxonomy spanning provider,
+  tool, process, verifier, policy, context, and environment sources, with
+  explicit transient/deterministic/policy/environment/cancelled dispositions;
+  one runtime-owned `RecoveryController` shared by provider and tool paths;
+  journal-restored global and per-failure-class budgets; capped exponential
+  backoff with bounded jitter, abort support, and exact `Retry-After`
+  precedence; structured failure + recovery feedback in tool/verifier
+  observations; replan/checkpoint guidance before the repeated-action circuit
+  breaker terminates a deterministic loop.
+- **Safety boundary:** automatic replay is limited to uncommitted provider
+  decisions and `effect: observe` tool operations. Workspace mutations,
+  process execution, state/review actions, orphaned calls after a crash, and
+  every completion verifier invocation are single-attempt even when their
+  exception resembles a transient disconnect. Provider HTTP 408/409/429/5xx,
+  timeouts, and disconnects are transient; authentication, invalid requests,
+  policy denials, deterministic tool/process exits, and context invariant
+  failures are not retried.
+- **Stream correctness:** a failed streaming attempt is provisional. Its
+  visible tail is reset before backoff/replay, and no model decision is
+  journaled until one canonical response decodes successfully. This prevents
+  duplicate text and duplicate tool calls across disconnect recovery.
+- **Durability and reporting:** `recovery.decided`, `recovery.delayed`,
+  `recovery.exhausted`, and `recovery.replan_required` are hash-chained run
+  events. Scorecard v3 trajectory metrics expose decisions, scheduled retries,
+  exhaustion, replan counts, aggregate delay, and counts by stable code and
+  disposition. Public terminal events surface scheduled delay, exhaustion,
+  and required replanning without leaking provider payloads.
+- **Adversarial proof:** fake-clock tests cover exponential cap/exhaustion,
+  abort during backoff, per-class budget persistence across resume, safe
+  read-only retry with exactly one final observation, mutation and verifier
+  non-retry, adapter-independent provider recovery, numeric Retry-After,
+  disconnected-stream reset/dedup, deterministic circuit/replan interaction,
+  taxonomy classification, and recovery scorecard metrics. No test sleeps on
+  wall time.
+- **Canary status:** not run in this phase. Implementation and deterministic
+  fault injection are not competitive/capability evidence.
+- **Unresolved risks:** classifier rules are deterministic heuristics over
+  typed HTTP state and bounded error evidence; new third-party adapters should
+  emit typed failure metadata rather than rely on message matching. Provider
+  failover is intentionally not implemented here, and live provider chaos
+  testing remains part of Phase 11/12 hardening.
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development

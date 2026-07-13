@@ -93,11 +93,13 @@ test("stops after the failed verification budget instead of thrashing", async ()
   });
 });
 
-test("opens the circuit breaker on an identical repeated failure", async () => {
+test("a repeated deterministic failure requires replanning before another action", async () => {
+  let executions = 0;
   const failingTool: ToolPort = {
     name: "shell",
     definition: toolDefinition("shell"),
     async execute() {
+      executions += 1;
       return { ok: false, output: "command failed" };
     },
   };
@@ -105,20 +107,20 @@ test("opens the circuit breaker on an identical repeated failure", async () => {
     kind: "tools",
     calls: [{ id: "call", name: "shell", input: { command: "bad" } }],
   };
+  const journal = new MemoryJournal();
   const kernel = new AgentKernel({
-    model: new ScriptedModel([repeatedCall, repeatedCall]),
+    model: new ScriptedModel([repeatedCall, repeatedCall, { kind: "complete", answer: "replanned" }]),
     tools: [failingTool],
     verifiers: [passingVerifier],
-    journal: new MemoryJournal(),
+    journal,
     options: { maxRepeatedAction: 2 },
   });
 
   const outcome = await kernel.run("do not loop forever");
-  assert.deepEqual(outcome, {
-    status: "failed",
-    reason: "Circuit breaker opened for shell.",
-    steps: 2,
-  });
+  assert.equal(outcome.status, "completed");
+  assert.equal(executions, 2);
+  assert.equal(journal.events.some((event) => event.type === "recovery.replan_required"), true);
+  assert.match(JSON.stringify(journal.events), /replan_and_checkpoint/);
 });
 
 test("a successful mutation resets repeated execution failure history", async () => {

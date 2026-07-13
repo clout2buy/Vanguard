@@ -5,12 +5,14 @@ import type {
   KernelMode,
   ModelDecision,
   ModelPort,
+  FailureSource,
   RunEventType,
   TaskContract,
   ToolCall,
   ToolDefinition,
   ToolObservation,
   PlanStatusPort,
+  RecoveryPort,
   ToolPort,
   TranscriptEntry,
   UserChannelPort,
@@ -21,6 +23,12 @@ import type {
 } from "./contracts.js";
 import { CONTROL_TOOL_NAMES, PLAN_TOOL_NAME, normalizeDecision, renderContract } from "./contracts.js";
 import { EvidenceContextPolicy } from "./contextPolicy.js";
+import {
+  RecoveryController,
+  classifyFailure,
+  replanFeedback,
+  type RecoveryConfiguration,
+} from "./recovery.js";
 
 export interface RunOptions {
   readonly maxSteps: number;
@@ -32,6 +40,10 @@ export interface RunOptions {
   readonly maxConsecutiveNarrations: number;
   /** Steps between runtime re-grounding notes during planned execution. */
   readonly regroundIntervalSteps: number;
+  /** Total attempts for one safe, read-only tool action (initial + retries). */
+  readonly maxToolRecoveryAttempts: number;
+  /** Total attempts for a provider decision when the adapter has no retry loop. */
+  readonly maxModelRecoveryAttempts: number;
   /**
    * Whether a user is available to answer questions. When false the kernel
    * does not offer `user.ask` and rejects ask_user decisions with feedback
@@ -90,6 +102,8 @@ export interface KernelDependencies {
   readonly userChannel?: UserChannelPort;
   /** Read-only view of the runtime-owned plan; activates the plan gates. */
   readonly plan?: PlanStatusPort;
+  /** Durable retry budgets and an injectable clock for deterministic tests. */
+  readonly recovery?: RecoveryConfiguration;
   readonly options?: Partial<RunOptions>;
 }
 
@@ -102,6 +116,8 @@ const DEFAULT_OPTIONS: RunOptions = {
   maxConversationTurnSteps: 10,
   maxConsecutiveNarrations: 3,
   regroundIntervalSteps: 12,
+  maxToolRecoveryAttempts: 4,
+  maxModelRecoveryAttempts: 4,
   interactive: false,
 };
 
@@ -160,6 +176,7 @@ export class AgentKernel {
   readonly #taskAddendum: string | undefined;
   readonly #userChannel: UserChannelPort | undefined;
   readonly #plan: PlanStatusPort | undefined;
+  readonly #recoveryConfiguration: RecoveryConfiguration;
   readonly #options: RunOptions;
   #sequence = 0;
 
@@ -173,6 +190,7 @@ export class AgentKernel {
     this.#taskAddendum = dependencies.taskAddendum;
     this.#userChannel = dependencies.userChannel;
     this.#plan = dependencies.plan;
+    this.#recoveryConfiguration = dependencies.recovery ?? {};
     this.#hasPlanTool = dependencies.tools.some((tool) => tool.name === PLAN_TOOL_NAME) && dependencies.plan !== undefined;
     this.#hasReviewTool = dependencies.tools.some((tool) => tool.definition.effect === "review");
     this.#options = { ...DEFAULT_OPTIONS, ...dependencies.options };
@@ -186,7 +204,11 @@ export class AgentKernel {
       || !Number.isSafeInteger(this.#options.maxConversationTurnSteps)
       || !Number.isSafeInteger(this.#options.maxConsecutiveNarrations)
       || !Number.isSafeInteger(this.#options.regroundIntervalSteps)
+      || !Number.isSafeInteger(this.#options.maxToolRecoveryAttempts)
+      || !Number.isSafeInteger(this.#options.maxModelRecoveryAttempts)
       || this.#options.regroundIntervalSteps < 1
+      || this.#options.maxToolRecoveryAttempts < 1
+      || this.#options.maxModelRecoveryAttempts < 1
       || this.#options.maxSteps < 1
       || this.#options.maxRepeatedAction < 1
       || this.#options.maxFailedVerificationAttempts < 1
@@ -239,6 +261,11 @@ export class AgentKernel {
     let stepsSinceReground = restored.stepsSinceReground;
     let completedMutations = restored.completedMutations;
     this.#sequence = restored.sequence;
+    const recovery = new RecoveryController(
+      priorEvents,
+      (type, data) => this.#record(type, data),
+      this.#recoveryConfiguration,
+    );
 
     if (restored.completed) throw new Error("Cannot resume a completed Vanguard run.");
 
@@ -253,11 +280,27 @@ export class AgentKernel {
         throw new Error("Resume task does not match the journaled task.");
       }
       for (const interrupted of restored.interruptedCalls) {
+        const interruptedMessage = `Tool '${interrupted.name}' was interrupted before its result was journaled. Inspect workspace state before retrying.`;
+        const interruptedEffect = this.#tools.get(interrupted.name)?.definition.effect;
+        const failure = classifyFailure(interruptedMessage, {
+          source: interruptedEffect === "execute" ? "process" : "tool",
+        });
+        const recoveryDecision = await recovery.handle({
+          operation: `tool.${interrupted.name}`,
+          attempt: 1,
+          maxAttempts: 1,
+          // Never replay an orphan automatically: a crash may have happened
+          // after an externally visible side effect but before journaling it.
+          idempotent: false,
+          failure,
+        }, signal);
         const observation: ToolObservation = {
           callId: interrupted.id,
           tool: interrupted.name,
           ok: false,
-          error: `Tool '${interrupted.name}' was interrupted before its result was journaled. Inspect workspace state before retrying.`,
+          error: interruptedMessage,
+          failure,
+          recovery: recoveryDecision.feedback,
         };
         transcript.push({ role: "observation", content: observation as unknown as JsonValue });
         await this.#record("tool.failed", observation as unknown as JsonValue);
@@ -311,9 +354,9 @@ export class AgentKernel {
         return this.#fail("Conversation step budget exhausted before the model yielded to the user.", step - 1);
       }
 
-      let decision: ModelDecision;
+      let selectedTranscript: readonly TranscriptEntry[];
       try {
-        const selectedTranscript = this.#contextPolicy.select(task, transcript, this.#options.maxContextBytes);
+        selectedTranscript = this.#contextPolicy.select(task, transcript, this.#options.maxContextBytes);
         const fullContextBytes = Buffer.byteLength(JSON.stringify(transcript));
         const selectedContextBytes = Buffer.byteLength(JSON.stringify(selectedTranscript));
         if (selectedContextBytes < fullContextBytes) {
@@ -324,18 +367,57 @@ export class AgentKernel {
             selectedBytes: selectedContextBytes,
           });
         }
-        decision = await this.#model.decide({
-          task,
-          mode,
-          transcript: selectedTranscript,
-          tools: this.#offeredTools(mode),
-          remainingSteps: this.#options.maxSteps - step + 1,
-          signal,
-          workingState: mode === "execution" ? this.#workingState?.snapshot() ?? null : null,
-        });
       } catch (error) {
-        if (signal.aborted) return this.#fail("Run aborted by its time or cancellation budget.", step - 1);
-        return this.#fail(`Model failure: ${errorMessage(error)}`, step - 1);
+        const failure = classifyFailure(error, { source: "context" });
+        await recovery.handle({
+          operation: "context.select",
+          attempt: 1,
+          maxAttempts: 1,
+          idempotent: false,
+          failure,
+        }, signal);
+        return this.#fail(`Context failure [${failure.code}]: ${failure.message}`, step - 1);
+      }
+
+      let decision: ModelDecision | undefined;
+      let terminalModelError: unknown;
+      for (let attempt = 1; attempt <= this.#options.maxModelRecoveryAttempts; attempt += 1) {
+        try {
+          decision = await this.#model.decide({
+            task,
+            mode,
+            transcript: selectedTranscript,
+            tools: this.#offeredTools(mode),
+            remainingSteps: this.#options.maxSteps - step + 1,
+            signal,
+            workingState: mode === "execution" ? this.#workingState?.snapshot() ?? null : null,
+            recovery,
+          });
+          break;
+        } catch (error) {
+          if (signal.aborted) return this.#fail("Run aborted by its time or cancellation budget.", step - 1);
+          terminalModelError = error;
+          if (wasRecoveryHandled(error)) break;
+          const failure = classifyFailure(error, { source: "provider" });
+          let recoveryDecision;
+          try {
+            recoveryDecision = await recovery.handle({
+              operation: "provider.decision",
+              attempt,
+              maxAttempts: this.#options.maxModelRecoveryAttempts,
+              idempotent: true,
+              failure,
+            }, signal);
+          } catch (recoveryError) {
+            if (signal.aborted) return this.#fail("Run aborted by its time or cancellation budget.", step - 1);
+            terminalModelError = recoveryError;
+            break;
+          }
+          if (!recoveryDecision.retry) break;
+        }
+      }
+      if (decision === undefined) {
+        return this.#fail(`Model failure: ${errorMessage(terminalModelError)}`, step - 1);
       }
 
       if (mode === "conversation" && decision.kind === "complete") {
@@ -360,12 +442,13 @@ export class AgentKernel {
 
       if (decision.kind === "ask_user") {
         if (!this.#options.interactive) {
-          const observation: ToolObservation = {
-            callId: "ask-user",
-            tool: CONTROL_TOOL_NAMES.ask,
-            ok: false,
-            error: "No user is available in this run. Proceed with the most reasonable engineering judgment and record the assumption.",
-          };
+          const observation = await this.#terminalObservation(
+            { id: "ask-user", name: CONTROL_TOOL_NAMES.ask, input: { question: decision.question } },
+            "No user is available in this run. Proceed with the most reasonable engineering judgment and record the assumption.",
+            "environment",
+            recovery,
+            signal,
+          );
           transcript.push({ role: "observation", content: observation as unknown as JsonValue });
           await this.#record("tool.failed", observation as unknown as JsonValue);
           const count = (actionFailures.get("ask_user") ?? 0) + 1;
@@ -392,12 +475,13 @@ export class AgentKernel {
 
       if (decision.kind === "execute") {
         if (mode === "execution") {
-          const observation: ToolObservation = {
-            callId: "task-execute",
-            tool: CONTROL_TOOL_NAMES.execute,
-            ok: false,
-            error: "Execution is already contracted. Continue the current task.",
-          };
+          const observation = await this.#terminalObservation(
+            { id: "task-execute", name: CONTROL_TOOL_NAMES.execute, input: decision.contract as unknown as JsonValue },
+            "Execution is already contracted. Continue the current task.",
+            "policy",
+            recovery,
+            signal,
+          );
           transcript.push({ role: "observation", content: observation as unknown as JsonValue });
           await this.#record("tool.failed", observation as unknown as JsonValue);
           continue;
@@ -423,10 +507,19 @@ export class AgentKernel {
             unprovenMilestones.length === 0 ? undefined
               : `These plan milestones remain unproven: ${unprovenMilestones.join("; ")}. Prove each with evidence references via plan.update, or invalidate it with a reason, before completing.`,
           ].filter((item) => item !== undefined);
+          const policyMessage = parts.join(" ");
+          const failure = classifyFailure(policyMessage, { source: "policy" });
+          await recovery.handle({
+            operation: "completion.evidence_policy",
+            attempt: 1,
+            maxAttempts: 1,
+            idempotent: false,
+            failure,
+          }, signal);
           const evidence: VerificationResult = {
             verifier: "completion evidence policy",
             passed: false,
-            evidence: parts.join(" "),
+            evidence: policyMessage,
           };
           await this.#record("verification.completed", evidence as unknown as JsonValue);
           transcript.push({ role: "verification", content: evidence as unknown as JsonValue });
@@ -439,9 +532,10 @@ export class AgentKernel {
           }
           continue;
         }
-        const verification = await Promise.all(
-          this.#verifiers.map((verifier) => verifier.verify(decision.answer, task)),
-        );
+        const verification: VerificationResult[] = [];
+        for (const verifier of this.#verifiers) {
+          verification.push(await this.#verifyOnce(verifier, decision.answer, task, recovery, signal));
+        }
         for (const result of verification) {
           await this.#record("verification.completed", result as unknown as JsonValue);
           transcript.push({ role: "verification", content: result as unknown as JsonValue });
@@ -470,9 +564,13 @@ export class AgentKernel {
           ? "The tools decision reused a call id; every call in a batch needs a unique id."
           : undefined;
       if (malformedBatch !== undefined) {
-        const observation: ToolObservation = {
-          callId: "malformed-batch", tool: "tools", ok: false, error: malformedBatch,
-        };
+        const observation = await this.#terminalObservation(
+          { id: "malformed-batch", name: "tools", input: decision as unknown as JsonValue },
+          malformedBatch,
+          "tool",
+          recovery,
+          signal,
+        );
         transcript.push({ role: "observation", content: observation as unknown as JsonValue });
         await this.#record("tool.failed", observation as unknown as JsonValue);
         const count = (actionFailures.get("malformed-batch") ?? 0) + 1;
@@ -484,6 +582,7 @@ export class AgentKernel {
       }
       const batchOutcome = await this.#executeBatch(decision.calls, {
         task, step, signal, transcript, actionFailures,
+        recovery,
         mode,
         completedMutations: () => completedMutations,
         onMutate: () => {
@@ -534,6 +633,7 @@ export class AgentKernel {
       signal: AbortSignal;
       transcript: TranscriptEntry[];
       actionFailures: Map<string, number>;
+      recovery: RecoveryPort;
       mode: KernelMode;
       completedMutations: () => number;
       onMutate: () => void;
@@ -543,16 +643,37 @@ export class AgentKernel {
   ): Promise<string | undefined> {
     const allObserve = calls.every((call) => this.#tools.get(call.name)?.definition.effect === "observe");
     const mutationCalls = calls.filter((call) => this.#tools.get(call.name)?.definition.effect === "mutate");
+    const circuitBlockedCallIds = new Set<string>();
     const runCall = async (call: ToolCall): Promise<ToolObservation> => {
+      const fingerprint = stableFingerprint(call.name, call.input);
+      if ((context.actionFailures.get(fingerprint) ?? 0) >= this.#options.maxRepeatedAction) {
+        circuitBlockedCallIds.add(call.id);
+        return this.#terminalObservation(
+          call,
+          `Circuit breaker blocked an identical replay of '${call.name}'. Follow the prior replan/checkpoint guidance and change the action instead.`,
+          "policy",
+          context.recovery,
+          context.signal,
+        );
+      }
       const tool = this.#tools.get(call.name);
       if (tool === undefined) {
-        return { callId: call.id, tool: call.name, ok: false, error: `Unknown tool: ${call.name}` };
+        return this.#terminalObservation(
+          call,
+          `Unknown tool: ${call.name}`,
+          "tool",
+          context.recovery,
+          context.signal,
+        );
       }
       if (context.mode === "conversation" && tool.definition.effect !== "observe") {
-        return {
-          callId: call.id, tool: call.name, ok: false,
-          error: `Tool '${call.name}' is not available before a task contract exists. Use task.execute to begin contracted work.`,
-        };
+        return this.#terminalObservation(
+          call,
+          `Tool '${call.name}' is not available before a task contract exists. Use task.execute to begin contracted work.`,
+          "policy",
+          context.recovery,
+          context.signal,
+        );
       }
       // The only plan-free mutation is one genuinely narrow exact-text
       // replacement. Creates, deletes, overwrites, large replacements, any
@@ -560,17 +681,71 @@ export class AgentKernel {
       if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
         && this.#plan!.isEmpty()
         && (context.completedMutations() > 0 || mutationCalls.length !== 1 || !isNarrowPlanFreeMutation(call))) {
+        return this.#terminalObservation(
+          call,
+          "This mutation is not one narrow exact-text replacement. Materialize a non-empty engineering plan with plan.update before changing the workspace.",
+          "policy",
+          context.recovery,
+          context.signal,
+        );
+      }
+
+      const source = tool.definition.effect === "execute" ? "process" : "tool";
+      const idempotent = tool.definition.effect === "observe";
+      for (let attempt = 1; attempt <= this.#options.maxToolRecoveryAttempts; attempt += 1) {
+        let output: JsonValue | undefined;
+        let error: unknown;
+        try {
+          const result = await tool.execute(call.input, {
+            task: context.task,
+            step: context.step,
+            signal: context.signal,
+          });
+          if (result.ok) return { callId: call.id, tool: call.name, ok: true, output: result.output };
+          output = result.output;
+          error = result;
+        } catch (caught) {
+          error = caught;
+        }
+        const failure = classifyFailure(error, { source });
+        let decision;
+        try {
+          decision = await context.recovery.handle({
+            operation: `tool.${call.name}`,
+            attempt,
+            maxAttempts: this.#options.maxToolRecoveryAttempts,
+            idempotent,
+            failure,
+          }, context.signal);
+        } catch (recoveryError) {
+          const cancelled = classifyFailure(recoveryError, { source, aborted: context.signal.aborted });
+          decision = await context.recovery.handle({
+            operation: `tool.${call.name}.backoff`,
+            attempt: 1,
+            maxAttempts: 1,
+            idempotent: false,
+            failure: cancelled,
+          }, context.signal);
+          return {
+            callId: call.id,
+            tool: call.name,
+            ok: false,
+            error: cancelled.message,
+            failure: cancelled,
+            recovery: decision.feedback,
+          };
+        }
+        if (decision.retry) continue;
         return {
-          callId: call.id, tool: call.name, ok: false,
-          error: "This mutation is not one narrow exact-text replacement. Materialize a non-empty engineering plan with plan.update before changing the workspace.",
+          callId: call.id,
+          tool: call.name,
+          ok: false,
+          ...(output === undefined ? { error: failure.message } : { output }),
+          failure,
+          recovery: decision.feedback,
         };
       }
-      try {
-        const result = await tool.execute(call.input, { task: context.task, step: context.step, signal: context.signal });
-        return { callId: call.id, tool: call.name, ok: result.ok, output: result.output };
-      } catch (error) {
-        return { callId: call.id, tool: call.name, ok: false, error: errorMessage(error) };
-      }
+      throw new Error("Unreachable tool recovery loop.");
     };
 
     const observations: ToolObservation[] = allObserve && calls.length > 1
@@ -581,10 +756,9 @@ export class AgentKernel {
     }
 
     let failureReason: string | undefined;
-    for (const [index, observation] of observations.entries()) {
+    for (const [index, originalObservation] of observations.entries()) {
       const call = calls[index]!;
-      context.transcript.push({ role: "observation", content: observation as unknown as JsonValue });
-      await this.#record(observation.ok ? "tool.completed" : "tool.failed", observation as unknown as JsonValue);
+      let observation = originalObservation;
       const fingerprint = stableFingerprint(call.name, call.input);
       if (observation.ok) {
         context.actionFailures.delete(fingerprint);
@@ -596,16 +770,118 @@ export class AgentKernel {
         if (effect === "execute") context.onExecute();
         if (effect === "review") context.onReview();
       } else {
-        const count = (context.actionFailures.get(fingerprint) ?? 0) + 1;
+        const priorCount = context.actionFailures.get(fingerprint) ?? 0;
+        const count = priorCount + 1;
         context.actionFailures.set(fingerprint, count);
-        if (count >= this.#options.maxRepeatedAction && failureReason === undefined) {
-          failureReason = this.#tools.has(call.name)
-            ? `Circuit breaker opened for ${call.name}.`
-            : `Repeated invalid tool action: ${call.name}`;
+        if (circuitBlockedCallIds.has(call.id)) {
+          if (failureReason === undefined) failureReason = `Circuit breaker blocked identical replay for ${call.name}.`;
+        } else if (count >= this.#options.maxRepeatedAction && failureReason === undefined) {
+          const failure = observation.failure ?? classifyFailure(observation, {
+            source: this.#tools.get(call.name)?.definition.effect === "execute" ? "process" : "tool",
+          });
+          if (failure.disposition === "transient" || failure.disposition === "cancelled") {
+            failureReason = this.#tools.has(call.name)
+              ? `Recovery and repeated-action budgets exhausted for ${call.name}.`
+              : `Repeated invalid tool action: ${call.name}`;
+          } else {
+            const feedback = replanFeedback(
+              failure,
+              observation.recovery?.remainingGlobalRetries ?? 0,
+              observation.recovery?.remainingClassRetries ?? 0,
+            );
+            observation = { ...observation, failure, recovery: feedback };
+            await this.#record("recovery.replan_required", {
+              operation: `tool.${call.name}`,
+              fingerprint,
+              failures: count,
+              failure: failure as unknown as JsonValue,
+              feedback: feedback as unknown as JsonValue,
+            });
+            // Give the model one decision boundary to act on the structured
+            // guidance. A third identical call is blocked above without
+            // dispatching the tool and then terminates the run.
+          }
         }
       }
+      context.transcript.push({ role: "observation", content: observation as unknown as JsonValue });
+      await this.#record(observation.ok ? "tool.completed" : "tool.failed", observation as unknown as JsonValue);
     }
     return failureReason;
+  }
+
+  async #terminalObservation(
+    call: ToolCall,
+    message: string,
+    source: FailureSource,
+    recovery: RecoveryPort,
+    signal: AbortSignal,
+  ): Promise<ToolObservation> {
+    const failure = classifyFailure(message, { source });
+    const decision = await recovery.handle({
+      operation: `tool.${call.name}`,
+      attempt: 1,
+      maxAttempts: 1,
+      idempotent: false,
+      failure,
+    }, signal);
+    return {
+      callId: call.id,
+      tool: call.name,
+      ok: false,
+      error: message,
+      failure,
+      recovery: decision.feedback,
+    };
+  }
+
+  async #verifyOnce(
+    verifier: VerifierPort,
+    candidate: string,
+    task: string,
+    recovery: RecoveryPort,
+    signal: AbortSignal,
+  ): Promise<VerificationResult> {
+    try {
+      const result = await verifier.verify(candidate, task);
+      if (result.passed) return result;
+      const failure = classifyFailure({
+        message: `Verification failed: ${verifier.name} returned failure.`,
+        evidence: result.evidence,
+      }, { source: "verifier" });
+      const decision = await recovery.handle({
+        operation: `verifier.${verifier.name}`,
+        attempt: 1,
+        maxAttempts: 1,
+        idempotent: false,
+        failure,
+      }, signal);
+      return {
+        ...result,
+        evidence: {
+          evidence: result.evidence,
+          failure: failure as unknown as JsonValue,
+          recovery: decision.feedback as unknown as JsonValue,
+        },
+      };
+    } catch (error) {
+      const failure = classifyFailure(error, { source: "verifier" });
+      const decision = await recovery.handle({
+        operation: `verifier.${verifier.name}`,
+        attempt: 1,
+        maxAttempts: 1,
+        idempotent: false,
+        failure,
+      }, signal);
+      return {
+        verifier: verifier.name,
+        passed: false,
+        evidence: {
+          error: failure.message,
+          failure: failure as unknown as JsonValue,
+          recovery: decision.feedback as unknown as JsonValue,
+        },
+      };
+    }
   }
 
   async #record(type: RunEventType, data: JsonValue): Promise<void> {
@@ -834,4 +1110,9 @@ function recordValue(value: JsonValue): Record<string, JsonValue> | undefined {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function wasRecoveryHandled(error: unknown): boolean {
+  return error !== null && typeof error === "object"
+    && "recoveryHandled" in error && (error as { recoveryHandled?: unknown }).recoveryHandled === true;
 }

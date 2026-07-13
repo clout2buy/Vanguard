@@ -48,6 +48,27 @@ test("public event stream exposes chat and tool flow without private reasoning",
   assert.doesNotMatch(JSON.stringify(processResult), /SECRET_FROM/);
 });
 
+test("public event stream reports recovery without exposing provider payloads", () => {
+  const presenter = new PublicRunEventPresenter();
+  const delayed = presenter.present({
+    sequence: 1,
+    type: "recovery.delayed",
+    data: { failureCode: "provider_rate_limited", delayMs: 2_000, privateResponse: "SECRET" },
+  });
+  assert.equal(delayed[0]?.type, "recovery.scheduled");
+  assert.match(delayed[0]?.detail ?? "", /provider_rate_limited.*2000 ms/);
+  assert.doesNotMatch(JSON.stringify(delayed), /SECRET/);
+
+  const exhausted = presenter.present({
+    sequence: 2,
+    type: "recovery.exhausted",
+    data: { reason: "class_retry_budget_exhausted", privateResponse: "SECRET" },
+  });
+  assert.equal(exhausted[0]?.type, "recovery.exhausted");
+  assert.equal(exhausted[0]?.detail, "class_retry_budget_exhausted");
+  assert.doesNotMatch(JSON.stringify(exhausted), /SECRET/);
+});
+
 test("public event stream presents verifier and compaction state", () => {
   const presenter = new PublicRunEventPresenter();
   const verification = presenter.present({

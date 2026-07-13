@@ -166,6 +166,8 @@ export interface ModelRequest {
   readonly remainingSteps: number;
   readonly signal: AbortSignal;
   readonly workingState: JsonValue;
+  /** Provider adapters use this instead of maintaining hidden retry state. */
+  readonly recovery?: RecoveryPort;
 }
 
 export interface ModelPort {
@@ -194,6 +196,10 @@ export interface ToolObservation {
   readonly ok: boolean;
   readonly output?: JsonValue;
   readonly error?: string;
+  /** Stable machine-readable diagnosis supplied by the recovery runtime. */
+  readonly failure?: FailureDescriptor;
+  /** Actionable next step; unlike the raw error, this is safe to plan from. */
+  readonly recovery?: RecoveryFeedback;
 }
 
 export interface ToolDefinition {
@@ -201,6 +207,76 @@ export interface ToolDefinition {
   readonly description: string;
   readonly inputSchema: JsonValue;
   readonly effect?: "observe" | "mutate" | "execute" | "review" | "state";
+}
+
+export type FailureSource = "provider" | "tool" | "process" | "verifier" | "policy" | "context" | "environment";
+export type FailureDisposition = "transient" | "deterministic" | "policy" | "environment" | "cancelled";
+
+/** Versioned failure taxonomy shared by adapters, journals, and scorecards. */
+export interface FailureDescriptor {
+  readonly version: 1;
+  readonly code:
+    | "provider_timeout"
+    | "provider_rate_limited"
+    | "provider_conflict"
+    | "provider_unavailable"
+    | "provider_disconnect"
+    | "provider_authentication"
+    | "provider_request_invalid"
+    | "tool_transient"
+    | "tool_failed"
+    | "process_exit"
+    | "process_timeout"
+    | "verifier_failed"
+    | "verifier_exception"
+    | "policy_denied"
+    | "context_budget"
+    | "context_invalid"
+    | "environment_missing_dependency"
+    | "environment_io"
+    | "cancelled"
+    | "unknown_failure";
+  readonly source: FailureSource;
+  readonly disposition: FailureDisposition;
+  readonly retryable: boolean;
+  readonly message: string;
+  readonly status?: number;
+  readonly retryAfterMs?: number;
+}
+
+export interface RecoveryFeedback {
+  readonly action:
+    | "retry_scheduled"
+    | "change_approach"
+    | "repair_environment"
+    | "respect_policy"
+    | "replan_and_checkpoint"
+    | "stop_cancelled";
+  readonly guidance: string;
+  readonly retryDelayMs?: number;
+  readonly remainingGlobalRetries: number;
+  readonly remainingClassRetries: number;
+}
+
+export interface RecoveryRequest {
+  readonly operation: string;
+  readonly attempt: number;
+  readonly maxAttempts: number;
+  readonly idempotent: boolean;
+  readonly failure: FailureDescriptor;
+}
+
+export interface RecoveryDecision {
+  readonly retry: boolean;
+  readonly reason: string;
+  readonly failure: FailureDescriptor;
+  readonly feedback: RecoveryFeedback;
+  readonly delayMs?: number;
+}
+
+/** Runtime-owned recovery port; implementations journal budgets and delays. */
+export interface RecoveryPort {
+  handle(request: RecoveryRequest, signal: AbortSignal): Promise<RecoveryDecision>;
 }
 
 export interface ToolPort {
@@ -255,6 +331,10 @@ export type RunEventType =
   | "tool.completed"
   | "tool.failed"
   | "verification.completed"
+  | "recovery.decided"
+  | "recovery.delayed"
+  | "recovery.exhausted"
+  | "recovery.replan_required"
   | "run.completed"
   | "run.failed"
   | "change.reviewed"

@@ -1,5 +1,6 @@
 import type { JsonValue, ModelDecision, ModelPort, ModelRequest } from "../kernel/contracts.js";
 import { normalizeDecision } from "../kernel/contracts.js";
+import { classifyFailure } from "../kernel/recovery.js";
 
 export interface SerializableModelRequest {
   readonly task: string;
@@ -93,8 +94,6 @@ export class HttpModelAdapter implements ModelPort {
   }
 
   async decide(request: ModelRequest): Promise<ModelDecision> {
-    const headers = await this.options.headerProvider?.headers() ?? {};
-    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(this.#timeoutMs)]);
     const serializable: SerializableModelRequest = {
       task: request.task,
       mode: request.mode,
@@ -123,22 +122,19 @@ export class HttpModelAdapter implements ModelPort {
     };
 
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
+      const timeoutSignal = AbortSignal.timeout(this.#timeoutMs);
+      const attemptSignal = AbortSignal.any([request.signal, timeoutSignal]);
       try {
+        const headers = await this.options.headerProvider?.headers() ?? {};
         const response = await this.#fetch(this.options.endpoint, {
           method: "POST",
           headers: { "content-type": "application/json", ...headers },
           body,
-          signal,
+          signal: attemptSignal,
         });
         if (!response.ok) {
           const detail = (await response.text()).slice(0, 2_000);
           const error = new HttpInferenceError(response.status, detail, retryAfter(response.headers));
-          if (!error.retryable) throw error;
-          lastError = error;
-          if (attempt < this.#maxAttempts) {
-            await delay(error.retryAfterMs ?? this.#retryBaseMs * 2 ** (attempt - 1), signal);
-            continue;
-          }
           throw error;
         }
         if (streaming && isEventStream(response)) {
@@ -151,7 +147,7 @@ export class HttpModelAdapter implements ModelPort {
             visibleText = true;
             observer?.delta(text);
           });
-          await consumeServerSentEvents(response, accumulator, signal);
+          await consumeServerSentEvents(response, accumulator, attemptSignal);
           const canonical = accumulator.finish();
           const decision = this.#codec.decode(canonical);
           reportUsage(canonical, observer);
@@ -166,15 +162,56 @@ export class HttpModelAdapter implements ModelPort {
         observer?.committed?.();
         return decision;
       } catch (error) {
-        if (signal.aborted || error instanceof HttpInferenceError && !error.retryable) throw fail(error);
+        if (request.signal.aborted) throw fail(markRecoveryHandled(error));
         lastError = error;
-        if (attempt < this.#maxAttempts) {
-          await delay(this.#retryBaseMs * 2 ** (attempt - 1), signal);
-          continue;
+        const failure = classifyFailure(error, {
+          source: "provider",
+          ...(error instanceof HttpInferenceError ? {
+            status: error.status,
+            ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+          } : {}),
+          timedOut: timeoutSignal.aborted,
+        });
+
+        let retry = false;
+        if (request.recovery !== undefined) {
+          // All streamed text is provisional. Discard it before a recovery
+          // decision can wait, retry, or report an exhausted budget.
+          if (visibleText) {
+            observer?.reset?.();
+            visibleText = false;
+          }
+          try {
+            retry = (await request.recovery.handle({
+              operation: "provider.http_request",
+              attempt,
+              maxAttempts: this.#maxAttempts,
+              idempotent: true,
+              failure,
+            }, request.signal)).retry;
+          } catch (recoveryError) {
+            throw fail(markRecoveryHandled(recoveryError));
+          }
+        } else if (failure.disposition === "transient" && failure.retryable && attempt < this.#maxAttempts) {
+          if (visibleText) {
+            observer?.reset?.();
+            visibleText = false;
+          }
+          try {
+            await delay(
+              failure.retryAfterMs ?? this.#retryBaseMs * 2 ** (attempt - 1),
+              request.signal,
+            );
+          } catch (delayError) {
+            throw fail(delayError);
+          }
+          retry = true;
         }
+        if (retry) continue;
+        throw fail(request.recovery === undefined ? error : markRecoveryHandled(error));
       }
     }
-    throw fail(lastError);
+    throw fail(request.recovery === undefined ? lastError : markRecoveryHandled(lastError));
   }
 
   #observer(): StreamObserver | undefined {
@@ -277,16 +314,27 @@ async function consumeServerSentEvents(
 }
 
 class HttpInferenceError extends Error {
-  readonly retryable: boolean;
-
   constructor(
     readonly status: number,
     detail: string,
     readonly retryAfterMs: number | undefined,
   ) {
     super(`Inference endpoint returned HTTP ${status}: ${detail}`);
-    this.retryable = status === 429 || status >= 500;
   }
+}
+
+class RecoveryHandledError extends Error {
+  readonly recoveryHandled = true;
+
+  constructor(error: unknown) {
+    const cause = error instanceof Error ? error : new Error(String(error));
+    super(cause.message, { cause });
+    this.name = cause.name;
+  }
+}
+
+function markRecoveryHandled(error: unknown): Error {
+  return error instanceof RecoveryHandledError ? error : new RecoveryHandledError(error);
 }
 
 function retryAfter(headers: Headers): number | undefined {

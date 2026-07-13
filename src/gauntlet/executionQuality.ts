@@ -15,9 +15,17 @@ export interface ExecutionQuality {
   };
 }
 
+type QualityTrajectory = Pick<TrajectoryMetrics,
+  | "toolCallsByName"
+  | "toolFrictionFailures"
+  | "verificationFailures"
+  | "completionClaims"
+  | "localTestFailures"
+> & Partial<TrajectoryMetrics>;
+
 export function scoreExecutionQuality(
   verified: boolean,
-  trajectory: TrajectoryMetrics,
+  trajectory: QualityTrajectory,
   patch: PatchMetrics,
 ): ExecutionQuality {
   const writes = (trajectory.toolCallsByName["workspace.write"] ?? 0)
