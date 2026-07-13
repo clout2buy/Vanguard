@@ -73,6 +73,25 @@ export { PluginLifecycleError };
   },
 ] as const;
 
+test("plugin-lifecycle grader rejects prototype-unsafe status objects", async () => {
+  const reference = references[0];
+  const caseRoot = path.resolve("gauntlet", "cases", reference.id);
+  const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-plugin-prototype-mutant-"));
+  const workspace = path.join(container, "workspace");
+  try {
+    await cp(path.join(caseRoot, "workspace"), workspace, { recursive: true });
+    const mutant = reference.source.replace(
+      'status() { return Object.fromEntries([...this.#plugins.keys()].map((name) => [name, this.#started.has(name) ? "started" : "registered"])); }',
+      'status() { const result = {}; for (const name of this.#plugins.keys()) result[name] = this.#started.has(name) ? "started" : "registered"; return result; }',
+    );
+    assert.notEqual(mutant, reference.source);
+    await writeFile(path.join(workspace, reference.file), mutant);
+    await assert.rejects(() => executeFile(process.execPath, [path.join(caseRoot, "grader.mjs"), workspace]));
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
 for (const reference of references) {
   test(`v2 ${reference.id} grader rejects starter and accepts reference behavior`, async () => {
     const caseRoot = path.resolve("gauntlet", "cases", reference.id);

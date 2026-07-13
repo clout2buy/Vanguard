@@ -54,6 +54,8 @@ Provider transport, authentication, and protocol/adapter failures are classified
 
 Schema v5 adds pre-mutation scope enforcement and distinguishes productive local test failures from malformed test-harness failures. Case graders accept semantically useful error wording rather than requiring one arbitrary phrase.
 
+Schema v6 requires `workspace.changes` review after the final mutation and exposes large patch expansion before completion. Plugin-lifecycle v3 adds prototype-safe status-key behavior.
+
 ## Execution-quality score
 
 Correctness remains binary and exclusively grader-owned. For verified runs, execution quality begins at `1.0` and applies bounded, visible penalties for tool-friction failures (`0.08` each), failed verifier claims (`0.12` each), and repeated completion claims (`0.04` each after the first). A non-zero local test exit is recorded as a productive test failure rather than penalized: discovering a defect before completion is healthy engineering. Large patch expansion and high edit churn are emitted as review flags instead of being blended into correctness. This score measures trajectory hygiene, not code style, and a failed behavioral grader always yields zero.

@@ -38,7 +38,9 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
             }
           : decisions === 2
             ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
-            : { kind: "complete", answer: "Fixed and tested." };
+            : decisions === 3
+              ? { kind: "tool", call: { id: "review", name: "workspace.changes", input: {} } }
+              : { kind: "complete", answer: "Fixed and tested." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
     });

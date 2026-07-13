@@ -57,6 +57,7 @@ export class AgentKernel {
   readonly #journal: JournalPort;
   readonly #contextPolicy: ContextPolicyPort;
   readonly #workingState: WorkingStatePort | undefined;
+  readonly #hasReviewTool: boolean;
   readonly #options: RunOptions;
   #sequence = 0;
 
@@ -67,6 +68,7 @@ export class AgentKernel {
     this.#journal = dependencies.journal;
     this.#contextPolicy = dependencies.contextPolicy ?? new EvidenceContextPolicy();
     this.#workingState = dependencies.workingState;
+    this.#hasReviewTool = dependencies.tools.some((tool) => tool.definition.effect === "review");
     this.#options = { ...DEFAULT_OPTIONS, ...dependencies.options };
 
     if (
@@ -88,6 +90,7 @@ export class AgentKernel {
     const actionFailures = new Map<string, number>();
     let failedVerificationAttempts = 0;
     let mutationNeedsExecutionEvidence = false;
+    let mutationNeedsReview = false;
     await this.#record("run.started", { task });
 
     for (let step = 1; step <= this.#options.maxSteps; step += 1) {
@@ -114,11 +117,15 @@ export class AgentKernel {
       transcript.push({ role: "decision", content: decision as unknown as JsonValue });
 
       if (decision.kind === "complete") {
-        if (mutationNeedsExecutionEvidence) {
+        if (mutationNeedsExecutionEvidence || mutationNeedsReview) {
+          const missing = [
+            mutationNeedsExecutionEvidence ? "a successful executable check" : undefined,
+            mutationNeedsReview ? "workspace.changes review" : undefined,
+          ].filter((item) => item !== undefined).join(" and ");
           const evidence: VerificationResult = {
             verifier: "completion evidence policy",
             passed: false,
-            evidence: "Run a successful executable check after the latest workspace mutation before completing.",
+            evidence: `Complete ${missing} after the latest workspace mutation before completing.`,
           };
           await this.#record("verification.completed", evidence as unknown as JsonValue);
           transcript.push({ role: "verification", content: evidence as unknown as JsonValue });
@@ -181,8 +188,12 @@ export class AgentKernel {
           }
         } else {
           actionFailures.delete(fingerprint);
-          if (tool.definition.effect === "mutate") mutationNeedsExecutionEvidence = true;
+          if (tool.definition.effect === "mutate") {
+            mutationNeedsExecutionEvidence = true;
+            mutationNeedsReview = this.#hasReviewTool;
+          }
           if (tool.definition.effect === "execute") mutationNeedsExecutionEvidence = false;
+          if (tool.definition.effect === "review") mutationNeedsReview = false;
         }
       } catch (error) {
         const count = (actionFailures.get(fingerprint) ?? 0) + 1;

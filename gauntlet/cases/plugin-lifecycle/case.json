@@ -1,6 +1,6 @@
 {
   "id": "plugin-lifecycle",
-  "version": 2,
+  "version": 3,
   "track": "multi-file",
   "workspace": "workspace",
   "task": "TASK.md",

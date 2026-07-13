@@ -18,6 +18,7 @@ Prefer narrow, maintainable changes. Run the strongest relevant tests after edit
 Tests must fail the process when an assertion fails. For Node inline checks, use node:assert/strict; never use console.assert, which can print a failure while exiting successfully.
 Prefer one cohesive adversarial test harness plus targeted reruns over many tiny process calls. Consolidate related cases so evidence is faster and easier to review.
 Before completion, adversarially review the patch for malformed inputs, inherited properties, numeric boundaries, mutation, concurrency, cleanup, and compatibility as relevant to the task. Avoid speculative rewrites and unnecessary code growth.
+After final execution evidence, call workspace.changes. Treat large expansion as a reason to re-read changed files and simplify duplication before completing.
 For multi-stage or multi-file work, use run.checkpoint after reconnaissance and major verified phases so working state survives compaction.
 Do not claim completion until the requested behavior has been implemented and verified. If verification feedback reports failure, diagnose and repair it.`;
 

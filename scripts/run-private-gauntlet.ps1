@@ -157,7 +157,7 @@ try {
   $InfrastructureErrors = $Total - $Evaluated
   $Passed = @($EvaluatedResults | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 5
+    version = 6
     provider = $Provider
     model = $Model
     passed = $Passed

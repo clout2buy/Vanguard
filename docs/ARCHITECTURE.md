@@ -40,6 +40,7 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - SDK-free native HTTP inference with bounded transient retry
 - Workspace-confined file operations with version-bound guarded edits
 - Pre-mutation editable-root/protected-path enforcement and hash-guarded deletion
+- Mandatory post-test change-scope/growth review after the latest mutation
 - Editable-root filesystem permissions for restricted Node subprocesses
 - Allowlisted no-shell process execution and command-based verification
 - Persistent hash-chained run journals

@@ -38,6 +38,14 @@ Live results are retained with an audit status. A passing verifier is necessary 
 - Core correction: mutation scope is now enforced before writes/replacements/deletions, restricted Node subprocess write permissions are limited to editable roots, protected paths are rejected at mutation time, and `workspace.delete` provides hash-guarded recovery.
 - Efficiency audit: the run issued 37 process calls and four malformed inline harnesses. Schema v5 separates harness failures from productive code-test failures and flags high test fragmentation; provider guidance now asks for consolidated adversarial harnesses.
 
+## 2026-07-12 — plugin-lifecycle v2 live pass
+
+- Valid pass: 36 steps, 263.4 seconds, one completion claim, zero verifier failures, and both sealed behavior and workspace integrity passed.
+- The pre-mutation policy blocked an out-of-scope test file, the agent moved its harness under `src`, and `workspace.delete` removed it before completion. The final patch changed only `src/registry.mjs`.
+- Execution quality was `0.76`: two productive local test discoveries, three tool-friction failures, nine edit iterations, and 26→220 lines. Correctness was strong; efficiency and concision were not yet elite.
+- Post-pass audit found a latent prototype-key defect in `status()` for a valid plugin named `__proto__`. Plugin-lifecycle v3 adds this adversarial behavior and a mutant regression test.
+- Core response: `workspace.changes` now reports patch scope and expansion before completion, and the kernel requires fresh change review after the last mutation. Large expansion explicitly asks the model to re-read and simplify.
+
 ## 2026-07-11 — public repair-cart preview
 
 - Provider/model: DeepSeek `deepseek-v4-pro`

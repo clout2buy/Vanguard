@@ -31,6 +31,14 @@ await registry.stopAll();
 assert.deepEqual(registry.status(), { api: "registered", cache: "registered", db: "registered" });
 
 assert.throws(() => registry.register(plugin("db")), /duplicate|already registered/i);
+const unusual = new PluginRegistry();
+unusual.register(plugin("__proto__"));
+const unusualStatus = unusual.status();
+assert.equal(Object.hasOwn(unusualStatus, "__proto__"), true);
+assert.equal(unusualStatus.__proto__, "registered");
+await unusual.startAll();
+assert.equal(unusual.status().__proto__, "started");
+await unusual.stopAll();
 for (const malformed of [null, {}, { name: "", start() {}, stop() {} }, { name: "x", requires: "y", start() {}, stop() {} }]) {
   assert.throws(() => new PluginRegistry().register(malformed));
 }
