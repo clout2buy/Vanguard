@@ -18,6 +18,7 @@ export * from "./runtime/imageInspectionTool.js";
 export * from "./runtime/mutationPolicy.js";
 export * from "./runtime/processTool.js";
 export * from "./runtime/projectVerification.js";
+export * from "./runtime/publicRunEvents.js";
 export * from "./runtime/reviewChangesTool.js";
 export * from "./runtime/session.js";
 export * from "./runtime/workspace.js";

@@ -52,7 +52,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     const address = server.address();
     if (address === null || typeof address === "string") throw new Error("Mock server failed to bind.");
     const cli = path.resolve("dist", "src", "cli.js");
-    const { stdout } = await executeFile(process.execPath, [
+    const { stdout, stderr } = await executeFile(process.execPath, [
       cli,
       "run",
       "--workspace", source,
@@ -65,7 +65,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
       "--editable-root", "answer.mjs",
       "--restrict-process", "true",
       "--verifier-evidence", "summary",
-    ], { maxBuffer: 5_000_000 });
+    ], { maxBuffer: 5_000_000, env: { ...process.env, VANGUARD_EVENT_STREAM: "1" } });
     const scorecard = JSON.parse(stdout) as {
       outcome: { status: string; verification?: unknown[] };
       grade: { executionQuality: { score: number; cleanFirstPass: boolean } };
@@ -83,6 +83,9 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
     assert.equal(JSON.parse(await readFile(scorecard.scorecardFile, "utf8")).outcome.status, "completed");
+    assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"session.ready"/);
+    assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"tool.started".*"workspace.read"/);
+    assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"verification.completed"/);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(source, { recursive: true, force: true });

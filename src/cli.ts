@@ -33,6 +33,8 @@ import {
   openCodingSession,
   FixedCommandTool,
   ImageInspectionTool,
+  PublicRunEventPresenter,
+  encodePublicRunEvent,
 } from "./index.js";
 
 interface CliOptions {
@@ -58,6 +60,15 @@ interface CliOptions {
 
 async function main(): Promise<void> {
   const command = process.argv[2];
+  if ((command === undefined || command === "tui") && process.stdin.isTTY && process.stdout.isTTY) {
+    const { runTui } = await import("./tui.js");
+    await runTui(process.cwd());
+    return;
+  }
+  if (command === "--help" || command === "-h") {
+    printUsage();
+    return;
+  }
   if (command !== "run" && command !== "resume") {
     printUsage();
     process.exitCode = 2;
@@ -111,6 +122,17 @@ async function main(): Promise<void> {
   const journalFile = path.join(container, "run.jsonl");
   const scorecardFile = path.join(container, "scorecard.json");
   const fileJournal = await FileJournal.open(journalFile);
+  streamPublicEvent({
+    type: "session.ready",
+    agentId: "main",
+    status: "info",
+    title: resuming ? "Session resumed" : "Session created",
+    sessionId: session.id,
+    sessionRoot: container,
+    workspaceRoot: session.workspaceRoot,
+    journalFile,
+    scorecardFile,
+  });
   const priorEvents = resuming ? await fileJournal.readValidated() : [];
   let lastProgressAt = Date.now();
   const journal = progressJournal(fileJournal, () => { lastProgressAt = Date.now(); });
@@ -355,10 +377,12 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
 
 function progressJournal(fileJournal: FileJournal, onActivity: () => void): JournalPort {
   let modelTurns = 0;
+  const presenter = new PublicRunEventPresenter();
   return {
     async append(event: RunEvent): Promise<void> {
       await fileJournal.append(event);
       onActivity();
+      for (const publicEvent of presenter.present(event)) streamPublicEvent(publicEvent);
       if (event.type === "model.decided") {
         modelTurns += 1;
         const decision = event.data as { kind?: string; call?: { name?: string } };
@@ -377,6 +401,11 @@ function progressJournal(fileJournal: FileJournal, onActivity: () => void): Jour
   };
 }
 
+function streamPublicEvent(event: Parameters<typeof encodePublicRunEvent>[0]): void {
+  if (process.env.VANGUARD_EVENT_STREAM !== "1") return;
+  process.stderr.write(encodePublicRunEvent(event));
+}
+
 function formatDuration(durationMs: number): string {
   const seconds = Math.max(0, Math.floor(durationMs / 1_000));
   const minutes = Math.floor(seconds / 60);
@@ -385,7 +414,7 @@ function formatDuration(durationMs: number): string {
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard                         Open the interactive terminal UI in the current directory\n  vanguard tui                     Open the interactive terminal UI\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {

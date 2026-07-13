@@ -39,6 +39,14 @@ or:
 
 Use a model ID available to your account. The fixture begins broken; Vanguard must inspect it, repair it, execute its tests, and pass the independent verifier. A score of `1` means the verifier accepted the final state. It is a smoke test, not evidence that Vanguard is already superior to established coding agents.
 
+## Interactive terminal UI
+
+After running `scripts\install-cli.ps1` once, `vanguard` opens the terminal UI from any PowerShell directory. The current directory is selected by default. Setup asks for the task, provider/model, and turn budget; project verification is detected before inference begins.
+
+During a run, the UI shows sanitized agent chat, active tool calls, tool outcomes, liveness, context compaction, and verifier decisions. Private reasoning, source-file contents, provider credentials, and sealed verifier evidence are never copied into the public UI stream. Press `Q` or `Ctrl+C` to interrupt. Once the session has been created, an interrupted run prints a durable `vanguard resume --session ...` command.
+
+The agent-stream layout supports multiple agent identifiers, but the current kernel launches one `main` agent. Child-agent execution will populate additional lanes only after delegation is implemented and verified; the UI does not simulate sub-agents.
+
 ## Run a long project
 
 The project wrapper is the easiest terminal entry point. It loads the selected API credential from the current process, the Windows user environment, or Vanguard's ignored DPAPI secret store; builds Vanguard; creates a disposable project copy; and starts a two-hour run with up to 240 model turns.
