@@ -50,6 +50,13 @@ import {
   SyntaxCommandRunner,
   UsageLedger,
   createStreamLifecyclePresenter,
+  reviewSessionChanges,
+  applyReviewedManifest,
+  undoAppliedTransaction,
+  createSessionCheckpoint,
+  listSessionCheckpoints,
+  restoreSessionCheckpoint,
+  forkSessionCheckpoint,
   encodePublicRunEvent,
   type CodingSession,
   type StreamObserver,
@@ -100,12 +107,86 @@ async function main(): Promise<void> {
     await runStdioServer();
     return;
   }
+  if (command === "review" || command === "apply" || command === "undo") {
+    await changeCommand(command, process.argv.slice(3));
+    return;
+  }
+  if (command === "session") {
+    await sessionCommand(process.argv.slice(3));
+    return;
+  }
   if (command !== "run" && command !== "resume") {
     printUsage();
     process.exitCode = 2;
     return;
   }
   await runCommand(command === "resume", process.argv.slice(3));
+}
+
+async function changeCommand(command: "review" | "apply" | "undo", args: readonly string[]): Promise<void> {
+  const values = parseArgumentMap(args);
+  const session = await openCodingSession(required(values, "--session"));
+  const journal = await openSessionJournal(session, path.join(path.dirname(session.workspaceRoot), "run.jsonl"));
+  if (command === "review") {
+    process.stdout.write(`${JSON.stringify(await reviewSessionChanges(session, journal), null, 2)}\n`);
+    return;
+  }
+  if (command === "apply") {
+    const manifest = required(values, "--manifest");
+    const confirmation = required(values, "--confirm");
+    process.stdout.write(`${JSON.stringify(
+      await applyReviewedManifest(session, journal, manifest, confirmation), null, 2,
+    )}\n`);
+    return;
+  }
+  const transaction = required(values, "--apply");
+  const confirmation = required(values, "--confirm");
+  process.stdout.write(`${JSON.stringify(
+    await undoAppliedTransaction(session, journal, transaction, confirmation), null, 2,
+  )}\n`);
+}
+
+async function sessionCommand(args: readonly string[]): Promise<void> {
+  const subcommand = args[0];
+  if (subcommand === undefined) throw new Error("Session command requires checkpoint, list, restore, or fork.");
+  const values = parseArgumentMap(args.slice(1));
+  const session = await openCodingSession(required(values, "--session"));
+  const journal = await openSessionJournal(session, path.join(path.dirname(session.workspaceRoot), "run.jsonl"));
+  if (subcommand === "checkpoint") {
+    const result = await createSessionCheckpoint(session, journal, single(values, "--label"));
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  if (subcommand === "list") {
+    process.stdout.write(`${JSON.stringify({ sessionId: session.id, checkpoints: await listSessionCheckpoints(session) }, null, 2)}\n`);
+    return;
+  }
+  if (subcommand === "restore") {
+    const checkpoint = required(values, "--checkpoint");
+    const result = await restoreSessionCheckpoint(session, journal, checkpoint, required(values, "--confirm"));
+    process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    return;
+  }
+  if (subcommand === "fork") {
+    const result = await forkSessionCheckpoint(session, journal, required(values, "--checkpoint"));
+    process.stdout.write(`${JSON.stringify({
+      checkpointId: result.checkpointId,
+      parentSessionId: result.parentSessionId,
+      parentJournalHash: result.parentJournalHash,
+      sessionId: result.session.id,
+      sessionRoot: path.dirname(result.session.workspaceRoot),
+      workspaceRoot: result.session.workspaceRoot,
+      journalFile: result.journalFile,
+    }, null, 2)}\n`);
+    return;
+  }
+  throw new Error(`Unknown session command '${subcommand}'.`);
+}
+
+function openSessionJournal(session: CodingSession, file: string): Promise<FileJournal> {
+  return FileJournal.open(file, {
+    ...(session.journalGenesisHash === undefined ? {} : { genesisHash: session.journalGenesisHash }),
+  });
 }
 
 async function runCommand(resuming: boolean, args: readonly string[]): Promise<void> {
@@ -127,7 +208,7 @@ async function runCommand(resuming: boolean, args: readonly string[]): Promise<v
   }
   const journalFile = path.join(container, "run.jsonl");
   const scorecardFile = path.join(container, "scorecard.json");
-  const fileJournal = await FileJournal.open(journalFile);
+  const fileJournal = await openSessionJournal(session, journalFile);
   emitSessionReady(session, container, journalFile, scorecardFile, resuming);
   const priorEvents = resuming ? await fileJournal.readValidated() : [];
   const runtime = await buildExecutionRuntime(session, options, fileJournal, false);
@@ -174,7 +255,7 @@ async function advanceSession(
   const journalFile = path.join(container, "run.jsonl");
   const scorecardFile = path.join(container, "scorecard.json");
   const configurationFile = path.join(container, "run-config.json");
-  const fileJournal = await FileJournal.open(journalFile);
+  const fileJournal = await openSessionJournal(session, journalFile);
   emitSessionReady(session, container, journalFile, scorecardFile, session.materialized);
   let priorEvents = await fileJournal.readValidated();
   const startedAt = Date.now();
@@ -828,6 +909,7 @@ function formatDuration(durationMs: number): string {
 }
 
 function printUsage(): void {
+  process.stdout.write(`Safe review/apply commands:\n  vanguard review --session SESSION_PATH\n  vanguard apply --session SESSION_PATH --manifest SHA256 --confirm SHA256\n  vanguard undo --session SESSION_PATH --apply TRANSACTION_ID --confirm TRANSACTION_ID\n  vanguard session checkpoint|list|restore|fork --session SESSION_PATH [options]\n\n`);
   process.stdout.write(`Vanguard expert coding agent\n\nUsage:\n  vanguard                         Start the conversational agent in the current directory\n  vanguard tui                     Start the conversational agent in the current directory\n  vanguard serve --stdio           Start the versioned NDJSON engine protocol\n  vanguard advance --workspace PATH --provider P --model M [options] [--message TEXT]\n                                   Create a conversational session and advance it one turn\n  vanguard advance --session SESSION_PATH [--message TEXT]\n                                   Continue an existing conversational session\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nDefault TUI overrides:\n  VANGUARD_PROVIDER                deepseek, openai, or anthropic\n  VANGUARD_MODEL                   Provider model ID\n  VANGUARD_MAX_STEPS               Expert turn budget (default: 240)\n\nAdvanced run options:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --adaptive-verification BOOL  Blank-project mode requiring the agent to establish a build/test contract\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 

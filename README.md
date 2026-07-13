@@ -48,6 +48,26 @@ The default launch is a real conversation with the model, not a task launcher. T
 
 Advanced provider overrides are available through `VANGUARD_PROVIDER`, `VANGUARD_MODEL`, and `VANGUARD_MAX_STEPS`; the explicit `vanguard run ...` interface remains available for evaluation and policy configuration.
 
+## Review, apply, and time travel
+
+Execution still never edits the original project. Returning verified work is
+an explicit, content-addressed workflow:
+
+```powershell
+vanguard review --session C:\path\to\vanguard-session
+vanguard apply --session C:\path\to\vanguard-session --manifest SHA256 --confirm SHA256
+vanguard undo --session C:\path\to\vanguard-session --apply apply-ID --confirm apply-ID
+```
+
+Review produces a deterministic JSON manifest. Apply refuses if either the
+original project or candidate changed after review, and rolls back injected or
+ordinary partial failures. Undo refuses if anything changed after apply.
+
+Durable candidate snapshots are available through `vanguard session
+checkpoint`, `list`, `restore`, and `fork`. Restore requires an exact
+checkpoint confirmation; fork preserves the selected journal prefix and its
+hash-chain branch point. These commands emit JSON for TUI and engine clients.
+
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design boundary and [`gauntlet/README.md`](gauntlet/README.md) for evaluation rules.
 
 Vanguard's vendor and clean-room guarantees are defined in [`docs/INDEPENDENCE.md`](docs/INDEPENDENCE.md).

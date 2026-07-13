@@ -9,7 +9,12 @@ interface JournalEnvelope {
   readonly event: RunEvent;
 }
 
-const GENESIS_HASH = "0".repeat(64);
+export const JOURNAL_GENESIS_HASH = "0".repeat(64);
+
+export interface JournalTip {
+  readonly hash: string;
+  readonly sequence: number;
+}
 
 export class FileJournal implements JournalPort {
   #lastHash: string;
@@ -17,21 +22,24 @@ export class FileJournal implements JournalPort {
 
   private constructor(
     readonly file: string,
+    readonly genesisHash: string,
     lastHash: string,
   ) {
     this.#lastHash = lastHash;
   }
 
-  static async open(file: string): Promise<FileJournal> {
+  static async open(file: string, options: { readonly genesisHash?: string } = {}): Promise<FileJournal> {
     const absolute = path.resolve(file);
+    const genesisHash = options.genesisHash ?? JOURNAL_GENESIS_HASH;
+    if (!/^[a-f0-9]{64}$/.test(genesisHash)) throw new Error("Journal genesis hash is malformed.");
     await mkdir(path.dirname(absolute), { recursive: true });
     try {
       await writeFile(absolute, "", { flag: "wx" });
     } catch (error) {
       if (!isExisting(error)) throw error;
     }
-    const envelopes = await readValidatedJournal(absolute);
-    return new FileJournal(absolute, envelopes.at(-1)?.hash ?? GENESIS_HASH);
+    const envelopes = await readValidatedJournal(absolute, genesisHash);
+    return new FileJournal(absolute, genesisHash, envelopes.at(-1)?.hash ?? genesisHash);
   }
 
   async append(event: RunEvent): Promise<void> {
@@ -48,15 +56,22 @@ export class FileJournal implements JournalPort {
 
   async readValidated(): Promise<readonly RunEvent[]> {
     await this.#writeChain;
-    return (await readValidatedJournal(this.file)).map((envelope) => envelope.event);
+    return (await readValidatedJournal(this.file, this.genesisHash)).map((envelope) => envelope.event);
+  }
+
+  async tip(): Promise<JournalTip> {
+    await this.#writeChain;
+    const envelopes = await readValidatedJournal(this.file, this.genesisHash);
+    const last = envelopes.at(-1);
+    return { hash: last?.hash ?? this.genesisHash, sequence: last?.event.sequence ?? 0 };
   }
 }
 
-async function readValidatedJournal(file: string): Promise<JournalEnvelope[]> {
+async function readValidatedJournal(file: string, genesisHash: string): Promise<JournalEnvelope[]> {
   const contents = await readFile(file, "utf8");
   const lines = contents.split("\n").filter((line) => line.length > 0);
   const envelopes: JournalEnvelope[] = [];
-  let previousHash = GENESIS_HASH;
+  let previousHash = genesisHash;
 
   for (const [index, line] of lines.entries()) {
     const parsed = JSON.parse(line) as JournalEnvelope;

@@ -256,7 +256,13 @@ export type RunEventType =
   | "tool.failed"
   | "verification.completed"
   | "run.completed"
-  | "run.failed";
+  | "run.failed"
+  | "change.reviewed"
+  | "change.applied"
+  | "change.reverted"
+  | "session.checkpointed"
+  | "session.restored"
+  | "session.forked";
 
 export interface RunEvent {
   readonly sequence: number;

@@ -716,6 +716,26 @@ function restoreSession(
       completed = true;
       continue;
     }
+    if (event.type === "session.restored" || event.type === "session.forked") {
+      const data = recordValue(event.data);
+      if (event.type === "session.forked" && data?.role !== "child") continue;
+      // Time travel never erases the prior completion record; the later
+      // branch event explicitly reopens the state machine while leaving the
+      // complete journal prefix auditable.
+      completed = false;
+      pendingQuestion = undefined;
+      pendingCalls = [];
+      trailingNarrations = 0;
+      mutationNeedsExecutionEvidence = mode === "execution";
+      mutationNeedsReview = mode === "execution" && hasReviewTool;
+      transcript.push({
+        role: "user",
+        content: event.type === "session.restored"
+          ? "[Vanguard runtime] The candidate workspace was restored to a durable checkpoint. Re-inspect changed state and re-run verification before claiming completion."
+          : "[Vanguard runtime] This is a child branch from a durable checkpoint. Continue from the branched workspace and re-establish fresh evidence.",
+      });
+      continue;
+    }
     if (event.type === "model.decided") {
       flushCompletion();
       const decision = normalizeDecision(event.data);

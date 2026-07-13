@@ -178,6 +178,46 @@ superiority** — the evidence selects the language afterward.
   correctness to terminal rendering. Restart replay includes durable journal
   events, not provisional SSE deltas that were never committed. This is an
   implementation milestone, not evidence of competitive coding parity.
+### Phase 5 — Safe review/apply/undo + session time travel
+
+- **Intended KPI:** zero unreviewed original-repository mutations, zero
+  partial repositories after injected apply failures, and exact durable
+  restoration/fork lineage across restart.
+- **Implemented:** every materialized session now captures a deterministic
+  content-addressed baseline while execution remains confined to the
+  disposable workspace. `vanguard review` emits and journals a canonical
+  SHA-256 patch manifest containing add/delete/modify/rename operations,
+  before/after content hashes, byte counts, binary classification, and mode
+  bits. `vanguard apply` requires both the reviewed manifest hash and an exact
+  confirmation; it refuses original drift, candidate drift, path traversal,
+  excluded roots, symlinks, and junctions before staging. Apply copies both
+  sides into a session-owned transaction, rechecks both tree roots after
+  staging, uses a per-project lock, records progress atomically, verifies the
+  postcondition, and rolls back on any ordinary failure. Incomplete apply or
+  undo state is recovered on restart; touched paths with third-party content
+  are never overwritten during recovery. `vanguard undo` succeeds only when
+  the entire post-apply tree still matches its recorded hash, protecting user
+  edits made after apply.
+- **Time travel:** `vanguard session checkpoint/list/restore/fork` captures
+  candidate workspace state plus the exact journal and durable plan/checkpoint
+  files. Restores use a recoverable whole-workspace swap and append rather
+  than rewrite journal history. Forks copy the journal prefix at the selected
+  checkpoint and append child/parent branch events from the recorded hash,
+  preserving a verifiable hash-chain lineage. All command results are JSON;
+  destructive restore also requires an exact checkpoint confirmation.
+- **Adversarial proof:** deterministic repeated review; binary add/rename;
+  original and candidate drift; wrong confirmation; forged traversal
+  manifest; Windows junction/symlink change; injected mid-apply rollback;
+  simulated process death and restart recovery; post-apply user edit blocking
+  undo; restore crash recovery; checkpoint listing; child journal branch
+  validation; compiled CLI review/apply/undo round trip. POSIX-only coverage
+  additionally asserts executable-mode application.
+- **Boundary:** filesystem metadata beyond portable mode bits (ACLs, owners,
+  alternate data streams, xattrs) is intentionally not applied. Link changes
+  are reported as unsupported rather than followed. These conservative
+  refusals are product behavior, not silent omissions.
+- **Tests:** full suite 144 cases on Windows: 143 passed, with the one
+  POSIX-only executable-mode assertion correctly skipped.
 
 ## Invalidated results ledger
 
