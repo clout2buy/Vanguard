@@ -41,7 +41,7 @@ Use a model ID available to your account. The fixture begins broken; Vanguard mu
 
 ## Interactive terminal UI
 
-After running `scripts\install-cli.ps1` once, `vanguard` opens the terminal UI from any PowerShell directory. The current directory is selected by default. Setup asks for the task, provider/model, and turn budget; project verification is detected before inference begins.
+After running `scripts\install-cli.ps1` once, `vanguard` opens the terminal UI from any PowerShell directory. The current directory is locked in automatically, so the first input prompt is `Task >`. Setup then asks for the provider/model and turn budget; project verification is detected before inference begins.
 
 During a run, the UI shows sanitized agent chat, active tool calls, tool outcomes, liveness, context compaction, and verifier decisions. Private reasoning, source-file contents, provider credentials, and sealed verifier evidence are never copied into the public UI stream. Press `Q` or `Ctrl+C` to interrupt. Once the session has been created, an interrupted run prints a durable `vanguard resume --session ...` command.
 

@@ -9,6 +9,19 @@ import test from "node:test";
 
 const executeFile = promisify(execFile);
 
+test("compiled CLI reports setup failures without a stack trace", async () => {
+  const cli = path.resolve("dist", "src", "cli.js");
+  await assert.rejects(
+    executeFile(process.execPath, [cli, "run"]),
+    (error: unknown) => {
+      const stderr = (error as { stderr?: string }).stderr ?? "";
+      assert.match(stderr, /^Vanguard failed: .+\r?\n$/);
+      assert.doesNotMatch(stderr, /\n\s*at\s/);
+      return true;
+    },
+  );
+});
+
 test("compiled CLI repairs an isolated copy and writes a scorecard", async () => {
   const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-source-"));
   await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 41;\n");

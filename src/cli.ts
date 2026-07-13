@@ -418,6 +418,9 @@ function printUsage(): void {
 }
 
 main().catch((error: unknown) => {
-  process.stderr.write(`Vanguard failed: ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  const detail = error instanceof Error
+    ? process.env.VANGUARD_DEBUG === "1" ? error.stack ?? error.message : error.message
+    : String(error);
+  process.stderr.write(`Vanguard failed: ${detail}\n`);
   process.exitCode = 1;
 });

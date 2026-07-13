@@ -34,7 +34,7 @@ Then open PowerShell in any codebase and run:
 vanguard
 ```
 
-The terminal UI starts on the current directory, detects its trusted build/test command, loads the selected provider credential from the process, Windows user environment, or Vanguard's ignored DPAPI store, and runs against a disposable copy. It streams agent messages, tool calls, build results, compaction, and independent verifier state. The original project remains unchanged; the final handoff links the disposable workspace, journal, scorecard, and resume command.
+The terminal UI locks onto the current directory and puts the cursor directly on `Task >`; change projects by changing directories before launching it. It detects the trusted build/test command, loads the selected provider credential from the process, Windows user environment, or Vanguard's ignored DPAPI store, and runs against a disposable copy. It streams agent messages, tool calls, build results, compaction, and independent verifier state. The original project remains unchanged; the final handoff links the disposable workspace, journal, scorecard, and resume command.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design boundary and [`gauntlet/README.md`](gauntlet/README.md) for evaluation rules.
 

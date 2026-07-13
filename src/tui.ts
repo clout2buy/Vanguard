@@ -152,32 +152,41 @@ async function promptConfiguration(startDirectory: string): Promise<TuiConfig> {
   process.stdout.write(`${ansi.dim}Your project is copied into an isolated session. The original directory is not edited.${ansi.reset}\n\n`);
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const workspaceAnswer = (await prompt.question(`Workspace ${ansi.dim}[${startDirectory}]${ansi.reset} > `)).trim();
-    const workspace = await realpath(path.resolve(workspaceAnswer.length === 0 ? startDirectory : workspaceAnswer));
+    const workspace = await realpath(path.resolve(startDirectory));
     if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory.");
+    process.stdout.write(`Workspace: ${ansi.bold}${workspace}${ansi.reset}\n`);
+    let task = "";
+    while (task.length === 0) {
+      task = (await prompt.question("\nTask > ")).trim();
+      if (task.length === 0) process.stdout.write(`${ansi.amber}Describe the coding outcome Vanguard should complete.${ansi.reset}\n`);
+    }
     const detected = await detectProjectVerification(workspace);
     let verification = detected;
     if (verification === undefined) {
       process.stdout.write(`${ansi.amber}No npm, Gradle, pytest, or Cargo verification command was detected.${ansi.reset}\n`);
+      process.stdout.write(`${ansi.dim}Choose the command Vanguard must make pass before it can finish (for example: npm test).${ansi.reset}\n`);
       const commandLine = (await prompt.question("Verification command > ")).trim();
       const parsed = splitCommandLine(commandLine);
       if (parsed.length === 0) throw new Error("A verification command is required.");
       verification = { command: parsed[0]!, args: parsed.slice(1) };
     }
     process.stdout.write(`${ansi.green}✓${ansi.reset} Verification: ${verification.command} ${verification.args.join(" ")}\n`);
-    let task = "";
-    while (task.length === 0) {
-      task = (await prompt.question("\nTask > ")).trim();
-      if (task.length === 0) process.stdout.write(`${ansi.amber}Describe the coding outcome Vanguard should complete.${ansi.reset}\n`);
+    let provider: Provider | undefined;
+    while (provider === undefined) {
+      const providerAnswer = (await prompt.question("Provider [deepseek] (deepseek/openai/anthropic) > ")).trim().toLowerCase();
+      provider = parseProvider(providerAnswer);
+      if (provider === undefined) process.stdout.write(`${ansi.amber}Choose deepseek, openai, or anthropic.${ansi.reset}\n`);
     }
-    const providerAnswer = (await prompt.question("Provider [deepseek] (deepseek/openai/anthropic) > ")).trim().toLowerCase();
-    const provider = parseProvider(providerAnswer);
     const defaultModel = provider === "deepseek" ? "deepseek-v4-pro" : provider === "openai" ? "gpt-5.6" : "claude-opus-4-8";
     const modelAnswer = (await prompt.question(`Model ${ansi.dim}[${defaultModel}]${ansi.reset} > `)).trim();
     const model = modelAnswer.length === 0 ? defaultModel : modelAnswer;
-    const stepsAnswer = (await prompt.question("Maximum agent turns [240] > ")).trim();
-    const maxSteps = stepsAnswer.length === 0 ? 240 : Number(stepsAnswer);
-    if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > 2_000) throw new Error("Maximum turns must be an integer from 1 to 2000.");
+    let maxSteps: number | undefined;
+    while (maxSteps === undefined) {
+      const stepsAnswer = (await prompt.question("Maximum agent turns [240] > ")).trim();
+      const candidate = stepsAnswer.length === 0 ? 240 : Number(stepsAnswer);
+      if (Number.isSafeInteger(candidate) && candidate >= 1 && candidate <= 2_000) maxSteps = candidate;
+      else process.stdout.write(`${ansi.amber}Enter a whole number from 1 to 2000.${ansi.reset}\n`);
+    }
     process.stdout.write(`\n${ansi.bold}${path.basename(workspace)}${ansi.reset} · ${provider}/${model} · ${maxSteps} turns\n`);
     const confirm = (await prompt.question("Start isolated run? [Y/n] > ")).trim().toLowerCase();
     if (confirm === "n" || confirm === "no") throw new Error("Run cancelled before start.");
@@ -442,11 +451,11 @@ function repositoryRoot(): string {
   return path.resolve(import.meta.dirname, "..", "..");
 }
 
-function parseProvider(value: string): Provider {
+function parseProvider(value: string): Provider | undefined {
   if (value.length === 0 || value === "1" || value === "deepseek") return "deepseek";
   if (value === "2" || value === "openai") return "openai";
   if (value === "3" || value === "anthropic") return "anthropic";
-  throw new Error("Provider must be deepseek, openai, or anthropic.");
+  return undefined;
 }
 
 function splitCommandLine(value: string): string[] {
