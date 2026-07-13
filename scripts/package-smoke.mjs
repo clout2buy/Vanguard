@@ -46,6 +46,8 @@ try {
     "docs/ENGINE_PROTOCOL.md",
     "docs/PROVIDERS.md",
     "docs/PORTABILITY.md",
+    "docs/EXTENSIONS.md",
+    "docs/THREAT_MODEL.md",
     "scripts/vanguard",
     "scripts/vanguard.ps1",
   ]) {
@@ -58,6 +60,12 @@ try {
     'const api = await import("vanguard");',
     'if (api.VANGUARD_PROTOCOL_VERSION !== 1) throw new Error("engine export unavailable");',
     'if (typeof api.resolveProviderProfile !== "function") throw new Error("provider profile export unavailable");',
+    'if (typeof api.VanguardEngine !== "function") throw new Error("embedded engine export unavailable");',
+    'if (typeof api.resolveSecurityPolicy !== "function") throw new Error("security policy export unavailable");',
+    'if (typeof api.reviewSessionChanges !== "function") throw new Error("review/apply export unavailable");',
+    'if (typeof api.createSessionCheckpoint !== "function") throw new Error("time-travel export unavailable");',
+    'if (typeof api.createConfiguredProviderModel !== "function") throw new Error("provider runtime export unavailable");',
+    'if (typeof api.AresVanguardAdapter !== "function") throw new Error("Ares adapter export unavailable");',
   ].join("\n")], consumer);
   const help = run(process.execPath, [path.join(consumer, "node_modules", "vanguard", "dist", "src", "cli.js"), "--help"], consumer);
   assert.match(help, /Vanguard expert coding agent/u);

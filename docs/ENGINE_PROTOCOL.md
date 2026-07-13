@@ -69,6 +69,9 @@ that were never journaled are intentionally not fabricated.
 - Credential-shaped assignments and configured secret environment values are
   redacted again at the transport boundary.
 - API keys remain in the worker environment; they are never protocol fields.
+- `session.ready` carries the runtime-owned `materialized` boolean, so live
+  status changes when the disposable workspace exists instead of lagging
+  until the worker exits. Clients must not infer this state from paths/titles.
 - Worker stdout is drained but not forwarded. Sanitized public events are
   parsed from the dedicated prefixed stderr channel; other logs stay on the
   server's stderr.

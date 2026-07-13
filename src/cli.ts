@@ -703,6 +703,7 @@ function emitSessionReady(
     workspaceRoot: session.workspaceRoot,
     journalFile,
     scorecardFile,
+    materialized: session.materialized,
   });
 }
 

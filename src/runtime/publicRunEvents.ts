@@ -19,6 +19,8 @@ export interface PublicRunEvent {
   readonly workspaceRoot?: string;
   readonly journalFile?: string;
   readonly scorecardFile?: string;
+  /** Runtime-owned workspace lifecycle state; never inferred by clients. */
+  readonly materialized?: boolean;
 }
 
 export class PublicRunEventPresenter {

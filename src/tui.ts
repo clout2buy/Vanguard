@@ -1,11 +1,11 @@
-import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import path from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { createInterface } from "node:readline/promises";
 import type { CommandSpec } from "./runtime/projectVerification.js";
 import { detectProjectVerification } from "./runtime/projectVerification.js";
-import { PUBLIC_EVENT_PREFIX, type PublicRunEvent } from "./runtime/publicRunEvents.js";
+import type { PublicRunEvent } from "./runtime/publicRunEvents.js";
 import { VanguardEngine } from "./engine/vanguardEngine.js";
 import type { VanguardEngineEvent, VanguardSessionStatus } from "./engine/types.js";
 
@@ -97,9 +97,12 @@ const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 export async function runTui(startDirectory: string): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The Vanguard TUI requires an interactive terminal.");
   const config = await resolveConfiguration(startDirectory);
-  // Validate credential presence once. The embedded engine's worker inherits
-  // the environment; credential values never enter its public event surface.
-  loadCredential(config.provider);
+  // The Windows credential helper returns a value without mutating this
+  // process. Install it for the lifetime of the embedded engine so its worker
+  // can inherit it, then restore the caller's environment on shutdown.
+  const credentialName = credentialVariable(config.provider);
+  const previousCredential = process.env[credentialName];
+  process.env[credentialName] = loadCredential(config.provider);
   const engine = new VanguardEngine({ logger: () => {} });
 
   process.stdout.write(`\x1b[2J\x1b[H${renderWelcome(config.workspace, config.model)}`);
@@ -161,12 +164,13 @@ export async function runTui(startDirectory: string): Promise<void> {
   } finally {
     prompt.close();
     await engine.shutdown();
+    if (previousCredential === undefined) delete process.env[credentialName];
+    else process.env[credentialName] = previousCredential;
   }
 }
 
 interface TurnResult {
   readonly outcome: TurnOutcome | undefined;
-  readonly sessionRoot: string | undefined;
   readonly contracted: boolean;
 }
 
@@ -310,7 +314,6 @@ async function runEngineTurn(
   }
   return {
     outcome: cancelled ? { status: "failed" } : outcome,
-    sessionRoot: status.sessionRoot,
     contracted: state.contracted,
   };
 }
@@ -333,150 +336,6 @@ function outcomeFromEngineState(status: VanguardSessionStatus, state: UiState): 
   return { status: "responded", ...(message === undefined ? {} : { message }) };
 }
 
-async function runTurn(
-  message: string,
-  config: TuiConfig,
-  credentialName: string,
-  credential: string,
-  sessionRoot: string | undefined,
-  alreadyContracted: boolean,
-): Promise<TurnResult> {
-  const state: UiState = {
-    phase: alreadyContracted ? "running" : "starting",
-    startedAt: Date.now(),
-    frame: 0,
-    quietDetail: alreadyContracted ? "Continuing contracted execution" : "Understanding your request",
-    task: message,
-    agents: new Map([["main", { id: "main", turn: 0, action: alreadyContracted ? "resuming" : "listening", status: "active" }]]),
-    activity: [],
-    chat: [{ agentId: "you", message }],
-    verifiers: new Map(),
-    contracted: alreadyContracted,
-    screenActive: false,
-    conversationMessages: [],
-    composer: "",
-    liveDelta: "",
-  };
-
-  const child = startAgent(message, config, credentialName, credential, sessionRoot);
-  let cancelled = false;
-  const sendSteering = (): void => {
-    const text = state.composer.trim();
-    state.composer = "";
-    if (text.length === 0) return;
-    child.stdin.write(`${JSON.stringify({ type: "user_message", text })}\n`);
-    state.chat.push({ agentId: "you", message: text });
-    trimTo(state.chat, 30);
-    state.quietDetail = "Steering delivered; it lands at the next decision boundary";
-  };
-  const onKeypress = (text: string | undefined, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
-    if (key.ctrl === true && key.name === "c") {
-      if (state.phase === "completed" || state.phase === "failed" || state.phase === "cancelled") return;
-      cancelled = true;
-      state.phase = "cancelling";
-      state.quietDetail = "Stopping after the current process boundary";
-      child.stdin.write(`${JSON.stringify({ type: "cancel" })}\n`);
-      child.kill("SIGTERM");
-      return;
-    }
-    if (key.ctrl === true || key.meta === true) return;
-    if (key.name === "return" || key.name === "enter") {
-      sendSteering();
-      return;
-    }
-    if (key.name === "backspace") {
-      state.composer = state.composer.slice(0, -1);
-      return;
-    }
-    if (key.name === "escape") {
-      state.composer = "";
-      return;
-    }
-    if (typeof text === "string" && text.length === 1 && text.charCodeAt(0) >= 32) {
-      if (state.composer.length < 500) state.composer += text;
-    }
-  };
-  const onSigint = (): void => {
-    cancelled = true;
-    child.kill("SIGTERM");
-  };
-  process.on("SIGINT", onSigint);
-
-  const enterExecutionScreen = (): void => {
-    if (state.screenActive) return;
-    state.screenActive = true;
-    emitKeypressEvents(process.stdin);
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.on("keypress", onKeypress);
-    enterScreen();
-  };
-  const leaveExecutionScreen = (): void => {
-    if (!state.screenActive) return;
-    state.screenActive = false;
-    process.stdin.off("keypress", onKeypress);
-    process.stdin.setRawMode(false);
-    process.stdin.pause();
-    leaveScreen();
-  };
-
-  if (alreadyContracted) enterExecutionScreen();
-  else process.stdout.write(`${ansi.dim}…${ansi.reset}\n`);
-
-  const animation = setInterval(() => {
-    state.frame += 1;
-    if (state.screenActive) render(state, config);
-    if (!state.contracted && state.phase === "starting") state.phase = "running";
-  }, 120);
-  animation.unref();
-
-  let exitCode: number | null = null;
-  try {
-    exitCode = await consumeChild(child, state, enterExecutionScreen);
-    if (state.screenActive) {
-      if (cancelled) {
-        state.phase = "cancelled";
-        state.quietDetail = "Run interrupted; send another message to resume this session";
-      } else if (exitCode === 0 && resultCompleted(state.finalResult)) {
-        state.phase = "completed";
-        state.quietDetail = "Independent verification accepted the result";
-        const main = state.agents.get("main");
-        if (main !== undefined) main.status = "done";
-      } else if (outcomeStatus(state.finalResult) === "waiting_for_user") {
-        state.phase = "running";
-        state.quietDetail = "Vanguard is waiting for your answer";
-      } else {
-        state.phase = "failed";
-        state.quietDetail = state.error ?? "Run stopped before verified completion";
-        const main = state.agents.get("main");
-        if (main !== undefined) main.status = "failed";
-      }
-      render(state, config);
-      await delay(400);
-    }
-  } finally {
-    clearInterval(animation);
-    process.removeListener("SIGINT", onSigint);
-    leaveExecutionScreen();
-  }
-
-  const outcome = extractOutcome(state.finalResult);
-  if (state.contracted || outcomeStatus(state.finalResult) === "completed") {
-    await printHandoff(state, config, cancelled);
-  } else if (outcome?.status === "responded" && outcome.message !== undefined
-    && !state.conversationMessages.includes(outcome.message)) {
-    process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${outcome.message}\n\n`);
-  } else if (outcome === undefined && !cancelled) {
-    process.stdout.write(`${ansi.red}${state.error ?? "Vanguard stopped unexpectedly. The session journal has the details."}${ansi.reset}\n`);
-  }
-
-  return {
-    outcome: cancelled ? { status: "failed" } : outcome,
-    sessionRoot: state.session?.sessionRoot,
-    contracted: state.contracted,
-  };
-}
-
 async function resolveConfiguration(startDirectory: string): Promise<TuiConfig> {
   const workspace = await realpath(path.resolve(startDirectory));
   if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory.");
@@ -493,88 +352,6 @@ async function resolveConfiguration(startDirectory: string): Promise<TuiConfig> 
     adaptiveVerification: detectedVerification === undefined,
     maxSteps,
   };
-}
-
-function startAgent(
-  message: string,
-  config: TuiConfig,
-  credentialName: string,
-  credential: string,
-  sessionRoot: string | undefined,
-): ChildProcessWithoutNullStreams {
-  const entry = path.join(import.meta.dirname, "cli.js");
-  const args = sessionRoot !== undefined
-    ? [entry, "advance", "--session", sessionRoot, "--message", message]
-    : [
-      entry,
-      "advance",
-      "--workspace", config.workspace,
-      "--message", message,
-      "--provider", config.provider,
-      "--model", config.model,
-      "--verify-command", config.verification.command,
-      ...config.verification.args.flatMap((argument) => ["--verify-arg", argument]),
-      "--check-command", config.verification.command,
-      ...config.verification.args.flatMap((argument) => ["--check-arg", argument]),
-      "--verifier-evidence", "summary",
-      "--adaptive-verification", String(config.adaptiveVerification),
-      "--max-steps", String(config.maxSteps),
-      "--max-duration-ms", "7200000",
-      "--command-timeout-ms", "1800000",
-      "--max-context-bytes", "300000",
-      "--max-verification-attempts", "3",
-    ];
-  return spawn(process.execPath, args, {
-    cwd: repositoryRoot(),
-    windowsHide: true,
-    env: { ...process.env, [credentialName]: credential, VANGUARD_EVENT_STREAM: "1", VANGUARD_CONTROL_STREAM: "1", FORCE_COLOR: "0" },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-}
-
-async function consumeChild(
-  child: ChildProcessWithoutNullStreams,
-  state: UiState,
-  enterExecutionScreen: () => void,
-): Promise<number | null> {
-  let stdout = "";
-  let stderrBuffer = "";
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => { stdout += chunk; });
-  child.stderr.on("data", (chunk: string) => {
-    stderrBuffer += chunk;
-    const lines = stderrBuffer.split(/\r?\n/);
-    stderrBuffer = lines.pop() ?? "";
-    for (const line of lines) consumeLine(line, state, enterExecutionScreen);
-  });
-  const exitCode = await new Promise<number | null>((resolve, reject) => {
-    child.once("error", reject);
-    child.once("close", resolve);
-  });
-  if (stderrBuffer.length > 0) consumeLine(stderrBuffer, state, enterExecutionScreen);
-  try {
-    state.finalResult = JSON.parse(stdout) as Record<string, unknown>;
-  } catch {
-    if (stdout.trim().length > 0) state.error = lastLine(stdout);
-  }
-  return exitCode;
-}
-
-function consumeLine(line: string, state: UiState, enterExecutionScreen: () => void): void {
-  if (line.startsWith(PUBLIC_EVENT_PREFIX)) {
-    try {
-      consumeEvent(JSON.parse(line.slice(PUBLIC_EVENT_PREFIX.length)) as PublicRunEvent, state, enterExecutionScreen);
-    } catch {
-      state.quietDetail = "Received an unreadable UI event; full evidence remains in the journal";
-    }
-    return;
-  }
-  if (line.includes("working: provider or tool response pending")) {
-    state.quietDetail = line.replace(/^\[Vanguard\]\s*/, "");
-  } else if (line.includes("Vanguard failed:")) {
-    state.error = bounded(line.replace(/^Vanguard failed:\s*/, ""), 220);
-  }
 }
 
 function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScreen: () => void): void {
@@ -945,14 +722,6 @@ function elapsed(startedAt: number): string {
   return hours > 0
     ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
     : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
-}
-
-function resultCompleted(result: Record<string, unknown> | undefined): boolean {
-  return outcomeStatus(result) === "completed";
-}
-
-function lastLine(value: string): string {
-  return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1) ?? "Unknown child-process error";
 }
 
 function trimTo<T>(items: T[], limit: number): void {

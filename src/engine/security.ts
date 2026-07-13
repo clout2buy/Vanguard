@@ -39,6 +39,7 @@ export function sanitizePublicEvent(
     ...(safeText(value.workspaceRoot, redact, 2_000) === undefined ? {} : { workspaceRoot: safeText(value.workspaceRoot, redact, 2_000)! }),
     ...(safeText(value.journalFile, redact, 2_000) === undefined ? {} : { journalFile: safeText(value.journalFile, redact, 2_000)! }),
     ...(safeText(value.scorecardFile, redact, 2_000) === undefined ? {} : { scorecardFile: safeText(value.scorecardFile, redact, 2_000)! }),
+    ...(typeof value.materialized === "boolean" ? { materialized: value.materialized } : {}),
   };
 }
 

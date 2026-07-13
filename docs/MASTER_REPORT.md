@@ -203,12 +203,10 @@ superiority** — the evidence selects the language afterward.
   replay from a hash-chained journal. Public embedding and stdio client
   examples live under `examples/`.
 - **Tests:** 146/146 (134 inherited + 12 Phase-8 protocol/engine cases).
-- **Honest remaining work:** the current TUI still launches the legacy
-  `advance` child directly; making it dogfood `serve --stdio` is intentionally
-  deferred to the Phase 10 product rewrite rather than coupling protocol
-  correctness to terminal rendering. Restart replay includes durable journal
-  events, not provisional SSE deltas that were never committed. This is an
-  implementation milestone, not evidence of competitive coding parity.
+- **Honest remaining work:** restart replay includes durable journal events,
+  not provisional SSE deltas that were never committed. The terminal now
+  consumes this same engine contract (Phase 10), but that product integration
+  is still not evidence of competitive coding parity.
 ### Phase 5 — Safe review/apply/undo + session time travel
 
 - **Intended KPI:** zero unreviewed original-repository mutations, zero
@@ -333,6 +331,27 @@ superiority** — the evidence selects the language afterward.
   cross-platform packaging remain Phase 11; destructive security campaigns
   remain Phase 12; no competitive parity claim follows from this phase alone.
 - **Tests:** 170/170 (161 inherited + 9 Phase-9 adversarial cases).
+
+### Phase 10 — Product flow on the public engine
+
+- **Intended KPI:** one prompt-first terminal flow with no provider/setup
+  questionnaire, no second session controller, and no behavior split between
+  the product UI and embedders using `VanguardEngine`.
+- **Implemented:** the TUI creates, advances, steers, cancels, and observes
+  sessions exclusively through the exported engine API. Conversation remains
+  inline until a task contract exists; contracted execution switches to the
+  animated tool/verifier view, keeps a live steering composer, and derives
+  terminal outcomes from engine state plus sanitized public events. Resume,
+  materialization, bounded replay, cancellation, and worker cleanup therefore
+  retain the same ownership as stdio and embedded clients.
+- **Integration cleanup:** the superseded direct `advance` child launcher,
+  stderr event parser, stdout result parser, and duplicate cancellation loop
+  were removed from `src/tui.ts`. An architectural regression test inspects
+  the built TUI artifact and fails if that legacy execution path returns.
+- **Proof boundary:** render tests cover the welcome/prompt contract, terminal
+  bounds, live agent/tool/verifier presentation, and minimum-size collapse;
+  engine protocol tests cover behavior and lifecycle. TTY rendering quality is
+  product evidence only, not a Claude Code/Codex/OpenCode capability result.
 
 ### Phase 11 — Provider conformance + portability hardening
 

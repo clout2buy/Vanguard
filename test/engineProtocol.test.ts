@@ -145,6 +145,37 @@ test("public events are allowlisted and redact environment and assignment secret
   }
 });
 
+test("live session status observes the worker materialization transition", async () => {
+  const source = await workspace("engine-live-materialization");
+  const runner = new FakeRunner();
+  const engine = new VanguardEngine({ runner });
+  let root = "";
+  try {
+    const session = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = session.sessionRoot;
+    assert.equal(session.materialized, false);
+    engine.advance(session.sessionId, "contract and execute");
+    await until(() => runner.runs.has(root));
+    runner.emit(root, {
+      type: "session.ready",
+      agentId: "main",
+      status: "info",
+      title: "Session resumed",
+      sessionId: session.sessionId,
+      sessionRoot: root,
+      workspaceRoot: session.workspaceRoot,
+      materialized: true,
+    });
+    assert.equal(engine.status(session.sessionId).materialized, true);
+    assert.equal(engine.status(session.sessionId).state, "running");
+    assert.equal(engine.events(session.sessionId).events[0]?.event.materialized, true);
+    runner.runs.get(root)?.finish();
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
+  }
+});
+
 test("resume reconstructs deterministic public replay from the hash-chained journal", async () => {
   const source = await workspace("engine-resume");
   const first = new VanguardEngine({ runner: new FakeRunner() });
@@ -253,6 +284,127 @@ test("engine bounds registered sessions and steering accepted during one advance
   } finally {
     await engine.shutdown();
     await cleanup([root, sourceA, sourceB]);
+  }
+});
+
+test("terminal worker events cannot open an overlapping advance during cleanup", async () => {
+  const source = await workspace("engine-terminal-cleanup");
+  const runner = new FakeRunner();
+  const engine = new VanguardEngine({ runner });
+  let root = "";
+  try {
+    const session = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = session.sessionRoot;
+    engine.advance(session.sessionId, "first task");
+    await until(() => runner.runs.has(root));
+    runner.emit(root, event("run.failed", "terminal failure"));
+    assert.equal(engine.status(session.sessionId).state, "failed");
+    assert.throws(
+      () => engine.advance(session.sessionId, "must not overlap"),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "session_busy",
+    );
+
+    runner.runs.get(root)?.finish({ code: 1, signal: null });
+    await until(() => engine.status(session.sessionId).state === "failed");
+    // Once the worker has actually exited, failed sessions remain resumable.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(engine.advance(session.sessionId, "repair after failure").state, "running");
+    engine.cancel(session.sessionId);
+    await until(() => engine.status(session.sessionId).state === "cancelled");
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
+  }
+});
+
+test("queued steering backpressure is contained and the worker is cleaned up", async () => {
+  const source = await workspace("engine-queued-steering-failure");
+  const logs: string[] = [];
+  let cancelled = 0;
+  const runner: VanguardRunnerPort = {
+    start(_sessionRoot, _message, _hooks) {
+      let finish!: (exit: { code: number | null; signal: NodeJS.Signals | null }) => void;
+      const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => { finish = resolve; });
+      return {
+        done,
+        steer: () => { throw new Error("synthetic backpressure"); },
+        cancel: () => {
+          cancelled += 1;
+          finish({ code: null, signal: "SIGTERM" });
+        },
+      };
+    },
+  };
+  const engine = new VanguardEngine({ runner, logger: (line) => logs.push(line) });
+  let root = "";
+  try {
+    const session = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = session.sessionRoot;
+    engine.advance(session.sessionId, "task");
+    // This lands in the pre-launch queue because advance starts on setImmediate.
+    engine.steer(session.sessionId, "queued guidance");
+    await until(() => cancelled === 1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(engine.status(session.sessionId).state, "failed");
+    assert.match(logs.join("\n"), /Queued steering delivery failed: synthetic backpressure/u);
+    assert.equal(engine.advance(session.sessionId, "retry safely").state, "running");
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
+  }
+});
+
+test("pre-launch cancellation outranks queued steering", async () => {
+  const source = await workspace("engine-cancel-before-launch");
+  const runner = new FakeRunner();
+  const engine = new VanguardEngine({ runner });
+  let root = "";
+  try {
+    const session = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = session.sessionRoot;
+    engine.advance(session.sessionId, "task");
+    engine.steer(session.sessionId, "must not reach a cancelled worker");
+    assert.equal(engine.cancel(session.sessionId).state, "cancelling");
+    await until(() => engine.status(session.sessionId).state === "cancelled");
+    assert.deepEqual(runner.runs.get(root)?.steering, []);
+    assert.equal(runner.runs.get(root)?.cancelled, true);
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
+  }
+});
+
+test("worker launch failure does not replay stale queued steering on retry", async () => {
+  const source = await workspace("engine-start-retry");
+  let starts = 0;
+  const delivered: string[] = [];
+  let finish!: (exit: { code: number | null; signal: NodeJS.Signals | null }) => void;
+  const runner: VanguardRunnerPort = {
+    start() {
+      starts += 1;
+      if (starts === 1) throw new Error("synthetic launch failure");
+      const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => { finish = resolve; });
+      return {
+        done,
+        steer: (message) => delivered.push(message),
+        cancel: () => finish({ code: null, signal: "SIGTERM" }),
+      };
+    },
+  };
+  const engine = new VanguardEngine({ runner });
+  let root = "";
+  try {
+    const session = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = session.sessionRoot;
+    engine.advance(session.sessionId, "first attempt");
+    engine.steer(session.sessionId, "stale guidance");
+    await until(() => engine.status(session.sessionId).state === "failed");
+    engine.advance(session.sessionId, "second attempt");
+    await until(() => starts === 2);
+    assert.deepEqual(delivered, []);
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
   }
 });
 

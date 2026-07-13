@@ -152,7 +152,8 @@ export class VanguardEngine {
       throw new VanguardEngineError("invalid_message", "Advance messages may not exceed 16,384 characters.");
     }
     const session = this.#requiredSession(sessionId);
-    if (session.state === "running" || session.state === "cancelling") {
+    if (session.handle !== undefined || session.startTimer !== undefined
+      || session.state === "running" || session.state === "cancelling") {
       throw new VanguardEngineError("session_busy", "The session already has an active advance.", true);
     }
     if (session.state === "completed") {
@@ -212,12 +213,13 @@ export class VanguardEngine {
   cancel(sessionId: string): VanguardSessionStatus {
     this.#assertOpen();
     const session = this.#requiredSession(sessionId);
-    if (session.state !== "running" && session.state !== "waiting_for_user" && session.state !== "cancelling") {
+    if (session.handle === undefined && session.startTimer === undefined
+      && session.state !== "running" && session.state !== "waiting_for_user" && session.state !== "cancelling") {
       throw new VanguardEngineError("session_not_running", "Cancellation requires an active session.", true);
     }
     session.cancelRequested = true;
     session.state = "cancelling";
-    session.handle?.cancel();
+    if (session.handle !== undefined) this.#cancelWorker(session, "Cancellation delivery failed");
     return this.#status(session);
   }
 
@@ -263,7 +265,7 @@ export class VanguardEngine {
       }
       if (session.handle !== undefined) {
         session.cancelRequested = true;
-        session.handle.cancel();
+        this.#cancelWorker(session, "Shutdown cancellation failed");
         completions.push(session.handle.done);
       }
     }
@@ -286,12 +288,12 @@ export class VanguardEngine {
       });
     } catch (error) {
       session.state = "failed";
+      session.pendingSteering.length = 0;
+      session.steeringBytesThisAdvance = 0;
       this.#logger(`Worker start failed: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
     session.handle = handle;
-    for (const steering of session.pendingSteering.splice(0)) handle.steer(steering);
-    if (session.cancelRequested) handle.cancel();
     void handle.done.then(async (exit) => {
       session.handle = undefined;
       try {
@@ -309,6 +311,33 @@ export class VanguardEngine {
       session.state = session.cancelRequested ? "cancelled" : "failed";
       this.#logger(`Worker completion failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+    if (session.cancelRequested) {
+      // Cancellation outranks any guidance queued before the deferred launch.
+      session.pendingSteering.length = 0;
+      this.#cancelWorker(session, "Cancellation delivery failed");
+      return;
+    }
+    try {
+      for (const steering of session.pendingSteering.splice(0)) handle.steer(steering);
+    } catch (error) {
+      // Steering can be queued between advance() and the deferred worker
+      // launch. A runner-side backpressure failure must not escape the
+      // setImmediate callback or leave a live worker eligible for overlap.
+      session.state = "failed";
+      this.#logger(`Queued steering delivery failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.#cancelWorker(session, "Worker cleanup after steering failure failed");
+      return;
+    }
+  }
+
+  #cancelWorker(session: ManagedSession, context: string): void {
+    try {
+      session.handle?.cancel();
+    } catch (error) {
+      // Runner ports are host-provided code. Their control callbacks cannot
+      // be allowed to tear down the engine or its protocol server.
+      this.#logger(`${context}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   #record(session: ManagedSession, event: PublicRunEvent, notify: boolean): void {
@@ -322,6 +351,12 @@ export class VanguardEngine {
     session.events.push(envelope);
     while (session.events.length > this.#maxReplayEvents) session.events.shift();
     session.replayFloorCursor = session.events[0]?.cursor ?? session.nextCursor;
+    if (sanitized.type === "session.ready" && sanitized.materialized === true) {
+      // The worker materializes after the conversation contract is journaled.
+      // Reflect that transition while the long-running advance is still live,
+      // rather than waiting for process exit to reopen session metadata.
+      session.session = { ...session.session, materialized: true };
+    }
     if (sanitized.type === "run.waiting_for_user") session.state = "waiting_for_user";
     else if (sanitized.type === "run.completed") session.state = "completed";
     else if (sanitized.type === "run.failed") session.state = "failed";

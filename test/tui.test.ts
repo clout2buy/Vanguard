@@ -1,6 +1,17 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { renderTuiPreviewForTest, renderWelcomeForTest } from "../src/tui.js";
+
+test("terminal product flow has one engine-backed execution path", async () => {
+  const compiled = await readFile(new URL("../src/tui.js", import.meta.url), "utf8");
+  assert.match(compiled, /new VanguardEngine\(/u);
+  assert.match(compiled, /engine\.advance\(/u);
+  assert.doesNotMatch(compiled, /function (?:startAgent|consumeChild|consumeLine)\b/u);
+  assert.doesNotMatch(compiled, /PUBLIC_EVENT_PREFIX/u);
+  assert.match(compiled, /process\.env\[credentialName\] = loadCredential\(config\.provider\)/u);
+  assert.match(compiled, /delete process\.env\[credentialName\]/u);
+});
 
 test("default terminal launch opens a single conversational prompt", () => {
   const welcome = renderWelcomeForTest().replace(/\x1b\[[0-9;]*m/g, "");

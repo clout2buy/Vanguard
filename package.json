@@ -21,6 +21,8 @@
     "docs/ENGINE_PROTOCOL.md",
     "docs/PORTABILITY.md",
     "docs/PROVIDERS.md",
+    "docs/EXTENSIONS.md",
+    "docs/THREAT_MODEL.md",
     "docs/ARES_INTEGRATION.md",
     "docs/THREAT_MODEL.md",
     "examples",
