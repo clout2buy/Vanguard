@@ -28,4 +28,5 @@ export * from "./runtime/publicRunEvents.js";
 export * from "./runtime/reviewChangesTool.js";
 export * from "./runtime/session.js";
 export * from "./runtime/workspace.js";
+export * from "./evaluation/certification.js";
 export * from "./runtime/versionLedger.js";

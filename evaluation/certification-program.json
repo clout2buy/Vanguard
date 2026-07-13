@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "status": "awaiting-external-holdout-freeze",
+  "program": "Vanguard Elite Engine Certification 1",
+  "observedAt": "2026-07-13T00:00:00-04:00",
+  "plannedPairedTasks": 192,
+  "plannedRepetitions": 3,
+  "plannedRuns": 2304,
+  "engines": [
+    {
+      "id": "vanguard",
+      "version": "freeze from candidate commit",
+      "command": "vanguard",
+      "modelPolicy": "same provider/model and budget as each paired baseline"
+    },
+    {
+      "id": "claude-code",
+      "version": "2.1.204",
+      "command": "claude"
+    },
+    {
+      "id": "codex",
+      "version": "codex-cli 0.130.0",
+      "command": "codex"
+    },
+    {
+      "id": "opencode",
+      "version": "1.1.65",
+      "command": "opencode"
+    }
+  ],
+  "thresholds": {
+    "parityOverallLowerBound": -0.03,
+    "parityCategoryLowerBound": -0.05,
+    "superiorityOverallLowerBound": 0.05,
+    "maintainabilityLowerBound": -0.03,
+    "maxCostRatio": 1.25,
+    "maxInterventionDelta": 0,
+    "confidence": 0.95
+  },
+  "externalRequirements": [
+    "An evaluator independent of Vanguard implementation",
+    "A never-run holdout bundle with frozen source and grader SHA-256 digests",
+    "Fresh competitor sessions with pinned CLI versions and identical task/model/budget policy",
+    "Provider cost assumptions or complete normalized usage for every run",
+    "Human maintainability scoring performed while engine aliases remain blinded"
+  ]
+}

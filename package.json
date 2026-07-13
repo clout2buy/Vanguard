@@ -11,7 +11,8 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node --test dist/test/**/*.test.js",
-    "vanguard": "npm run build && node dist/src/cli.js"
+    "vanguard": "npm run build && node dist/src/cli.js",
+    "certify": "npm run build && node dist/src/evaluation/certificationCli.js"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
