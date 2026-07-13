@@ -6,6 +6,8 @@ import { createInterface } from "node:readline/promises";
 import type { CommandSpec } from "./runtime/projectVerification.js";
 import { detectProjectVerification } from "./runtime/projectVerification.js";
 import { PUBLIC_EVENT_PREFIX, type PublicRunEvent } from "./runtime/publicRunEvents.js";
+import { VanguardEngine } from "./engine/vanguardEngine.js";
+import type { VanguardEngineEvent, VanguardSessionStatus } from "./engine/types.js";
 
 type Provider = "deepseek" | "openai" | "anthropic";
 type Phase = "starting" | "running" | "verifying" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -68,6 +70,8 @@ interface UiState {
   composer: string;
   /** Model text streaming in before the decision lands. */
   liveDelta: string;
+  /** Engine-derived turn outcome; never inferred from child stdout. */
+  outcome?: TurnOutcome;
 }
 
 interface TurnOutcome {
@@ -93,11 +97,13 @@ const spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", 
 export async function runTui(startDirectory: string): Promise<void> {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error("The Vanguard TUI requires an interactive terminal.");
   const config = await resolveConfiguration(startDirectory);
-  const credential = loadCredential(config.provider);
-  const credentialName = credentialVariable(config.provider);
+  // Validate credential presence once. The embedded engine's worker inherits
+  // the environment; credential values never enter its public event surface.
+  loadCredential(config.provider);
+  const engine = new VanguardEngine({ logger: () => {} });
 
   process.stdout.write(`\x1b[2J\x1b[H${renderWelcome(config.workspace, config.model)}`);
-  let sessionRoot: string | undefined;
+  let sessionId: string | undefined;
   let contracted = false;
 
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
@@ -113,9 +119,24 @@ export async function runTui(startDirectory: string): Promise<void> {
         continue;
       }
       prompt.pause();
-      const turn = await runTurn(input, config, credentialName, credential, sessionRoot, contracted);
+      if (sessionId === undefined) {
+        const created = await engine.create({
+          workspace: config.workspace,
+          provider: config.provider,
+          model: config.model,
+          verification: config.verification,
+          adaptiveVerification: config.adaptiveVerification,
+          maxSteps: config.maxSteps,
+          maxDurationMs: 7_200_000,
+          commandTimeoutMs: 1_800_000,
+          maxContextBytes: 300_000,
+          maxFailedVerificationAttempts: 3,
+          verifierEvidence: "summary",
+        });
+        sessionId = created.sessionId;
+      }
+      const turn = await runEngineTurn(engine, sessionId, input, config, contracted);
       prompt.resume();
-      sessionRoot = turn.sessionRoot ?? sessionRoot;
       contracted = turn.contracted;
 
       if (turn.outcome?.status === "responded") {
@@ -128,7 +149,7 @@ export async function runTui(startDirectory: string): Promise<void> {
       }
       if (turn.outcome?.status === "completed") {
         // A finished contract closes the session; the next message starts fresh.
-        sessionRoot = undefined;
+        sessionId = undefined;
         contracted = false;
         continue;
       }
@@ -139,6 +160,7 @@ export async function runTui(startDirectory: string): Promise<void> {
     }
   } finally {
     prompt.close();
+    await engine.shutdown();
   }
 }
 
@@ -146,6 +168,169 @@ interface TurnResult {
   readonly outcome: TurnOutcome | undefined;
   readonly sessionRoot: string | undefined;
   readonly contracted: boolean;
+}
+
+/**
+ * Product TUI adapter over the public engine contract. Session ownership,
+ * steering, cancellation, replay ordering, and event sanitization therefore
+ * have one implementation for the TUI, stdio clients, and embedders.
+ */
+async function runEngineTurn(
+  engine: VanguardEngine,
+  sessionId: string,
+  message: string,
+  config: TuiConfig,
+  alreadyContracted: boolean,
+): Promise<TurnResult> {
+  const status = engine.status(sessionId);
+  const state: UiState = {
+    phase: alreadyContracted ? "running" : "starting",
+    startedAt: Date.now(),
+    frame: 0,
+    quietDetail: alreadyContracted ? "Continuing contracted execution" : "Understanding your request",
+    task: message,
+    agents: new Map([["main", { id: "main", turn: 0, action: alreadyContracted ? "resuming" : "listening", status: "active" }]]),
+    activity: [],
+    chat: [{ agentId: "you", message }],
+    verifiers: new Map(),
+    session: sessionState(status),
+    contracted: alreadyContracted,
+    screenActive: false,
+    conversationMessages: [],
+    composer: "",
+    liveDelta: "",
+  };
+
+  let cancelled = false;
+  const sendSteering = (): void => {
+    const text = state.composer.trim();
+    state.composer = "";
+    if (text.length === 0) return;
+    try {
+      engine.steer(sessionId, text);
+      state.chat.push({ agentId: "you", message: text });
+      trimTo(state.chat, 30);
+      state.quietDetail = "Steering delivered; it lands at the next decision boundary";
+    } catch (error) {
+      state.quietDetail = bounded(error instanceof Error ? error.message : String(error), 180);
+    }
+  };
+  const cancel = (): void => {
+    if (cancelled || state.phase === "completed" || state.phase === "failed" || state.phase === "cancelled") return;
+    cancelled = true;
+    state.phase = "cancelling";
+    state.quietDetail = "Stopping after the current process boundary";
+    try { engine.cancel(sessionId); } catch { /* already stopped */ }
+  };
+  const onKeypress = (text: string | undefined, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
+    if (key.ctrl === true && key.name === "c") { cancel(); return; }
+    if (key.ctrl === true || key.meta === true) return;
+    if (key.name === "return" || key.name === "enter") { sendSteering(); return; }
+    if (key.name === "backspace") { state.composer = state.composer.slice(0, -1); return; }
+    if (key.name === "escape") { state.composer = ""; return; }
+    if (typeof text === "string" && text.length === 1 && text.charCodeAt(0) >= 32 && state.composer.length < 500) {
+      state.composer += text;
+    }
+  };
+  const onSigint = (): void => cancel();
+  process.on("SIGINT", onSigint);
+
+  const enterExecutionScreen = (): void => {
+    if (state.screenActive) return;
+    state.screenActive = true;
+    emitKeypressEvents(process.stdin);
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on("keypress", onKeypress);
+    enterScreen();
+  };
+  const leaveExecutionScreen = (): void => {
+    if (!state.screenActive) return;
+    state.screenActive = false;
+    process.stdin.off("keypress", onKeypress);
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
+    leaveScreen();
+  };
+  if (alreadyContracted) enterExecutionScreen();
+  else process.stdout.write(`${ansi.dim}…${ansi.reset}\n`);
+
+  const unsubscribe = engine.subscribe((envelope: VanguardEngineEvent) => {
+    if (envelope.sessionId !== sessionId) return;
+    consumeEvent(envelope.event, state, enterExecutionScreen);
+  });
+  const animation = setInterval(() => {
+    state.frame += 1;
+    if (state.screenActive) render(state, config);
+    if (!state.contracted && state.phase === "starting") state.phase = "running";
+  }, 120);
+  animation.unref();
+
+  try {
+    engine.advance(sessionId, message);
+    let finalStatus = engine.status(sessionId);
+    while (finalStatus.state === "running" || finalStatus.state === "cancelling") {
+      await delay(40);
+      finalStatus = engine.status(sessionId);
+    }
+    const outcome = state.outcome ?? outcomeFromEngineState(finalStatus, state);
+    state.outcome = outcome;
+    state.finalResult = { outcome };
+    if (state.screenActive) {
+      if (cancelled || finalStatus.state === "cancelled") {
+        state.phase = "cancelled";
+        state.quietDetail = "Run interrupted; send another message to resume this session";
+      } else if (outcome.status === "completed") {
+        state.phase = "completed";
+        state.quietDetail = "Independent verification accepted the result";
+        const main = state.agents.get("main");
+        if (main !== undefined) main.status = "done";
+      } else if (outcome.status === "waiting_for_user") {
+        state.phase = "running";
+        state.quietDetail = "Vanguard is waiting for your answer";
+      } else if (outcome.status === "failed") {
+        state.phase = "failed";
+        state.quietDetail = state.error ?? "Run stopped before verified completion";
+      }
+      render(state, config);
+      await delay(250);
+    }
+  } finally {
+    clearInterval(animation);
+    unsubscribe();
+    process.removeListener("SIGINT", onSigint);
+    leaveExecutionScreen();
+  }
+
+  const outcome = state.outcome;
+  if (state.contracted || outcome?.status === "completed") await printHandoff(state, config, cancelled);
+  else if (outcome?.status === "responded" && outcome.message !== undefined
+    && !state.conversationMessages.includes(outcome.message)) {
+    process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${outcome.message}\n\n`);
+  }
+  return {
+    outcome: cancelled ? { status: "failed" } : outcome,
+    sessionRoot: status.sessionRoot,
+    contracted: state.contracted,
+  };
+}
+
+function sessionState(status: VanguardSessionStatus): SessionState {
+  return {
+    sessionId: status.sessionId,
+    sessionRoot: status.sessionRoot,
+    workspaceRoot: status.workspaceRoot,
+    journalFile: path.join(status.sessionRoot, "run.jsonl"),
+    scorecardFile: path.join(status.sessionRoot, "scorecard.json"),
+  };
+}
+
+function outcomeFromEngineState(status: VanguardSessionStatus, state: UiState): TurnOutcome {
+  if (status.state === "completed") return { status: "completed" };
+  if (status.state === "waiting_for_user") return state.outcome ?? { status: "waiting_for_user" };
+  if (status.state === "failed" || status.state === "cancelled") return { status: "failed" };
+  const message = state.conversationMessages.at(-1);
+  return { status: "responded", ...(message === undefined ? {} : { message }) };
 }
 
 async function runTurn(
@@ -444,6 +629,7 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
       // During conversation observation, surface narration inline as it streams.
       state.conversationMessages.push(event.message);
       process.stdout.write(`\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${event.message}\n\n`);
+      state.outcome = { status: "responded", message: event.message };
     }
   }
   if (event.type === "tool.started") {
@@ -463,8 +649,10 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     state.phase = event.status === "failed" ? "running" : "verifying";
   } else if (event.type === "run.completed") {
     agent.status = "done";
+    state.outcome = { status: "completed" };
   } else if (event.type === "run.failed") {
     agent.status = "failed";
+    state.outcome = { status: "failed" };
   } else if (event.type === "run.waiting_for_user") {
     agent.status = "idle";
     state.quietDetail = "Vanguard asked you a question — type your answer and press Enter";
@@ -472,6 +660,10 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
       state.chat.push({ agentId: event.agentId, message: event.message });
       trimTo(state.chat, 30);
     }
+    state.outcome = {
+      status: "waiting_for_user",
+      ...(event.message === undefined ? {} : { question: event.message }),
+    };
   }
   if (event.type !== "agent.message" && event.type !== "session.ready" && event.type !== "context.compacted"
     && event.type !== "run.contracted" && event.type !== "run.waiting_for_user") {

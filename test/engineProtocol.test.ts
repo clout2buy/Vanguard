@@ -179,6 +179,37 @@ test("resume reconstructs deterministic public replay from the hash-chained jour
   }
 });
 
+test("resume honors a session journal genesis and reopens restored terminal sessions", async () => {
+  const source = await workspace("engine-branched-resume");
+  const bootstrap = new VanguardEngine({ runner: new FakeRunner() });
+  let root = "";
+  try {
+    const created = await bootstrap.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = created.sessionRoot;
+    const genesisHash = "a".repeat(64);
+    const metadataFile = path.join(root, "session.json");
+    const metadata = JSON.parse(await readFile(metadataFile, "utf8")) as Record<string, unknown>;
+    await writeFile(metadataFile, JSON.stringify({ ...metadata, journalGenesisHash: genesisHash }, null, 2), "utf8");
+    const journal = await FileJournal.open(path.join(root, "run.jsonl"), { genesisHash });
+    await journal.append({ sequence: 1, type: "run.completed", data: { answer: "old branch result" } });
+    await journal.append({ sequence: 2, type: "session.restored", data: { checkpointId: "checkpoint-test" } });
+    await bootstrap.shutdown();
+
+    const restarted = new VanguardEngine({ runner: new FakeRunner() });
+    try {
+      const resumed = await restarted.resume(root);
+      assert.equal(resumed.state, "idle");
+      assert.equal(resumed.latestCursor, 1);
+      assert.equal(restarted.events(resumed.sessionId).events[0]?.event.type, "run.completed");
+    } finally {
+      await restarted.shutdown();
+    }
+  } finally {
+    await bootstrap.shutdown();
+    await cleanup([root, source]);
+  }
+});
+
 test("an explicit sealed verifier is not exposed as the model-callable public check", async () => {
   const source = await workspace("engine-sealed-verifier");
   const engine = new VanguardEngine({ runner: new FakeRunner() });

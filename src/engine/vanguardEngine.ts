@@ -122,7 +122,9 @@ export class VanguardEngine {
     this.#assertSessionCapacity();
     await validateStoredConfiguration(path.join(path.dirname(session.workspaceRoot), "run-config.json"));
     const managed = this.#newManagedSession(session, path.dirname(session.workspaceRoot), "idle");
-    const journal = await FileJournal.open(path.join(managed.root, "run.jsonl"));
+    const journal = await FileJournal.open(path.join(managed.root, "run.jsonl"), {
+      ...(session.journalGenesisHash === undefined ? {} : { genesisHash: session.journalGenesisHash }),
+    });
     const presenter = new PublicRunEventPresenter();
     const journalEvents = await journal.readValidated();
     for (const event of journalEvents) {
@@ -478,7 +480,8 @@ function restoredState(events: readonly { type: string }[]): VanguardSessionStat
     if (event.type === "run.waiting_for_user") state = "waiting_for_user";
     else if (event.type === "run.completed") state = "completed";
     else if (event.type === "run.failed") state = "failed";
-    else if (event.type === "user.message" || event.type === "run.resumed") state = "idle";
+    else if (event.type === "user.message" || event.type === "run.resumed"
+      || event.type === "session.restored" || event.type === "session.forked") state = "idle";
   }
   return state;
 }
