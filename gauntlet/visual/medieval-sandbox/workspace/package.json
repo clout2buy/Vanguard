@@ -1,0 +1,7 @@
+{
+  "name": "vanguard-medieval-sandbox-benchmark",
+  "private": true,
+  "scripts": {
+    "test": "node tools/check.mjs"
+  }
+}
