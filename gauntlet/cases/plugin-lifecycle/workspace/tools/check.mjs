@@ -25,4 +25,15 @@ rollback.register({ name: "c", requires: ["b"], start: async () => { rollbackEve
 await assert.rejects(() => rollback.startAll(), (error) => error === original);
 assert.deepEqual(rollbackEvents, ["start:a", "start:b", "start:c", "stop:b", "stop:a"]);
 assert.deepEqual({ ...rollback.status() }, { a: "registered", b: "registered", c: "registered" });
+
+const unusual = new PluginRegistry();
+unusual.register({ name: "__proto__", start: async () => {}, stop: async () => {} });
+assert.equal(Object.hasOwn(unusual.status(), "__proto__"), true);
+assert.equal(unusual.status().__proto__, "registered");
+
+const cleanupEvents = []; const cleanup = new PluginRegistry();
+cleanup.register({ name: "a", start: async () => {}, stop: async () => { cleanupEvents.push("a"); throw new Error("stop-a"); } });
+cleanup.register({ name: "b", start: async () => {}, stop: async () => cleanupEvents.push("b") });
+await cleanup.startAll(); await assert.rejects(() => cleanup.stopAll(), /stop|cleanup|aggregate/i);
+assert.deepEqual(cleanupEvents, ["b", "a"]); assert.deepEqual({ ...cleanup.status() }, { a: "registered", b: "registered" });
 console.log("plugin-lifecycle: public checks passed");

@@ -1,6 +1,6 @@
 {
   "id": "plugin-lifecycle",
-  "version": 6,
+  "version": 7,
   "track": "multi-file",
   "workspace": "workspace",
   "task": "TASK.md",
@@ -9,5 +9,6 @@
   "rawProcess": false,
   "protected": ["package.json", "tools/check.mjs"],
   "editableRoots": ["src/registry.mjs"],
-  "maxSteps": 140
+  "maxSteps": 140,
+  "maxDurationMs": 7200000
 }
