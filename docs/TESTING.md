@@ -45,7 +45,11 @@ After running `scripts\install-cli.ps1` once, `vanguard` opens the terminal UI f
 
 During a run, the UI shows a compact conversation, active tool calls, tool outcomes, liveness, context compaction, and verifier decisions. Private reasoning, source-file contents, provider credentials, and sealed verifier evidence are never copied into the public UI stream. Press `Ctrl+C` to interrupt. Once the session has been created, an interrupted run prints a durable `vanguard resume --session ...` command.
 
-The agent-stream layout supports multiple agent identifiers, but the current kernel launches one `main` agent. Child-agent execution will populate additional lanes only after delegation is implemented and verified; the UI does not simulate sub-agents.
+The `main` agent may launch real bounded child coding sessions during contracted
+execution. Their sanitized public events use durable `agent-...` identifiers,
+so the UI displays genuine child lanes rather than simulated activity. A child
+patch reaches the parent only through an explicit exact-hash transactional
+merge; see `docs/DELEGATION.md`.
 
 ## Run a long project
 

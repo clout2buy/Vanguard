@@ -38,6 +38,8 @@ container or VM isolation. See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 3. Failures are classified before action: only safe, idempotent transient operations retry; mutations and completion verifiers never do, and repeated deterministic failures trip a replan-oriented circuit breaker.
 4. A final answer is provisional until independent verifiers accept it.
 5. Model providers, tools, context policy, and verification are replaceable ports—not hard-coded product assumptions.
+6. Delegated agents work in independent disposable sessions; only an explicit,
+   exact-hash transactional merge can change the disposable parent workspace.
 
 ## Development
 
@@ -86,6 +88,9 @@ checkpoint confirmation; fork preserves the selected journal prefix and its
 hash-chain branch point. These commands emit JSON for TUI and engine clients.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design boundary and [`gauntlet/README.md`](gauntlet/README.md) for evaluation rules.
+
+Real bounded child-agent execution and its merge boundary are documented in
+[`docs/DELEGATION.md`](docs/DELEGATION.md).
 
 Vanguard's vendor and clean-room guarantees are defined in [`docs/INDEPENDENCE.md`](docs/INDEPENDENCE.md).
 

@@ -1,5 +1,6 @@
 import type {
   ContextPolicyPort,
+  CompletionGatePort,
   JournalPort,
   JsonValue,
   KernelMode,
@@ -102,6 +103,8 @@ export interface KernelDependencies {
   readonly userChannel?: UserChannelPort;
   /** Read-only view of the runtime-owned plan; activates the plan gates. */
   readonly plan?: PlanStatusPort;
+  /** Runtime-owned asynchronous work that must settle before completion. */
+  readonly completionGates?: readonly CompletionGatePort[];
   /** Durable retry budgets and an injectable clock for deterministic tests. */
   readonly recovery?: RecoveryConfiguration;
   readonly options?: Partial<RunOptions>;
@@ -176,6 +179,7 @@ export class AgentKernel {
   readonly #taskAddendum: string | undefined;
   readonly #userChannel: UserChannelPort | undefined;
   readonly #plan: PlanStatusPort | undefined;
+  readonly #completionGates: readonly CompletionGatePort[];
   readonly #recoveryConfiguration: RecoveryConfiguration;
   readonly #options: RunOptions;
   #sequence = 0;
@@ -190,6 +194,7 @@ export class AgentKernel {
     this.#taskAddendum = dependencies.taskAddendum;
     this.#userChannel = dependencies.userChannel;
     this.#plan = dependencies.plan;
+    this.#completionGates = [...(dependencies.completionGates ?? [])];
     this.#recoveryConfiguration = dependencies.recovery ?? {};
     this.#hasPlanTool = dependencies.tools.some((tool) => tool.name === PLAN_TOOL_NAME) && dependencies.plan !== undefined;
     this.#hasReviewTool = dependencies.tools.some((tool) => tool.definition.effect === "review");
@@ -497,7 +502,8 @@ export class AgentKernel {
 
       if (decision.kind === "complete") {
         const unprovenMilestones = this.#hasPlanTool ? this.#plan!.unproven() : [];
-        if (mutationNeedsExecutionEvidence || mutationNeedsReview || unprovenMilestones.length > 0) {
+        const runtimeBlockers = this.#completionGates.flatMap((gate) => gate.blockers());
+        if (mutationNeedsExecutionEvidence || mutationNeedsReview || unprovenMilestones.length > 0 || runtimeBlockers.length > 0) {
           const missing = [
             mutationNeedsExecutionEvidence ? "a successful executable check" : undefined,
             mutationNeedsReview ? "workspace.changes review" : undefined,
@@ -506,6 +512,8 @@ export class AgentKernel {
             missing.length === 0 ? undefined : `Complete ${missing} after the latest workspace mutation before completing.`,
             unprovenMilestones.length === 0 ? undefined
               : `These plan milestones remain unproven: ${unprovenMilestones.join("; ")}. Prove each with evidence references via plan.update, or invalidate it with a reason, before completing.`,
+            runtimeBlockers.length === 0 ? undefined
+              : `Runtime work is still active: ${runtimeBlockers.join("; ")}. Wait for or cancel it before completing.`,
           ].filter((item) => item !== undefined);
           const policyMessage = parts.join(" ");
           const failure = classifyFailure(policyMessage, { source: "policy" });

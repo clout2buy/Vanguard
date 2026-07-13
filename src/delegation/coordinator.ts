@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { PublicRunEvent } from "../runtime/publicRunEvents.js";
-import { sanitizePublicEvent } from "../engine/security.js";
+import { createSecretRedactor, sanitizePublicEvent } from "../engine/security.js";
 
 export type DelegateState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted" | "merged";
 
@@ -238,20 +238,25 @@ export class DelegationCoordinator {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    for (const [id, handle] of this.#handles) {
-      handle.cancel();
-      const record = this.#records.get(id);
-      if (record !== undefined && !terminal(record.state)) {
+    for (const handle of this.#handles.values()) handle.cancel();
+    for (const [id, record] of this.#records) {
+      if (!terminal(record.state)) {
         this.#records.set(id, {
           ...record,
           state: "interrupted",
           completedAt: new Date().toISOString(),
           error: "Parent runtime closed before the child completed.",
         });
+        this.#notify(id);
       }
-      this.#notify(id);
     }
-    await Promise.allSettled([...this.#settlements.values()]);
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 5_000);
+      void Promise.allSettled([...this.#settlements.values()]).then(() => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
     await this.#persist();
   }
 
@@ -336,15 +341,16 @@ export class DelegationCoordinator {
         : result.status === "cancelled" ? "cancelled" : "failed";
       const error = state === "completed" ? undefined
         : result.error ?? (result.status === "completed" ? "Child completed without a reviewed patch." : `Child ${result.status}.`);
+      const redact = createSecretRedactor();
       this.#records.set(id, {
         ...current,
         state,
         completedAt: new Date().toISOString(),
         ...(result.sessionRoot === undefined ? {} : { sessionRoot: result.sessionRoot }),
-        ...(result.answer === undefined ? {} : { answer: bounded(result.answer, 8_000) }),
+        ...(result.answer === undefined ? {} : { answer: bounded(redact(result.answer), 8_000) }),
         ...(result.steps === undefined ? {} : { steps: result.steps }),
         ...(result.review === undefined ? {} : { review: validateReview(result.review) }),
-        ...(error === undefined ? {} : { error: bounded(error, 2_000) }),
+        ...(error === undefined ? {} : { error: bounded(redact(error), 2_000) }),
       });
     }
     await this.#persist();

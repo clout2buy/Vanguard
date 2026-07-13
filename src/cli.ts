@@ -65,6 +65,10 @@ import {
   type CodingSession,
   type SecurityProfile,
   type StreamObserver,
+  DelegationCoordinator,
+  CliDelegateRunner,
+  TransactionalDelegateMerger,
+  createDelegationTools,
 } from "./index.js";
 
 interface CliOptions {
@@ -222,13 +226,18 @@ async function runCommand(resuming: boolean, args: readonly string[]): Promise<v
   const runtime = await buildExecutionRuntime(session, options, fileJournal, false);
   const startedAt = Date.now();
   const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${runtime.mutationPolicyDescription}`;
-  const outcome = await runWithBudgets(options, runtime.journalActivity, new AbortController(), (signal) =>
-    runtime.kernel.run(runtimeTask, signal, priorEvents));
-  await writeScorecard({
-    session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
-    startedAt, resumed: resuming, usage: runtime.usage,
-  });
-  if (outcome.status !== "completed") process.exitCode = 1;
+  try {
+    const outcome = await runWithBudgets(options, runtime.journalActivity, new AbortController(), (signal) =>
+      runtime.kernel.run(runtimeTask, signal, priorEvents));
+    await writeScorecard({
+      session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
+      startedAt, resumed: resuming, usage: runtime.usage,
+      delegation: runtime.delegationSnapshot?.(),
+    });
+    if (outcome.status !== "completed") process.exitCode = 1;
+  } finally {
+    await runtime.dispose?.();
+  }
 }
 
 async function advanceCommand(args: readonly string[]): Promise<void> {
@@ -273,6 +282,7 @@ async function advanceSession(
   const userChannel = process.env.VANGUARD_CONTROL_STREAM === "1"
     ? new StdinUserChannel(() => controller.abort())
     : undefined;
+  let disposeRuntime: (() => Promise<void>) | undefined;
 
   try {
     if (!contracted) {
@@ -308,18 +318,21 @@ async function advanceSession(
     }
 
     const runtime = await buildExecutionRuntime(session, options, fileJournal, true, userChannel);
+    disposeRuntime = runtime.dispose;
     const outcome = await runWithBudgets(options, runtime.journalActivity, controller, (signal) =>
       runtime.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
     if (outcome.status === "completed" || outcome.status === "failed") {
       await writeScorecard({
         session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
         startedAt, resumed: true, usage: runtime.usage,
+        delegation: runtime.delegationSnapshot?.(),
       });
     } else {
       printAdvanceOutcome(outcome, session, container, journalFile);
     }
     if (outcome.status === "failed") process.exitCode = 1;
   } finally {
+    await disposeRuntime?.();
     // Release stdin so the process exits; a referenced reader would keep the
     // event loop alive after the advance finishes.
     userChannel?.close();
@@ -331,6 +344,8 @@ interface ExecutionRuntime {
   readonly mutationPolicyDescription: string;
   readonly journalActivity: () => number;
   readonly usage?: UsageLedger;
+  readonly dispose?: () => Promise<void>;
+  readonly delegationSnapshot?: () => JsonValue;
 }
 
 /** Merges the public-event stream presenter with usage accounting. */
@@ -460,11 +475,45 @@ async function buildExecutionRuntime(
     },
   );
   const usage = new UsageLedger(options.model);
+  const delegationDepth = boundedEnvironmentInteger("VANGUARD_DELEGATION_DEPTH", 0, 0, 16);
+  const delegationMaxDepth = boundedEnvironmentInteger("VANGUARD_DELEGATION_MAX_DEPTH", 1, 0, 4);
+  const delegation = await DelegationCoordinator.open({
+    storeFile: path.join(container, "delegations.json"),
+    parentWorkspace: session.workspaceRoot,
+    runner: new CliDelegateRunner({
+      provider: options.provider,
+      model: options.model,
+      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+      verification: options.verification,
+      ...(options.publicCheck === undefined ? {} : { publicCheck: options.publicCheck }),
+      protectedPaths: options.protectedPaths,
+      verifierEvidence: options.verifierEvidence,
+      maxDurationMs: Math.min(options.maxDurationMs, 30 * 60 * 1_000),
+      commandTimeoutMs,
+      maxContextBytes: options.maxContextBytes,
+      maxFailedVerificationAttempts: options.maxFailedVerificationAttempts,
+    }),
+    merger: new TransactionalDelegateMerger(session.workspaceRoot),
+    depth: delegationDepth,
+    maxDepth: delegationMaxDepth,
+    maxConcurrent: boundedEnvironmentInteger("VANGUARD_DELEGATION_CONCURRENCY", 2, 1, 8),
+    maxChildren: boundedEnvironmentInteger("VANGUARD_DELEGATION_MAX_CHILDREN", 6, 1, 16),
+    maxChildSteps: Math.min(options.maxSteps, 80),
+    maxTotalSteps: Math.max(Math.min(options.maxSteps * 2, 240), Math.min(options.maxSteps, 80)),
+    onEvent: streamPublicEvent,
+  });
+  // A private sealed verifier must never become indirectly model-callable in
+  // a child. Delegation is offered only when the parent has a distinct trusted
+  // public check the child can use for post-mutation execution evidence.
+  const delegationTools = delegationDepth < delegationMaxDepth && options.publicCheck !== undefined
+    ? createDelegationTools(delegation)
+    : [];
   // Both durable states ride into every request as runtime-owned context.
   const workingState = {
     snapshot: () => ({
       checkpoint: checkpoint.snapshot(),
       plan: plan.snapshot(),
+      delegations: JSON.parse(JSON.stringify(delegation.snapshot())) as JsonValue,
       ...(options.extensions === undefined ? {} : { extensions: options.extensions }),
     }),
   };
@@ -487,6 +536,7 @@ async function buildExecutionRuntime(
       new SyntaxCheckTool(new PostEditSyntaxChecker(new SyntaxCommandRunner(), workspace)),
       new CheckpointTool(checkpoint),
       new PlanTool(plan, evidenceResolver),
+      ...delegationTools,
       ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
       ...(options.exposeRawProcess ? [processTool] : []),
     ],
@@ -494,6 +544,7 @@ async function buildExecutionRuntime(
     journal,
     workingState,
     plan,
+    completionGates: [{ blockers: () => delegation.completionBlockers() }],
     taskAddendum: taskAddendum(options, mutationPolicy),
     ...(userChannel === undefined ? {} : { userChannel }),
     options: {
@@ -504,7 +555,14 @@ async function buildExecutionRuntime(
       interactive,
     },
   });
-  return { kernel, mutationPolicyDescription: mutationPolicy.describe(), journalActivity, usage };
+  return {
+    kernel,
+    mutationPolicyDescription: mutationPolicy.describe(),
+    journalActivity,
+    usage,
+    delegationSnapshot: () => JSON.parse(JSON.stringify(delegation.snapshot())) as JsonValue,
+    dispose: () => delegation.close(),
+  };
 }
 
 function taskAddendum(options: CliOptions, mutationPolicy: WorkspaceMutationPolicy): string {
@@ -548,6 +606,7 @@ interface ScorecardContext {
   readonly startedAt: number;
   readonly resumed: boolean;
   readonly usage?: UsageLedger | undefined;
+  readonly delegation?: JsonValue | undefined;
 }
 
 async function writeScorecard(context: ScorecardContext): Promise<void> {
@@ -594,6 +653,7 @@ async function writeScorecard(context: ScorecardContext): Promise<void> {
     sessionFile: session.metadataFile,
     configurationFile: context.configurationFile,
     extensions: options.extensions ?? null,
+    delegation: context.delegation ?? null,
   };
   await writeFile(context.scorecardFile, JSON.stringify(scorecard, null, 2));
   process.stdout.write(`${JSON.stringify({ ...scorecard, scorecardFile: context.scorecardFile }, null, 2)}\n`);
@@ -894,6 +954,16 @@ function parseSecurityProfile(value: string): SecurityProfile {
 function parseEvidenceMode(value: string): "full" | "summary" {
   if (value === "full" || value === "summary") return value;
   throw new Error("--verifier-evidence must be full or summary.");
+}
+
+function boundedEnvironmentInteger(name: string, fallback: number, minimum: number, maximum: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.length === 0) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}.`);
+  }
+  return value;
 }
 
 function required(values: ReadonlyMap<string, string[]>, name: string): string {

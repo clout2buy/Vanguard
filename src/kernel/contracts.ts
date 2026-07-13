@@ -55,6 +55,17 @@ export interface PlanStatusPort {
   unproven(): readonly string[];
 }
 
+/**
+ * Runtime-owned work that must settle before a completion claim can be
+ * verified. This intentionally stays generic: delegation, background
+ * verification, or future durable jobs can all participate without teaching
+ * the kernel their domain-specific state machines.
+ */
+export interface CompletionGatePort {
+  /** Human-readable blockers. An empty list means the gate is open. */
+  blockers(): readonly string[];
+}
+
 export type ModelDecision =
   | { readonly kind: "respond"; readonly message: string; readonly continuation?: JsonValue }
   | { readonly kind: "ask_user"; readonly question: string; readonly continuation?: JsonValue }

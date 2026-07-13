@@ -146,6 +146,37 @@ superiority** — the evidence selects the language afterward.
   structural on missing toolchain (no false failure), and gives unknown types
   no gate.
 
+### Phase 7 — Real bounded delegation
+
+- **Intended KPI:** real parallel coding work without shared-workspace races,
+  unverifiable child claims, secret leakage, or implicit merges. Parent
+  completion must remain impossible while child work is active.
+- **Implemented:** durable bounded `DelegationCoordinator`; parent-owned
+  `delegate.start/status/wait/cancel/merge` tools; non-blocking concurrent
+  scheduling; genuine compiled `vanguard run` children with independent
+  sessions, journals, plans, scorecards, verification, scope restrictions,
+  step/depth/duration caps, and environment-only credential inheritance;
+  canonical scorecard/event validation; deterministic Phase-5 child reviews;
+  exact-hash transactional merges with drift/conflict refusal and crash-safe
+  idempotence; real child `agent-...` public lanes; delegation working-state
+  and scorecard snapshots; and a domain-neutral kernel completion-gate port.
+- **Durability:** every transition is atomically persisted. Parent restart
+  marks queued/running records interrupted; graceful shutdown cancels active
+  processes and marks queued work honestly. Children have no path to mutate
+  the parent until an exact reviewed hash is passed to `delegate.merge`.
+- **Adversarial proof:** fake-runner concurrency, queueing, cancellation,
+  aggregate/child/depth/scope budgets, restart interruption, queued+running
+  shutdown, secret redaction, wrong-hash refusal, completion-gate enforcement,
+  parent-drift refusal, and a compiled nested HTTP-provider run where a real
+  child edits/tests/reviews, streams under its own identity, is transactionally
+  merged, and leaves the original project untouched. The compiled proof also
+  confirms a depth-one child is not offered recursive delegation.
+- **Boundary:** this is execution infrastructure, not competitive
+  certification. Children currently inherit the parent's provider/model and
+  verifier. See `docs/DELEGATION.md`.
+- **Tests:** full rebased Windows suite: 235 cases, 234 passed, one intentional
+  POSIX-only mode-bit assertion skipped, zero failures.
+
 ### Phase 8 — Universal engine surface
 
 - **Intended KPI:** one stable engine contract usable by Vanguard's terminal,
