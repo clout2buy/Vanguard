@@ -18,8 +18,18 @@ superiority** — the evidence selects the language afterward.
   baseline recorded for all later diffs.
 - **Deliverables:** `docs/GATE_ZERO.md` (canary / sealed shadow /
   certification holdout), `scripts/run-canary.ps1` (phase-stamped canary
-  results with commit provenance), this report.
-- **Canary baseline:** see `gauntlet/results/canary-baseline-*.json`.
+  results with commit provenance), and the reproducibility boundary described
+  below.
+- **Reproducibility boundary:** explicit commit resolved once; exclusive
+  process lock; detached disposable worktree; isolated `npm ci` + build;
+  exact GUID-qualified aggregate output; start/end source, harness, and
+  artifact manifests; unconditional cleanup; invalidation on any drift.
+- **Automated proof:** a no-inference infrastructure probe builds a historical
+  detached commit and records its exact aggregate, while support tests prove
+  that lock contention plus simulated commit/artifact/harness drift are
+  rejected. Probe wrappers are deliberately not capability evidence.
+- **Canary baseline:** no valid baseline is currently claimed. A replacement
+  must be produced by the hardened runner from an explicitly pinned commit.
 - **Commits:** recorded below as they land.
 
 ### Phase 1 — Provisional-stream lifecycle
@@ -74,8 +84,9 @@ superiority** — the evidence selects the language afterward.
   post-Phase-2 canary runs after commit.
 - **Provenance caveat:** the baseline canary's `npm run build` may have raced
   early Phase 2 type-only edits in the working tree. Behaviorally it is the
-  Phase 1 engine (no plan tool was wired). Rule added going forward: canary
-  runs only from committed trees.
+  Phase 1 engine (no plan tool was wired), but it is not evidence. The later
+  Gate Zero hardening enforces detached pinned execution; no retroactive
+  baseline is inferred from this run.
 
 ### Phase 3 — Durable context architecture + usage/cost
 
@@ -138,12 +149,15 @@ superiority** — the evidence selects the language afterward.
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development
-  builds (`npm test` → `tsc`) rewrote `dist/` while the canary was mid-run,
-  so later cases executed Phase 2 code while earlier cases executed Phase 1
-  code. The run is retained for crash signal only. Remediation: clean
-  Phase 1 baseline re-run from a git worktree pinned at `d8c3e9f`; standing
-  rule added — canary runs execute from committed trees with no concurrent
-  builds. (Historical invalidations remain in `docs/LIVE_RESULTS.md`.)
+  builds (`npm test` → `tsc`) rewrote the shared `dist/` while the canary was
+  mid-run, so cases may have executed different engine builds. The run is
+  retained for crash signal only. The earlier report said the remediation
+  would be a pinned worktree, but the original script only documented that
+  rule—it did not enforce it. Gate Zero now enforces a detached pinned
+  worktree, isolated dependency install/build, explicit output path, lock,
+  and start/end manifests. No replacement baseline is claimed until a paid
+  run is actually completed through that boundary. (Historical invalidations
+  remain in `docs/LIVE_RESULTS.md`.)
 
 ## Unresolved risks (program level)
 

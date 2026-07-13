@@ -6,24 +6,50 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$Model,
 
-  [string[]]$CaseId = @()
+  [string[]]$CaseId = @(),
+
+  [string]$CaseIdJsonBase64 = "",
+
+  [string]$EngineRoot = "",
+
+  [string]$OutputPath = "",
+
+  [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
-$Root = Split-Path -Parent $PSScriptRoot
+$HarnessRoot = Split-Path -Parent $PSScriptRoot
+$Root = if ([string]::IsNullOrWhiteSpace($EngineRoot)) {
+  $HarnessRoot
+}
+else {
+  [IO.Path]::GetFullPath($EngineRoot)
+}
+if (-not [string]::IsNullOrWhiteSpace($CaseIdJsonBase64)) {
+  $DecodedCaseIds = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($CaseIdJsonBase64)) | ConvertFrom-Json
+  $CaseId = @($DecodedCaseIds | ForEach-Object { [string]$_ })
+}
 . (Join-Path $PSScriptRoot "credential.ps1")
-Import-VanguardCredential -Provider $Provider -Root $Root
+. (Join-Path $PSScriptRoot "canary-support.ps1")
+Import-VanguardCredential -Provider $Provider -Root $HarnessRoot
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
   $PSNativeCommandUseErrorActionPreference = $false
 }
 $CasesRoot = Join-Path $Root "gauntlet\cases"
-$ResultsRoot = Join-Path $Root "gauntlet\results"
+$ResultsRoot = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+  Join-Path $Root "gauntlet\results"
+}
+else {
+  Split-Path -Parent ([IO.Path]::GetFullPath($OutputPath))
+}
 New-Item -ItemType Directory -Force -Path $ResultsRoot | Out-Null
 
 Push-Location $Root
 try {
-  npm run build
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if (-not $SkipBuild) {
+    npm run build
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
 
   $Results = @()
   foreach ($CaseFile in Get-ChildItem -LiteralPath $CasesRoot -Filter case.json -Recurse | Sort-Object FullName) {
@@ -169,9 +195,17 @@ try {
     }
     cases = $Results
   }
-  $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-  $Output = Join-Path $ResultsRoot "gauntlet-$Stamp.json"
-  $Aggregate | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Output -Encoding UTF8
+  $Output = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+    $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+    Join-Path $ResultsRoot "gauntlet-$Stamp-$([guid]::NewGuid().ToString('N')).json"
+  }
+  else {
+    [IO.Path]::GetFullPath($OutputPath)
+  }
+  if (Test-Path -LiteralPath $Output) {
+    throw "Refusing to overwrite an existing aggregate scorecard: $Output"
+  }
+  Write-CanaryJson -InputObject $Aggregate -Path $Output -Depth 10
   $Aggregate | ConvertTo-Json -Depth 10
   Write-Host "Aggregate scorecard: $Output" -ForegroundColor Green
   if ($InfrastructureErrors -gt 0) { exit 2 }

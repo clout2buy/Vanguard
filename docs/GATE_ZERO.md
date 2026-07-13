@@ -14,10 +14,18 @@ eventually certify it. It uses three strictly separated layers.
 - **Results:** `gauntlet/results/canary-<phase>-<timestamp>.json`, summarized
   in `docs/MASTER_REPORT.md` with a before/after diff against the previous
   phase.
-- **Isolation rule:** canary runs execute from a committed tree and never
-  concurrently with development builds — `dist/` is shared, and a mid-run
-  rebuild silently mixes engine versions across cases (this exact failure
-  invalidated the first baseline attempt; see the master report ledger).
+- **Isolation rule:** `run-canary.ps1` resolves `-Commit` exactly once, holds
+  an exclusive canary lock, and creates a disposable detached worktree at
+  that object. Dependencies are installed there with `npm ci`; the engine is
+  built and executed from that worktree's private `dist/`. Development builds
+  may therefore continue in the active tree without changing the evaluated
+  artifact. The source commit, evaluator-harness hash, dependency-lock object,
+  and complete built-artifact manifest are captured before execution and
+  checked again afterward. Any drift makes the wrapper `invalidated`.
+- **Output rule:** every invocation owns a GUID-qualified run directory and
+  passes its exact `aggregate.json` path to the gauntlet. Selecting the
+  newest file in a shared directory is forbidden. Cleanup runs in `finally`;
+  a cleanup failure also invalidates the run.
 
 ## Layer 2 — Shadow regression set (sealed, run at milestones)
 
@@ -49,6 +57,21 @@ eventually certify it. It uses three strictly separated layers.
    affected runs (`docs/LIVE_RESULTS.md` discipline applies to all layers).
 4. Canary saturation (repeated 6/6 passes) is expected and is *not* evidence
    of competitive capability; only the holdout supports capability claims.
+5. A wrapper is evidence only when `status` is `valid`. Infrastructure probes
+   exercise the isolation boundary without model spend but are never scored;
+   wrappers marked `invalidated` remain in the ledger and cannot be promoted.
+
+## Reproducible invocation
+
+```powershell
+.\scripts\run-canary.ps1 -Phase phase-5 -Commit <full-commit> -Provider deepseek -Model deepseek-v4-pro
+```
+
+`-Commit` defaults to `HEAD`, but is still resolved to a full commit before
+the lock or worktree is created. The runner harness can evaluate historical
+commits because it takes the engine root explicitly; the task corpus and
+engine always come from the pinned worktree, while the harness's own content
+hash is recorded and guarded for the full run.
 
 ## Phase KPIs
 
