@@ -41,9 +41,9 @@ Use a model ID available to your account. The fixture begins broken; Vanguard mu
 
 ## Interactive terminal UI
 
-After running `scripts\install-cli.ps1` once, `vanguard` opens the terminal UI from any PowerShell directory. The current directory is locked in automatically, so the first input prompt is `Task >`. Setup then asks for the provider/model and turn budget; project verification is detected before inference begins.
+After running `scripts\install-cli.ps1` once, `vanguard` opens the terminal UI from any PowerShell directory. The current directory is locked in automatically and the only setup input is the coding request. DeepSeek V4 Pro, the expert turn budget, credentials, and verification policy are selected silently. Existing npm, Gradle, pytest, Cargo, Maven, and supported native build contracts are detected automatically. Blank projects use an adaptive verifier that tells the agent—not the user—to establish a deterministic contract before completion.
 
-During a run, the UI shows sanitized agent chat, active tool calls, tool outcomes, liveness, context compaction, and verifier decisions. Private reasoning, source-file contents, provider credentials, and sealed verifier evidence are never copied into the public UI stream. Press `Q` or `Ctrl+C` to interrupt. Once the session has been created, an interrupted run prints a durable `vanguard resume --session ...` command.
+During a run, the UI shows a compact conversation, active tool calls, tool outcomes, liveness, context compaction, and verifier decisions. Private reasoning, source-file contents, provider credentials, and sealed verifier evidence are never copied into the public UI stream. Press `Ctrl+C` to interrupt. Once the session has been created, an interrupted run prints a durable `vanguard resume --session ...` command.
 
 The agent-stream layout supports multiple agent identifiers, but the current kernel launches one `main` agent. Child-agent execution will populate additional lanes only after delegation is implemented and verified; the UI does not simulate sub-agents.
 

@@ -13,6 +13,8 @@ export async function detectProjectVerification(workspace: string): Promise<Comm
       scripts?: Record<string, string>;
     };
     if (typeof parsed.scripts?.test === "string") return { command: "npm", args: ["test"] };
+    if (typeof parsed.scripts?.check === "string") return { command: "npm", args: ["run", "check"] };
+    if (typeof parsed.scripts?.build === "string") return { command: "npm", args: ["run", "build"] };
   } catch {}
 
   if (await exists(path.join(root, "gradle", "wrapper", "gradle-wrapper.jar"))) {
@@ -32,6 +34,7 @@ export async function detectProjectVerification(workspace: string): Promise<Comm
     return { command: "python", args: ["-m", "pytest"] };
   }
   if (await exists(path.join(root, "Cargo.toml"))) return { command: "cargo", args: ["test"] };
+  if (await exists(path.join(root, "pom.xml"))) return { command: "mvn", args: ["test"] };
   return undefined;
 }
 

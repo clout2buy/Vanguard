@@ -45,6 +45,7 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Allowlisted no-shell process execution and command-based verification
 - Model-independent BMP/PNG artifact inspection with regional visual metrics, luminance maps, HUD evidence, and pixel comparisons
 - Sanitized live event projection for terminal clients without exposing private reasoning, source payloads, credentials, or sealed evidence
+- One-prompt expert terminal launch with runtime-selected provider defaults and adaptive trusted verification for blank projects
 - Persistent hash-chained run journals
 - Runtime-owned working-state checkpoints that survive transcript compaction
 - Durable session resume from validated journals without replaying completed tool calls

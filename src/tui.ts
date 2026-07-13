@@ -16,6 +16,7 @@ interface TuiConfig {
   readonly provider: Provider;
   readonly model: string;
   readonly verification: CommandSpec;
+  readonly adaptiveVerification: boolean;
   readonly maxSteps: number;
 }
 
@@ -87,7 +88,7 @@ export async function runTui(startDirectory: string): Promise<void> {
     quietDetail: "Preparing isolated workspace",
     agents: new Map([["main", { id: "main", turn: 0, action: "starting", status: "active" }]]),
     activity: [],
-    chat: [],
+    chat: [{ agentId: "you", message: config.task }],
     verifiers: new Map(),
   };
 
@@ -147,50 +148,31 @@ export async function runTui(startDirectory: string): Promise<void> {
 }
 
 async function promptConfiguration(startDirectory: string): Promise<TuiConfig> {
-  process.stdout.write("\x1b[2J\x1b[H");
-  process.stdout.write(`${ansi.violet}${ansi.bold}VANGUARD${ansi.reset}  ${ansi.dim}verification-first coding preview${ansi.reset}\n`);
-  process.stdout.write(`${ansi.dim}Your project is copied into an isolated session. The original directory is not edited.${ansi.reset}\n\n`);
+  const workspace = await realpath(path.resolve(startDirectory));
+  if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory.");
+  const provider = configuredProvider();
+  const model = process.env.VANGUARD_MODEL?.trim() || defaultModel(provider);
+  const maxSteps = configuredMaxSteps();
+  const detectedVerification = await detectProjectVerification(workspace);
+  const verification = detectedVerification ?? automaticVerificationCommand();
+
+  process.stdout.write(`\x1b[2J\x1b[H${renderWelcome(workspace, model)}`);
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    const workspace = await realpath(path.resolve(startDirectory));
-    if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory.");
-    process.stdout.write(`Workspace: ${ansi.bold}${workspace}${ansi.reset}\n`);
     let task = "";
     while (task.length === 0) {
-      task = (await prompt.question("\nTask > ")).trim();
-      if (task.length === 0) process.stdout.write(`${ansi.amber}Describe the coding outcome Vanguard should complete.${ansi.reset}\n`);
+      task = (await prompt.question(`${ansi.violet}❯${ansi.reset} `)).trim();
+      if (task.length === 0) process.stdout.write(`${ansi.amber}Tell Vanguard the outcome you want.${ansi.reset}\n`);
     }
-    const detected = await detectProjectVerification(workspace);
-    let verification = detected;
-    if (verification === undefined) {
-      process.stdout.write(`${ansi.amber}No npm, Gradle, pytest, or Cargo verification command was detected.${ansi.reset}\n`);
-      process.stdout.write(`${ansi.dim}Choose the command Vanguard must make pass before it can finish (for example: npm test).${ansi.reset}\n`);
-      const commandLine = (await prompt.question("Verification command > ")).trim();
-      const parsed = splitCommandLine(commandLine);
-      if (parsed.length === 0) throw new Error("A verification command is required.");
-      verification = { command: parsed[0]!, args: parsed.slice(1) };
-    }
-    process.stdout.write(`${ansi.green}✓${ansi.reset} Verification: ${verification.command} ${verification.args.join(" ")}\n`);
-    let provider: Provider | undefined;
-    while (provider === undefined) {
-      const providerAnswer = (await prompt.question("Provider [deepseek] (deepseek/openai/anthropic) > ")).trim().toLowerCase();
-      provider = parseProvider(providerAnswer);
-      if (provider === undefined) process.stdout.write(`${ansi.amber}Choose deepseek, openai, or anthropic.${ansi.reset}\n`);
-    }
-    const defaultModel = provider === "deepseek" ? "deepseek-v4-pro" : provider === "openai" ? "gpt-5.6" : "claude-opus-4-8";
-    const modelAnswer = (await prompt.question(`Model ${ansi.dim}[${defaultModel}]${ansi.reset} > `)).trim();
-    const model = modelAnswer.length === 0 ? defaultModel : modelAnswer;
-    let maxSteps: number | undefined;
-    while (maxSteps === undefined) {
-      const stepsAnswer = (await prompt.question("Maximum agent turns [240] > ")).trim();
-      const candidate = stepsAnswer.length === 0 ? 240 : Number(stepsAnswer);
-      if (Number.isSafeInteger(candidate) && candidate >= 1 && candidate <= 2_000) maxSteps = candidate;
-      else process.stdout.write(`${ansi.amber}Enter a whole number from 1 to 2000.${ansi.reset}\n`);
-    }
-    process.stdout.write(`\n${ansi.bold}${path.basename(workspace)}${ansi.reset} · ${provider}/${model} · ${maxSteps} turns\n`);
-    const confirm = (await prompt.question("Start isolated run? [Y/n] > ")).trim().toLowerCase();
-    if (confirm === "n" || confirm === "no") throw new Error("Run cancelled before start.");
-    return { workspace, task, provider, model, verification, maxSteps };
+    return {
+      workspace,
+      task,
+      provider,
+      model,
+      verification,
+      adaptiveVerification: detectedVerification === undefined,
+      maxSteps,
+    };
   } finally {
     prompt.close();
   }
@@ -202,7 +184,7 @@ function startAgent(config: TuiConfig, credentialName: string, credential: strin
     entry,
     "run",
     "--workspace", config.workspace,
-    "--task", config.task,
+    "--task", expertTask(config),
     "--provider", config.provider,
     "--model", config.model,
     "--verify-command", config.verification.command,
@@ -329,46 +311,43 @@ function renderFrame(state: UiState, config: TuiConfig, width: number, height: n
   const inner = width - 4;
   const lines: string[] = [];
   const phase = phaseAppearance(state.phase, state.frame);
-  lines.push(padAnsi(` ${ansi.violet}${ansi.bold}VANGUARD${ansi.reset}  ${phase.icon} ${phase.label}  ${ansi.dim}${elapsed(state.startedAt)}${ansi.reset}`, width));
-  lines.push(padAnsi(` ${ansi.dim}${path.basename(config.workspace)} · ${config.provider}/${config.model} · isolated workspace${ansi.reset}`, width));
-  lines.push(`${ansi.slate}${"─".repeat(width)}${ansi.reset}`);
+  lines.push(padAnsi(` ${ansi.violet}${ansi.bold}◆ VANGUARD${ansi.reset}  ${ansi.dim}${path.basename(config.workspace)}  ·  ${config.model}${ansi.reset}`, width));
+  lines.push(padAnsi(` ${phase.icon} ${phase.label.toLowerCase()}  ${ansi.dim}${elapsed(state.startedAt)}  ·  ${bounded(config.task, Math.max(16, inner - 24))}${ansi.reset}`, width));
+  lines.push(" ".repeat(width));
 
-  lines.push(section("AGENT STREAMS", width));
   const agents = [...state.agents.values()];
   for (const agent of agents.slice(0, 3)) {
     const light = agent.status === "failed" ? ansi.red : agent.status === "done" ? ansi.green : ansi.cyan;
     const dot = agent.status === "active" ? spinner[state.frame % spinner.length]! : agent.status === "done" ? "✓" : agent.status === "failed" ? "×" : "○";
-    lines.push(padAnsi(` ${light}${dot}${ansi.reset} ${ansi.bold}${agent.id}${ansi.reset}  ${ansi.dim}turn ${agent.turn}${ansi.reset}  ${bounded(agent.action, inner - 22)}`, width));
+    lines.push(padAnsi(` ${light}${dot}${ansi.reset} ${ansi.bold}${agent.id}${ansi.reset}  ${ansi.dim}#${agent.turn}${ansi.reset}  ${bounded(agent.action, inner - 14)}`, width));
   }
-  if (agents.length === 1) lines.push(padAnsi(` ${ansi.dim}Child-agent lanes are ready; this build currently runs one main agent.${ansi.reset}`, width));
+  lines.push(" ".repeat(width));
 
-  const fixedLines = 13 + Math.min(3, agents.length);
+  const fixedLines = 7 + Math.min(3, agents.length);
   const available = Math.max(8, height - fixedLines);
-  const chatRows = Math.max(4, Math.floor(available * 0.48));
-  const activityRows = Math.max(4, available - chatRows);
-  lines.push(section("AGENT CHAT", width));
+  const chatRows = Math.max(3, Math.floor(available * 0.5));
+  const activityRows = Math.max(3, available - chatRows);
   const chatLines = recentChatLines(state.chat, inner, chatRows);
-  if (chatLines.length === 0) lines.push(padAnsi(` ${ansi.dim}Waiting for the first model response…${ansi.reset}`, width));
+  if (chatLines.length === 0) lines.push(padAnsi(` ${ansi.dim}Vanguard is reading the project…${ansi.reset}`, width));
   else for (const line of chatLines) lines.push(padAnsi(` ${line}`, width));
-  while (lines.length < 6 + agents.length + chatRows) lines.push(" ".repeat(width));
+  while (lines.length < 4 + agents.length + chatRows) lines.push(" ".repeat(width));
 
-  lines.push(section("LIVE ACTIVITY", width));
   const recent = state.activity.slice(-activityRows);
   if (recent.length === 0) lines.push(padAnsi(` ${ansi.dim}${state.quietDetail}${ansi.reset}`, width));
-  for (const item of recent) {
+  for (const [index, item] of recent.entries()) {
     const icon = item.status === "passed" ? `${ansi.green}✓${ansi.reset}`
       : item.status === "failed" ? `${ansi.red}×${ansi.reset}`
         : item.status === "pending" ? `${ansi.cyan}${spinner[state.frame % spinner.length]!}${ansi.reset}` : `${ansi.slate}·${ansi.reset}`;
-    const turn = item.turn === undefined ? "" : `${ansi.dim}#${item.turn}${ansi.reset} `;
-    const detail = item.detail === undefined ? "" : ` ${ansi.dim}${bounded(item.detail, Math.max(10, inner - item.title.length - 12))}${ansi.reset}`;
-    lines.push(padAnsi(` ${icon} ${turn}${item.title}${detail}`, width));
+    const branch = index === recent.length - 1 ? "└" : "├";
+    const detail = item.detail === undefined ? "" : `  ${ansi.dim}${bounded(item.detail, Math.max(10, inner - item.title.length - 12))}${ansi.reset}`;
+    lines.push(padAnsi(` ${ansi.slate}${branch}${ansi.reset} ${icon} ${item.title}${detail}`, width));
   }
 
   while (lines.length < height - 3) lines.push(" ".repeat(width));
   lines.push(`${ansi.slate}${"─".repeat(width)}${ansi.reset}`);
-  const verifierSummary = state.verifiers.size === 0 ? "verifiers waiting" : [...state.verifiers.entries()].map(([name, pass]) => `${pass ? "✓" : "×"} ${name}`).join(" · ");
-  lines.push(padAnsi(` ${ansi.dim}${bounded(state.quietDetail, inner - 24)}${ansi.reset}  ${verifierSummary}`, width));
-  lines.push(padAnsi(` ${ansi.dim}Q / Ctrl+C cancel · full evidence is retained in the durable journal${ansi.reset}`, width));
+  const verifierSummary = state.verifiers.size === 0 ? "verification waiting" : [...state.verifiers.entries()].map(([name, pass]) => `${pass ? "✓" : "×"} ${name}`).join(" · ");
+  lines.push(padAnsi(` ${ansi.dim}${bounded(state.quietDetail, Math.max(16, inner - verifierSummary.length - 3))}${ansi.reset}  ${verifierSummary}`, width));
+  lines.push(padAnsi(` ${ansi.dim}Ctrl+C to stop  ·  isolated copy  ·  durable recovery${ansi.reset}`, width));
   return lines.slice(0, height).join("\n");
 }
 
@@ -382,7 +361,10 @@ export function renderTuiPreviewForTest(width = 100, height = 34): string {
       ["main", { id: "main", turn: 7, action: "project.check", status: "active" }],
       ["scout", { id: "scout", turn: 3, action: "workspace.search", status: "active" }],
     ]),
-    chat: [{ agentId: "main", turn: 7, message: "The implementation is ready for a full trusted build." }],
+    chat: [
+      { agentId: "you", message: "Repair the project and prove it works." },
+      { agentId: "main", turn: 7, message: "The implementation is ready for a full trusted build." },
+    ],
     activity: [
       { status: "passed", title: "workspace.replace", detail: "src/main.ts · 1 replacement(s)", turn: 6 },
       { status: "pending", title: "project.check", detail: "trusted project verification", turn: 7 },
@@ -395,9 +377,21 @@ export function renderTuiPreviewForTest(width = 100, height = 34): string {
     provider: "deepseek",
     model: "deepseek-v4-pro",
     verification: { command: "npm", args: ["test"] },
+    adaptiveVerification: false,
     maxSteps: 240,
   };
   return renderFrame(state, config, Math.max(58, width), Math.max(24, height));
+}
+
+export function renderWelcomeForTest(workspace = "C:\\projects\\preview", model = "deepseek-v4-pro"): string {
+  return renderWelcome(workspace, model);
+}
+
+function renderWelcome(workspace: string, model: string): string {
+  return `${ansi.violet}${ansi.bold}◆ VANGUARD${ansi.reset}\n`
+    + `${ansi.dim}Expert coding  ·  ${path.basename(workspace)}  ·  ${model}${ansi.reset}\n`
+    + `${ansi.dim}Isolated execution; your original project stays untouched.${ansi.reset}\n\n`
+    + `${ansi.bold}What should I build or fix?${ansi.reset}\n`;
 }
 
 async function printHandoff(state: UiState, config: TuiConfig): Promise<void> {
@@ -409,15 +403,7 @@ async function printHandoff(state: UiState, config: TuiConfig): Promise<void> {
     process.stdout.write(`Journal:   ${state.session.journalFile}\n`);
     process.stdout.write(`Scorecard: ${state.session.scorecardFile}\n`);
     if (!passed) process.stdout.write(`Resume:    vanguard resume --session "${state.session.sessionRoot}"\n`);
-    const prompt = createInterface({ input: process.stdin, output: process.stdout });
-    try {
-      const open = (await prompt.question("\nOpen the disposable workspace in Explorer? [y/N] > ")).trim().toLowerCase();
-      if (open === "y" || open === "yes") {
-        spawn("explorer.exe", [state.session.workspaceRoot], { detached: true, stdio: "ignore", windowsHide: true }).unref();
-      }
-    } finally {
-      prompt.close();
-    }
+    process.stdout.write(`Open:      explorer "${state.session.workspaceRoot}"\n`);
   } else if (state.error !== undefined) {
     process.stdout.write(`${ansi.red}${state.error}${ansi.reset}\n`);
   }
@@ -451,17 +437,42 @@ function repositoryRoot(): string {
   return path.resolve(import.meta.dirname, "..", "..");
 }
 
+function configuredProvider(): Provider {
+  const configured = process.env.VANGUARD_PROVIDER?.trim().toLowerCase() ?? "deepseek";
+  const provider = parseProvider(configured);
+  if (provider === undefined) throw new Error("VANGUARD_PROVIDER must be deepseek, openai, or anthropic.");
+  return provider;
+}
+
+function configuredMaxSteps(): number {
+  const configured = process.env.VANGUARD_MAX_STEPS?.trim();
+  const maxSteps = configured === undefined || configured.length === 0 ? 240 : Number(configured);
+  if (!Number.isSafeInteger(maxSteps) || maxSteps < 1 || maxSteps > 2_000) {
+    throw new Error("VANGUARD_MAX_STEPS must be a whole number from 1 to 2000.");
+  }
+  return maxSteps;
+}
+
+function defaultModel(provider: Provider): string {
+  if (provider === "deepseek") return "deepseek-v4-pro";
+  if (provider === "openai") return "gpt-5.6";
+  return "claude-opus-4-8";
+}
+
+function automaticVerificationCommand(): CommandSpec {
+  return { command: "node", args: [path.join(import.meta.dirname, "autoVerify.js")] };
+}
+
+function expertTask(config: TuiConfig): string {
+  if (!config.adaptiveVerification) return config.task;
+  return `${config.task}\n\nVanguard expert-mode contract: own the implementation end to end. This project did not have a recognized verification contract at launch. Establish an appropriate deterministic build/test contract as part of the work, use project.check throughout, and finish only when the automatic trusted verifier passes.`;
+}
+
 function parseProvider(value: string): Provider | undefined {
   if (value.length === 0 || value === "1" || value === "deepseek") return "deepseek";
   if (value === "2" || value === "openai") return "openai";
   if (value === "3" || value === "anthropic") return "anthropic";
   return undefined;
-}
-
-function splitCommandLine(value: string): string[] {
-  const matches = value.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? [];
-  return matches.map((item) => item.length >= 2 && ((item.startsWith('"') && item.endsWith('"')) || (item.startsWith("'") && item.endsWith("'")))
-    ? item.slice(1, -1) : item);
 }
 
 function phaseAppearance(phase: Phase, frame: number): { icon: string; label: string } {
@@ -476,18 +487,15 @@ function phaseAppearance(phase: Phase, frame: number): { icon: string; label: st
 function recentChatLines(chat: readonly ChatItem[], width: number, limit: number): string[] {
   const lines: string[] = [];
   for (const item of chat.slice().reverse()) {
-    const prefix = `${ansi.violet}${item.agentId}${ansi.reset}${item.turn === undefined ? "" : ` ${ansi.dim}#${item.turn}${ansi.reset}`} `;
-    const wrapped = wrap(item.message, Math.max(20, width - item.agentId.length - 6));
-    const rendered = wrapped.map((line, index) => index === 0 ? `${prefix}${line}` : `${" ".repeat(item.agentId.length + 2)}${ansi.dim}${line}${ansi.reset}`);
+    const label = item.agentId === "you" ? "You" : item.agentId;
+    const color = item.agentId === "you" ? ansi.amber : ansi.violet;
+    const prefix = `${color}${ansi.bold}${label}${ansi.reset}${item.turn === undefined ? "" : ` ${ansi.dim}#${item.turn}${ansi.reset}`} `;
+    const wrapped = wrap(item.message, Math.max(20, width - label.length - 6));
+    const rendered = wrapped.map((line, index) => index === 0 ? `${prefix}${line}` : `${" ".repeat(label.length + 1)}${ansi.dim}${line}${ansi.reset}`);
     lines.unshift(...rendered);
     if (lines.length >= limit) return lines.slice(-limit);
   }
   return lines.slice(-limit);
-}
-
-function section(name: string, width: number): string {
-  const label = ` ${name} `;
-  return `${ansi.slate}─${ansi.reset}${ansi.bold}${label}${ansi.reset}${ansi.slate}${"─".repeat(Math.max(0, width - label.length - 1))}${ansi.reset}`;
 }
 
 function wrap(value: string, width: number): string[] {

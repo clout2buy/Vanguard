@@ -34,7 +34,9 @@ Then open PowerShell in any codebase and run:
 vanguard
 ```
 
-The terminal UI locks onto the current directory and puts the cursor directly on `Task >`; change projects by changing directories before launching it. It detects the trusted build/test command, loads the selected provider credential from the process, Windows user environment, or Vanguard's ignored DPAPI store, and runs against a disposable copy. It streams agent messages, tool calls, build results, compaction, and independent verifier state. The original project remains unchanged; the final handoff links the disposable workspace, journal, scorecard, and resume command.
+The default launch is intentionally one-prompt: Vanguard locks onto the current directory, asks what to build or fix, and starts. It silently uses DeepSeek V4 Pro, a 240-turn expert budget, the stored credential, and the strongest project verification it can detect. In a blank project, the adaptive trusted verifier requires Vanguard to establish a deterministic build/test contract instead of asking the user to configure one. The animated conversation view streams agent messages, tool calls, build results, compaction, and independent verifier state. The original project remains unchanged; the final handoff prints the disposable workspace, journal, scorecard, and resume command.
+
+Advanced provider overrides are available through `VANGUARD_PROVIDER`, `VANGUARD_MODEL`, and `VANGUARD_MAX_STEPS`; the explicit `vanguard run ...` interface remains available for evaluation and policy configuration.
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the design boundary and [`gauntlet/README.md`](gauntlet/README.md) for evaluation rules.
 
