@@ -5,6 +5,7 @@ export interface TrajectoryMetrics {
   readonly toolCalls: number;
   readonly toolFailures: number;
   readonly localTestFailures: number;
+  readonly testHarnessFailures: number;
   readonly toolFrictionFailures: number;
   readonly completionClaims: number;
   readonly verificationAttempts: number;
@@ -18,6 +19,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   let toolCalls = 0;
   let toolFailures = 0;
   let localTestFailures = 0;
+  let testHarnessFailures = 0;
   let toolFrictionFailures = 0;
   let completionClaims = 0;
   let verificationAttempts = 0;
@@ -45,7 +47,14 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       const serialized = JSON.stringify(event.data).toLocaleLowerCase();
       const output = record(data?.output);
       const isLocalTestFailure = pendingToolName === "process.run" && typeof output?.exitCode === "number";
-      if (isLocalTestFailure) localTestFailures += 1;
+      const isHarnessFailure = isLocalTestFailure && (
+        serialized.includes("syntaxerror") && serialized.includes("[eval")
+        || serialized.includes("err_eval_esm_cannot_print")
+      );
+      if (isHarnessFailure) {
+        testHarnessFailures += 1;
+        toolFrictionFailures += 1;
+      } else if (isLocalTestFailure) localTestFailures += 1;
       else toolFrictionFailures += 1;
       if (serialized.includes("process policy") || serialized.includes("evidence policy")) policyBlocks += 1;
     }
@@ -61,6 +70,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     toolCalls,
     toolFailures,
     localTestFailures,
+    testHarnessFailures,
     toolFrictionFailures,
     completionClaims,
     verificationAttempts,

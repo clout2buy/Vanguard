@@ -97,6 +97,7 @@ try {
         durationMs = $Scorecard.durationMs
         toolFailures = $Scorecard.trajectory.toolFailures
         localTestFailures = $Scorecard.trajectory.localTestFailures
+        testHarnessFailures = $Scorecard.trajectory.testHarnessFailures
         toolFrictionFailures = $Scorecard.trajectory.toolFrictionFailures
         verificationFailures = $Scorecard.trajectory.verificationFailures
         completionClaims = $Scorecard.trajectory.completionClaims
@@ -126,6 +127,7 @@ try {
         durationMs = 0
         toolFailures = 0
         localTestFailures = 0
+        testHarnessFailures = 0
         toolFrictionFailures = 0
         verificationFailures = 0
         completionClaims = 0
@@ -155,7 +157,7 @@ try {
   $InfrastructureErrors = $Total - $Evaluated
   $Passed = @($EvaluatedResults | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 4
+    version = 5
     provider = $Provider
     model = $Model
     passed = $Passed
@@ -171,6 +173,7 @@ try {
       totalSteps = [int](($Results | Measure-Object -Property steps -Sum).Sum)
       toolFailures = [int](($Results | Measure-Object -Property toolFailures -Sum).Sum)
       localTestFailures = [int](($Results | Measure-Object -Property localTestFailures -Sum).Sum)
+      testHarnessFailures = [int](($Results | Measure-Object -Property testHarnessFailures -Sum).Sum)
       toolFrictionFailures = [int](($Results | Measure-Object -Property toolFrictionFailures -Sum).Sum)
       verificationFailures = [int](($Results | Measure-Object -Property verificationFailures -Sum).Sum)
       completionClaims = [int](($Results | Measure-Object -Property completionClaims -Sum).Sum)

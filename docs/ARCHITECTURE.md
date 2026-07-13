@@ -39,6 +39,8 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Explicit model/tool/verifier contracts and evidence-focused context budgeting
 - SDK-free native HTTP inference with bounded transient retry
 - Workspace-confined file operations with version-bound guarded edits
+- Pre-mutation editable-root/protected-path enforcement and hash-guarded deletion
+- Editable-root filesystem permissions for restricted Node subprocesses
 - Allowlisted no-shell process execution and command-based verification
 - Persistent hash-chained run journals
 - Runtime-owned working-state checkpoints that survive transcript compaction
@@ -51,4 +53,5 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Trajectory and patch-scope scorecard metrics for quality audits beyond pass/fail
 - Versioned case contracts and transparent execution-quality scoring separate from correctness
 - Outcome classification separating infrastructure failures from capability scores
+- Separate productive-test, test-harness, and tool-friction trajectory signals
 - End-to-end inspect, patch, test, and independently verify control-loop coverage

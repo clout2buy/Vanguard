@@ -5,12 +5,14 @@ import path from "node:path";
 import test from "node:test";
 import {
   CommandVerifier,
+  DeleteFileTool,
   ListFilesTool,
   ProcessTool,
   ReadFileTool,
   ReplaceTextTool,
   SearchTextTool,
   WorkspaceBoundary,
+  WorkspaceMutationPolicy,
   WorkspaceVersionLedger,
   WriteFileTool,
   contentHash,
@@ -128,6 +130,35 @@ test("read leases eliminate hash bookkeeping without weakening stale-write prote
   }
 });
 
+test("mutation policy blocks out-of-scope writes and supports guarded deletion", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-mutation-policy-"));
+  try {
+    await mkdir(path.join(root, "src"));
+    await writeFile(path.join(root, "src", "protected.ts"), "keep\n");
+    const workspace = new WorkspaceBoundary(root);
+    const versions = new WorkspaceVersionLedger();
+    const policy = new WorkspaceMutationPolicy(["src"], ["src/protected.ts"]);
+    const writer = new WriteFileTool(workspace, versions, policy);
+    const reader = new ReadFileTool(workspace, 1_000_000, versions);
+    const deleter = new DeleteFileTool(workspace, versions, policy);
+
+    const outside = await writer.execute({ path: "test/generated.mjs", contents: "bad" }, context);
+    assert.equal(outside.ok, false);
+    assert.match(JSON.stringify(outside.output), /outside the declared editable roots/i);
+    const protectedWrite = await writer.execute({ path: "src/protected.ts", contents: "bad" }, context);
+    assert.equal(protectedWrite.ok, false);
+
+    const created = await writer.execute({ path: "src/generated.ts", contents: "temporary\n" }, context);
+    assert.equal(created.ok, true);
+    await reader.execute({ path: "src/generated.ts" }, context);
+    const deleted = await deleter.execute({ path: "src/generated.ts" }, context);
+    assert.equal(deleted.ok, true);
+    await assert.rejects(() => readFile(path.join(root, "src", "generated.ts"), "utf8"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("search returns bounded source evidence and ignores binary files", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-search-"));
   try {
@@ -238,6 +269,37 @@ test("restricted Node process cannot read outside workspace or widen its own per
     assert.match(JSON.stringify(escalation.output), /blocked by process policy/i);
   } finally {
     await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("restricted Node process cannot mutate outside declared editable roots", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-process-scope-"));
+  try {
+    const editable = path.join(root, "src");
+    await mkdir(editable);
+    await mkdir(path.join(root, "test"));
+    const tool = new ProcessTool(new WorkspaceBoundary(root), {
+      allowedCommands: ["node"],
+      commandAliases: {
+        node: {
+          executable: process.execPath,
+          argsPrefix: ["--experimental-permission", `--allow-fs-read=${root}`, `--allow-fs-write=${editable}`],
+        },
+      },
+    });
+    const allowed = await tool.execute({
+      command: "node",
+      args: ["-e", "require('fs').writeFileSync('src/allowed.txt','ok')"],
+    }, context);
+    assert.equal(allowed.ok, true);
+    const denied = await tool.execute({
+      command: "node",
+      args: ["-e", "require('fs').writeFileSync('test/outside.txt','bad')"],
+    }, context);
+    assert.equal(denied.ok, false);
+    assert.match(JSON.stringify(denied.output), /ERR_ACCESS_DENIED|permission/i);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 

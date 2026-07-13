@@ -19,7 +19,7 @@ export class PluginRegistry {
     if (!plugin || typeof plugin !== "object" || typeof plugin.name !== "string" || !plugin.name || typeof plugin.start !== "function" || typeof plugin.stop !== "function") throw new PluginLifecycleError("malformed plugin");
     const requires = plugin.requires ?? [];
     if (!Array.isArray(requires) || !requires.every((x) => typeof x === "string" && x) || new Set(requires).size !== requires.length) throw new PluginLifecycleError("malformed requirements");
-    if (this.#plugins.has(plugin.name)) throw new PluginLifecycleError("duplicate plugin");
+    if (this.#plugins.has(plugin.name)) throw new PluginLifecycleError("plugin is already registered");
     this.#plugins.set(plugin.name, { ...plugin, requires: [...requires] }); return this;
   }
   #order() {

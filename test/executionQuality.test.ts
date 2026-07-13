@@ -8,7 +8,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
     beforeBytes: 100, afterBytes: 200, beforeLines: 10, afterLines: 20,
   };
   const clean = scoreExecutionQuality(true, {
-    modelDecisions: 4, toolCalls: 3, toolFailures: 0, localTestFailures: 0, toolFrictionFailures: 0, completionClaims: 1,
+    modelDecisions: 4, toolCalls: 3, toolFailures: 0, localTestFailures: 0, testHarnessFailures: 0, toolFrictionFailures: 0, completionClaims: 1,
     verificationAttempts: 1, verificationFailures: 0, policyBlocks: 0,
     toolCallsByName: { "workspace.write": 1, "process.run": 1 },
   }, patch);
@@ -17,7 +17,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
   assert.equal(clean.patchExpansionRatio, 2);
 
   const productive = scoreExecutionQuality(true, {
-    modelDecisions: 7, toolCalls: 6, toolFailures: 1, localTestFailures: 1, toolFrictionFailures: 0, completionClaims: 1,
+    modelDecisions: 7, toolCalls: 6, toolFailures: 1, localTestFailures: 1, testHarnessFailures: 0, toolFrictionFailures: 0, completionClaims: 1,
     verificationAttempts: 1, verificationFailures: 0, policyBlocks: 0,
     toolCallsByName: { "workspace.write": 1, "workspace.replace": 1, "process.run": 2 },
   }, { ...patch, afterLines: 50 });
@@ -27,7 +27,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
   assert.deepEqual(productive.reviewFlags, ["large-patch-expansion"]);
 
   const churn = scoreExecutionQuality(true, {
-    modelDecisions: 12, toolCalls: 9, toolFailures: 2, localTestFailures: 1, toolFrictionFailures: 1, completionClaims: 3,
+    modelDecisions: 12, toolCalls: 9, toolFailures: 2, localTestFailures: 1, testHarnessFailures: 0, toolFrictionFailures: 1, completionClaims: 3,
     verificationAttempts: 3, verificationFailures: 2, policyBlocks: 0,
     toolCallsByName: { "workspace.write": 4, "process.run": 2 },
   }, patch);
@@ -38,7 +38,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
 
 function churnTrajectory() {
   return {
-    modelDecisions: 12, toolCalls: 9, toolFailures: 2, localTestFailures: 1, toolFrictionFailures: 1, completionClaims: 3,
+    modelDecisions: 12, toolCalls: 9, toolFailures: 2, localTestFailures: 1, testHarnessFailures: 0, toolFrictionFailures: 1, completionClaims: 3,
     verificationAttempts: 3, verificationFailures: 2, policyBlocks: 0,
     toolCallsByName: { "workspace.write": 4, "process.run": 2 },
   };

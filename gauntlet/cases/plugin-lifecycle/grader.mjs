@@ -30,7 +30,7 @@ assert.deepEqual(events.slice(3), ["stop:api", "stop:db", "stop:cache"]);
 await registry.stopAll();
 assert.deepEqual(registry.status(), { api: "registered", cache: "registered", db: "registered" });
 
-assert.throws(() => registry.register(plugin("db")), /duplicate/i);
+assert.throws(() => registry.register(plugin("db")), /duplicate|already registered/i);
 for (const malformed of [null, {}, { name: "", start() {}, stop() {} }, { name: "x", requires: "y", start() {}, stop() {} }]) {
   assert.throws(() => new PluginRegistry().register(malformed));
 }

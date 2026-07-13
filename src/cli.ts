@@ -6,6 +6,7 @@ import {
   AgentKernel,
   CheckpointTool,
   CommandVerifier,
+  DeleteFileTool,
   FileJournal,
   HttpModelAdapter,
   ListFilesTool,
@@ -16,6 +17,7 @@ import {
   SearchTextTool,
   WorkspaceBoundary,
   WorkspaceIntegrityVerifier,
+  WorkspaceMutationPolicy,
   WorkspaceVersionLedger,
   WriteFileTool,
   createAnthropicModel,
@@ -61,12 +63,13 @@ async function main(): Promise<void> {
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
   const versions = new WorkspaceVersionLedger();
   const workingState = new RunCheckpointLedger();
+  const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
   const agentAllowedCommands = options.restrictProcess
     ? [...new Set(["node", ...options.allowedCommands])]
     : [...new Set(["node", "npm", "npx", "git", options.verification.command, ...options.allowedCommands])];
   const processTool = new ProcessTool(workspace, {
     allowedCommands: agentAllowedCommands,
-    commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess),
+    commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess, mutationPolicy.writableAbsoluteRoots(session.workspaceRoot)),
     deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-experimental-permission"] : [],
     deniedArgumentSubstrings: options.restrictProcess ? ["console.assert"] : [],
     timeoutMs: 600_000,
@@ -74,7 +77,7 @@ async function main(): Promise<void> {
   });
   const verifierProcessTool = new ProcessTool(workspace, {
     allowedCommands: [options.verification.command],
-    commandAliases: commandAliases(session.workspaceRoot, false),
+    commandAliases: commandAliases(session.workspaceRoot, false, []),
     timeoutMs: 600_000,
     maxOutputBytes: 2_000_000,
   });
@@ -101,8 +104,9 @@ async function main(): Promise<void> {
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
       new ReadFileTool(workspace, 1_000_000, versions),
-      new WriteFileTool(workspace, versions),
-      new ReplaceTextTool(workspace, versions),
+      new WriteFileTool(workspace, versions, mutationPolicy),
+      new ReplaceTextTool(workspace, versions, mutationPolicy),
+      new DeleteFileTool(workspace, versions, mutationPolicy),
       new CheckpointTool(workingState),
       processTool,
     ],
@@ -120,7 +124,8 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
   const controller = new AbortController();
   const durationTimer = setTimeout(() => controller.abort(), options.maxDurationMs);
-  const outcome = await kernel.run(options.task, controller.signal).finally(() => clearTimeout(durationTimer));
+  const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${mutationPolicy.describe()}`;
+  const outcome = await kernel.run(runtimeTask, controller.signal).finally(() => clearTimeout(durationTimer));
   const trajectory = analyzeTrajectory(await fileJournal.readValidated());
   const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
   const verified = outcome.status === "completed";
@@ -235,10 +240,15 @@ async function detectVerification(workspace: string): Promise<CommandSpec | unde
 function commandAliases(
   workspaceRoot: string,
   restricted: boolean,
+  writableRoots: readonly string[],
 ): Record<string, { executable: string; argsPrefix: string[] }> {
   const npmBin = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin");
   const nodePrefix = restricted
-    ? ["--experimental-permission", `--allow-fs-read=${workspaceRoot}`, `--allow-fs-write=${workspaceRoot}`]
+    ? [
+        "--experimental-permission",
+        `--allow-fs-read=${workspaceRoot}`,
+        `--allow-fs-write=${writableRoots.join(",")}`,
+      ]
     : [];
   return {
     node: { executable: process.execPath, argsPrefix: nodePrefix },

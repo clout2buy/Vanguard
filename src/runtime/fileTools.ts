@@ -4,6 +4,7 @@ import path from "node:path";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
+import { WorkspaceMutationPolicy } from "./mutationPolicy.js";
 import { WorkspaceVersionLedger } from "./versionLedger.js";
 
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
@@ -52,11 +53,14 @@ export class WriteFileTool implements ToolPort {
   constructor(
     private readonly workspace: WorkspaceBoundary,
     private readonly versions?: WorkspaceVersionLedger,
+    private readonly mutationPolicy?: WorkspaceMutationPolicy,
   ) {}
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
     const relativePath = stringField(fields, "path");
+    const policyDenial = this.mutationPolicy?.check(relativePath);
+    if (policyDenial !== undefined) return policyDenial;
     const contents = stringField(fields, "contents");
     const destination = await this.workspace.writable(relativePath);
     const suppliedSha256 = fields.expectedSha256;
@@ -116,11 +120,14 @@ export class ReplaceTextTool implements ToolPort {
   constructor(
     private readonly workspace: WorkspaceBoundary,
     private readonly versions?: WorkspaceVersionLedger,
+    private readonly mutationPolicy?: WorkspaceMutationPolicy,
   ) {}
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
     const relativePath = stringField(fields, "path");
+    const policyDenial = this.mutationPolicy?.check(relativePath);
+    if (policyDenial !== undefined) return policyDenial;
     const suppliedSha256 = fields.expectedSha256;
     if (suppliedSha256 !== undefined && typeof suppliedSha256 !== "string") {
       throw new Error("Field 'expectedSha256' must be a string.");
@@ -151,6 +158,52 @@ export class ReplaceTextTool implements ToolPort {
       ok: true,
       output: { path: relativePath, replacements: 1, sha256: contentHash(updated) },
     };
+  }
+}
+
+export class DeleteFileTool implements ToolPort {
+  readonly name = "workspace.delete";
+  readonly definition = toolDefinition(
+    this.name,
+    "Delete one previously read regular file within the mutation policy.",
+    {
+      path: { type: "string", description: "Workspace-relative file path." },
+      expectedSha256: { type: "string", description: "Hash returned by workspace.read." },
+    },
+    ["path"],
+    "mutate",
+  );
+
+  constructor(
+    private readonly workspace: WorkspaceBoundary,
+    private readonly versions?: WorkspaceVersionLedger,
+    private readonly mutationPolicy?: WorkspaceMutationPolicy,
+  ) {}
+
+  async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
+    const fields = objectInput(input);
+    const relativePath = stringField(fields, "path");
+    const policyDenial = this.mutationPolicy?.check(relativePath);
+    if (policyDenial !== undefined) return policyDenial;
+    const suppliedSha256 = fields.expectedSha256;
+    if (suppliedSha256 !== undefined && typeof suppliedSha256 !== "string") {
+      throw new Error("Field 'expectedSha256' must be a string.");
+    }
+    const expectedSha256 = suppliedSha256 ?? this.versions?.get(relativePath);
+    if (expectedSha256 === undefined) {
+      return { ok: false, output: { error: "Deletion requires expectedSha256 or a current read lease." } };
+    }
+    const file = await this.workspace.existing(relativePath);
+    const metadata = await stat(file);
+    if (!metadata.isFile()) return { ok: false, output: { error: "Path is not a regular file." } };
+    const contents = await readFile(file);
+    const actualSha256 = createHash("sha256").update(contents).digest("hex");
+    if (actualSha256 !== expectedSha256) {
+      return { ok: false, output: { error: "File changed since it was read.", actualSha256 } };
+    }
+    await rm(file);
+    this.versions?.forget(relativePath);
+    return { ok: true, output: { path: relativePath, deleted: true, sha256: actualSha256 } };
   }
 }
 

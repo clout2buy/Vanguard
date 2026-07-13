@@ -30,6 +30,14 @@ Live results are retained with an audit status. A passing verifier is necessary 
 - Corrective action: opaque reasoning blocks, DeepSeek `reasoning_content`, and Anthropic thinking/signature content are now preserved; only known tool payload fields are compacted. A four-turn DeepSeek regression test covers the exact failure shape.
 - Aggregate schema v4 classifies model transport/protocol failures as infrastructure errors, excludes them from capability score denominators, and exits with code 2. This aborted run is not a Vanguard coding score of zero.
 
+## 2026-07-12 — plugin-lifecycle recovery audit
+
+- Provider-safe compaction succeeded beyond the previous four-turn failure. The run reached 69 model decisions without a DeepSeek history error.
+- The first completion claim was unrecoverable because the agent had created `test/test.js` outside the declared editable `src/` root, and the runtime exposed no delete tool. The behavioral implementation itself passed the sealed grader once the grader's wording overfit was corrected.
+- Benchmark correction: "plugin is already registered" is now accepted as a valid duplicate-registration error; behavior should not depend on one preferred adjective. Plugin-lifecycle is case version 2.
+- Core correction: mutation scope is now enforced before writes/replacements/deletions, restricted Node subprocess write permissions are limited to editable roots, protected paths are rejected at mutation time, and `workspace.delete` provides hash-guarded recovery.
+- Efficiency audit: the run issued 37 process calls and four malformed inline harnesses. Schema v5 separates harness failures from productive code-test failures and flags high test fragmentation; provider guidance now asks for consolidated adversarial harnesses.
+
 ## 2026-07-11 — public repair-cart preview
 
 - Provider/model: DeepSeek `deepseek-v4-pro`

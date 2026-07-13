@@ -35,6 +35,7 @@ export function scoreExecutionQuality(
     reviewFlags.push("large-patch-expansion");
   }
   if (changedFiles > 0 && writes > changedFiles * 4) reviewFlags.push("high-edit-churn");
+  if ((trajectory.toolCallsByName["process.run"] ?? 0) > 12) reviewFlags.push("high-test-fragmentation");
   return {
     score: verified ? round(Math.max(0, 1 - totalPenalty)) : 0,
     cleanFirstPass: verified
