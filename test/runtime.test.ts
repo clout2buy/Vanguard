@@ -7,6 +7,7 @@ import {
   CommandVerifier,
   DeleteFileTool,
   FixedCommandTool,
+  ImageInspectionTool,
   ListFilesTool,
   ProcessTool,
   ReadFileTool,
@@ -214,7 +215,41 @@ test("fixed command tool exposes a trusted check without model-controlled argume
     assert.equal(result.ok, true);
     assert.match(JSON.stringify(result.output), /fixed/);
     assert.equal((await tool.execute({ summary: "run trusted checks" }, context)).ok, true);
-    await assert.rejects(() => tool.execute({ args: ["malicious"] }, context), /does not accept arguments/);
+    const ignored = await tool.execute({ command: "malicious", args: ["malicious"] }, context);
+    assert.equal(ignored.ok, true);
+    assert.match(JSON.stringify(ignored.output), /fixed/);
+    assert.doesNotMatch(JSON.stringify(ignored.output), /malicious/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("image inspection gives non-vision models regional evidence and pixel comparisons", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-image-inspection-"));
+  try {
+    await mkdir(path.join(root, "images"));
+    const first = createBmp(64, 48, (x, y) => {
+      if (y >= 40 && x < 32 && x % 3 !== 0) return [240, 240, 240];
+      return y < 20 ? [90, 145, 220] : [55, 115, 45];
+    });
+    const second = createBmp(64, 48, (x, y) => {
+      if (x >= 20 && x < 36 && y >= 15 && y < 31) return [0, 0, 0];
+      if (y >= 40 && x < 32 && x % 3 !== 0) return [240, 240, 240];
+      return y < 20 ? [90, 145, 220] : [55, 115, 45];
+    });
+    await writeFile(path.join(root, "images", "first.bmp"), first);
+    await writeFile(path.join(root, "images", "second.bmp"), second);
+    const tool = new ImageInspectionTool(new WorkspaceBoundary(root));
+    const inspected = await tool.execute({ path: "images/first.bmp", comparePath: "images/second.bmp" }, context);
+    assert.equal(inspected.ok, true);
+    const evidence = JSON.stringify(inspected.output);
+    assert.match(evidence, /"format":"bmp"/);
+    assert.match(evidence, /"luminanceMap"/);
+    assert.match(evidence, /"hudEvidence":true/);
+    assert.match(evidence, /"exactPixelMatch":false/);
+    assert.match(evidence, /"changedPixelRatio":/);
+    const identical = await tool.execute({ path: "images/first.bmp", comparePath: "images/first.bmp" }, context);
+    assert.match(JSON.stringify(identical.output), /"exactPixelMatch":true/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -356,3 +391,33 @@ test("command verifier summary hides privileged command output", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+function createBmp(
+  width: number,
+  height: number,
+  colorAt: (x: number, y: number) => readonly [number, number, number],
+): Buffer {
+  const rowStride = Math.ceil((width * 3) / 4) * 4;
+  const pixelBytes = rowStride * height;
+  const buffer = Buffer.alloc(54 + pixelBytes);
+  buffer.write("BM", 0, "ascii");
+  buffer.writeUInt32LE(buffer.length, 2);
+  buffer.writeUInt32LE(54, 10);
+  buffer.writeUInt32LE(40, 14);
+  buffer.writeInt32LE(width, 18);
+  buffer.writeInt32LE(height, 22);
+  buffer.writeUInt16LE(1, 26);
+  buffer.writeUInt16LE(24, 28);
+  buffer.writeUInt32LE(pixelBytes, 34);
+  for (let fileY = 0; fileY < height; fileY += 1) {
+    const visualY = height - 1 - fileY;
+    for (let x = 0; x < width; x += 1) {
+      const [red, green, blue] = colorAt(x, visualY);
+      const index = 54 + fileY * rowStride + x * 3;
+      buffer[index] = blue;
+      buffer[index + 1] = green;
+      buffer[index + 2] = red;
+    }
+  }
+  return buffer;
+}

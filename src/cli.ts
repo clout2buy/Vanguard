@@ -32,6 +32,7 @@ import {
   classifyOutcome,
   openCodingSession,
   FixedCommandTool,
+  ImageInspectionTool,
 } from "./index.js";
 
 interface CliOptions {
@@ -135,6 +136,7 @@ async function main(): Promise<void> {
       new ReplaceTextTool(workspace, versions, mutationPolicy),
       new DeleteFileTool(workspace, versions, mutationPolicy),
       new ReviewChangesTool(session.sourceRoot, session.workspaceRoot),
+      new ImageInspectionTool(workspace),
       new CheckpointTool(workingState),
       ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
       ...(options.exposeRawProcess ? [processTool] : []),

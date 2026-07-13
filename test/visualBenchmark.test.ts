@@ -16,6 +16,12 @@ test("medieval visual benchmark defines a native rendered artifact and rejects i
   assert.match(task, /--capture PATH/);
   assert.match(task, /dragon/i);
 
+  const grader = await readFile(path.join(caseRoot, "grader.mjs"), "utf8");
+  assert.match(grader, /not pixel-stable/i);
+  assert.match(grader, /changedPixelRatio <= 0\.001/);
+  assert.match(grader, /meanLuminance >= 90/);
+  assert.match(grader, /bottomHudBrightRatio >= 0\.0005/);
+
   const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-medieval-starter-"));
   const workspace = path.join(container, "workspace");
   try {

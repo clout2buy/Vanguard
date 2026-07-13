@@ -14,6 +14,7 @@ export * from "./runtime/commandVerifier.js";
 export * from "./runtime/fileTools.js";
 export * from "./runtime/fixedCommandTool.js";
 export * from "./runtime/integrityVerifier.js";
+export * from "./runtime/imageInspectionTool.js";
 export * from "./runtime/mutationPolicy.js";
 export * from "./runtime/processTool.js";
 export * from "./runtime/projectVerification.js";
