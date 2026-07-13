@@ -5,13 +5,14 @@ import java.util.*;
 public final class PublicWardHarness {
     private static void check(boolean value, String message) { if (!value) throw new AssertionError(message); }
     private static void rejects(Runnable action, String message) { try { action.run(); } catch (RuntimeException expected) { return; } throw new AssertionError(message); }
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         UUID owner = UUID.fromString("00000000-0000-0000-0000-000000000001");
         UUID stranger = UUID.fromString("00000000-0000-0000-0000-000000000002");
         Claim shape = new Claim("manual", owner, "overworld", new BlockPos(2, 2, 2), new BlockPos(0, 0, 0));
         check(shape.volume() == 27L && shape.contains("overworld", new BlockPos(0, 0, 0)), "inclusive normalized claim");
         rejects(() -> new Claim("huge", owner, "overworld", new BlockPos(Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE), new BlockPos(Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE)), "overflow rejected");
         check(Claim.deserialize(shape.serialize()).serialize().equals(shape.serialize()), "claim persistence round trip");
+        rejects(() -> new Claim("bad\tid", owner, "overworld", new BlockPos(0, 0, 0), new BlockPos(0, 0, 0)), "persistence delimiters rejected");
 
         ClaimStore store = new ClaimStore(2);
         Claim first = store.claim(owner, "overworld", new BlockPos(0, 0, 0), new BlockPos(2, 2, 2));
@@ -19,6 +20,12 @@ public final class PublicWardHarness {
         boolean removed = false; try { removed = store.remove(first.getId(), stranger, false); } catch (SecurityException acceptable) {}
         check(!removed && store.findById(first.getId()).isPresent(), "unauthorized removal denied");
         try { store.all().clear(); throw new AssertionError("immutable snapshot"); } catch (UnsupportedOperationException expected) {}
+        java.nio.file.Path parent = java.nio.file.Files.createTempDirectory("ward-public").resolve("nested").resolve("claims.tsv");
+        check(ClaimStore.load(parent, 2).all().isEmpty(), "missing persistence loads empty");
+        store.save(parent); check(ClaimStore.load(parent, 2).all().size() == 1, "nested persistence round trip");
+        java.nio.file.Files.deleteIfExists(parent);
+        java.nio.file.Files.deleteIfExists(parent.getParent());
+        java.nio.file.Files.deleteIfExists(parent.getParent().getParent());
 
         PlayerContext strangerContext = new PlayerContext(stranger, "overworld", new BlockPos(1, 1, 1), false);
         PermissionService permissions = new PermissionService(store);

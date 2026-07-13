@@ -85,8 +85,10 @@ public final class ClaimStore {
                     if (value.getOwner().equals(claim.getOwner())) count++;
                 }
                 if (count >= maxClaimsPerOwner) throw new IllegalArgumentException("claim limit");
-                if (!claim.getId().matches("C[0-9]+")) throw new IllegalArgumentException("invalid id");
-                greatest = Math.max(greatest, Long.parseLong(claim.getId().substring(1)));
+                if (!claim.getId().matches("C[0-9]{6,}")) throw new IllegalArgumentException("invalid id");
+                long numericId = Long.parseLong(claim.getId().substring(1));
+                if (numericId < 1L || !formatId(numericId).equals(claim.getId())) throw new IllegalArgumentException("invalid id");
+                greatest = Math.max(greatest, numericId);
                 loaded.claims.put(claim.getId(), claim);
             }
         } catch (RuntimeException error) { throw new IOException("corrupt claim store", error); }

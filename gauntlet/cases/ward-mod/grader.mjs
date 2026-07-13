@@ -32,6 +32,8 @@ public final class WardHarness {
     check(normalized.volume() == 48L, "exact inclusive volume");
     check(Claim.deserialize(normalized.serialize()).serialize().equals(normalized.serialize()), "persistence round trip");
     rejects(() -> Claim.deserialize("bad"), "malformed record rejected");
+    rejects(() -> new Claim("bad\\tid", owner, "overworld", new BlockPos(0, 0, 0), new BlockPos(0, 0, 0)), "tabbed id rejected");
+    rejects(() -> new Claim("id", owner, "bad\\ndimension", new BlockPos(0, 0, 0), new BlockPos(0, 0, 0)), "line-separated dimension rejected");
     rejects(() -> new Claim("huge", owner, "overworld", new BlockPos(Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE), new BlockPos(Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE)), "overflow rejected");
 
     ClaimStore store = new ClaimStore(2);
@@ -55,6 +57,16 @@ public final class WardHarness {
     check(permissions.canBuild(strangerContext, "overworld", new BlockPos(99, 1, 1)), "wilderness allowed");
     permissions.grantBypass(stranger); check(permissions.canBuild(strangerContext, "overworld", new BlockPos(1, 1, 1)), "bypass allowed");
     permissions.revokeBypass(stranger); check(!permissions.hasBypass(stranger), "bypass revoked");
+    List<UUID> concurrentBypass = new ArrayList<UUID>();
+    for (int i = 0; i < 1200; i++) concurrentBypass.add(new UUID(7L, i + 10L));
+    List<Thread> workers = new ArrayList<Thread>();
+    for (int worker = 0; worker < 8; worker++) {
+      final int offset = worker;
+      Thread thread = new Thread(() -> { for (int i = offset; i < concurrentBypass.size(); i += 8) permissions.grantBypass(concurrentBypass.get(i)); });
+      workers.add(thread); thread.start();
+    }
+    for (Thread thread : workers) thread.join();
+    for (UUID id : concurrentBypass) check(permissions.hasBypass(id), "concurrent bypass update retained");
 
     ClaimStore commandStore = new ClaimStore(3);
     WardCommand command = new WardCommand(commandStore);
@@ -67,7 +79,8 @@ public final class WardHarness {
     check(command.execute(ownerContext, "unclaim C000001").isSuccess() && commandStore.all().isEmpty(), "unclaim command");
     check(!command.execute(ownerContext, "unknown").isSuccess(), "unknown command is safe");
 
-    Path data = Paths.get(args[0], "claims.tsv");
+    Path data = Paths.get(args[0], "nested", "data", "claims.tsv");
+    check(ClaimStore.load(Paths.get(args[0], "missing.tsv"), 3).all().isEmpty(), "missing store loads empty");
     store.save(data);
     List<String> lines = Files.readAllLines(data, StandardCharsets.UTF_8);
     List<String> sorted = new ArrayList<String>(lines); Collections.sort(sorted);
@@ -78,6 +91,8 @@ public final class WardHarness {
     check(next.getId().equals("C000004"), "ids continue after load");
     Files.write(data, Arrays.asList(lines.get(0), lines.get(0)), StandardCharsets.UTF_8);
     try { ClaimStore.load(data, 3); throw new AssertionError("duplicate persistence rejected"); } catch (java.io.IOException expected) {}
+    Files.write(data, Arrays.asList(lines.get(0).replaceFirst("^C[0-9]+", "C1")), StandardCharsets.UTF_8);
+    try { ClaimStore.load(data, 3); throw new AssertionError("noncanonical id rejected"); } catch (Exception expected) {}
 
     WardMod mod = new WardMod(2);
     mod.getStore().claim(owner, "overworld", new BlockPos(0, 0, 0), new BlockPos(1, 1, 1));
