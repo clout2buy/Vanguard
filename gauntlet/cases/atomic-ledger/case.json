@@ -1,11 +1,12 @@
 {
   "id": "atomic-ledger",
-  "version": 3,
+  "version": 4,
   "track": "repair",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
   "publicCheck": { "command": "node", "args": ["tools/check.mjs"] },
+  "rawProcess": false,
   "protected": ["package.json", "tools/check.mjs"],
   "editableRoots": ["src/ledger.mjs"],
   "maxSteps": 80

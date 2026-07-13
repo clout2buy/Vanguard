@@ -48,7 +48,8 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       toolFailures += 1;
       const serialized = JSON.stringify(event.data).toLocaleLowerCase();
       const output = record(data?.output);
-      const isLocalTestFailure = pendingToolName === "process.run" && typeof output?.exitCode === "number";
+      const isLocalTestFailure = (pendingToolName === "process.run" || pendingToolName === "project.check")
+        && typeof output?.exitCode === "number";
       const isHarnessFailure = isLocalTestFailure && (
         serialized.includes("syntaxerror") && serialized.includes("[eval")
         || serialized.includes("err_eval_esm_cannot_print")

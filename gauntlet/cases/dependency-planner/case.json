@@ -1,11 +1,12 @@
 {
   "id": "dependency-planner",
-  "version": 2,
+  "version": 3,
   "track": "algorithm",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
   "publicCheck": { "command": "node", "args": ["tools/check.mjs"] },
+  "rawProcess": false,
   "protected": ["package.json", "tools/check.mjs"],
   "editableRoots": ["src/planner.mjs"],
   "maxSteps": 90

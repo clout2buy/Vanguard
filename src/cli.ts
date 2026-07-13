@@ -55,6 +55,7 @@ interface CliOptions {
   readonly restrictProcess: boolean;
   readonly verifierEvidence: "full" | "summary";
   readonly publicCheck?: CommandSpec;
+  readonly exposeRawProcess: boolean;
 }
 
 async function main(): Promise<void> {
@@ -137,7 +138,7 @@ async function main(): Promise<void> {
       new ReviewChangesTool(session.sourceRoot, session.workspaceRoot),
       new CheckpointTool(workingState),
       ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
-      processTool,
+      ...(options.exposeRawProcess ? [processTool] : []),
     ],
     verifiers,
     journal,
@@ -254,6 +255,7 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     protectedPaths: values.get("--protect") ?? [],
     editableRoots: values.get("--editable-root") ?? [],
     restrictProcess: parseBoolean(single(values, "--restrict-process") ?? "false", "--restrict-process"),
+    exposeRawProcess: parseBoolean(single(values, "--expose-raw-process") ?? "true", "--expose-raw-process"),
     verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence") ?? "full"),
     ...(publicCheckCommand === undefined ? {} : {
       publicCheck: { command: publicCheckCommand, args: values.get("--check-arg") ?? [] },
@@ -379,7 +381,7 @@ function progressJournal(fileJournal: FileJournal): JournalPort {
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {

@@ -82,6 +82,7 @@ try {
       $Arguments += @("--check-command", [string]$Case.publicCheck.command)
       foreach ($CheckArgument in $Case.publicCheck.args) { $Arguments += @("--check-arg", [string]$CheckArgument) }
     }
+    if ($null -ne $Case.rawProcess) { $Arguments += @("--expose-raw-process", ([string]$Case.rawProcess).ToLowerInvariant()) }
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
     foreach ($EditableRoot in $Case.editableRoots) { $Arguments += @("--editable-root", [string]$EditableRoot) }
 

@@ -1,11 +1,12 @@
 {
   "id": "async-pool",
-  "version": 3,
+  "version": 4,
   "track": "greenfield-async",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
   "publicCheck": { "command": "node", "args": ["tools/check.mjs"] },
+  "rawProcess": false,
   "protected": ["package.json", "tools/check.mjs"],
   "editableRoots": ["src/mapConcurrent.mjs"],
   "maxSteps": 130

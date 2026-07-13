@@ -44,6 +44,16 @@ test("trajectory metrics treat a non-zero local test exit as productive evidence
   assert.equal(metrics.toolFrictionFailures, 0);
 });
 
+test("trajectory metrics treat a failed trusted project check as productive evidence", () => {
+  const events: RunEvent[] = [
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "project.check" } } },
+    { sequence: 2, type: "tool.failed", data: { ok: false, output: { exitCode: 1, stderr: "assertion" } } },
+  ];
+  const metrics = analyzeTrajectory(events);
+  assert.equal(metrics.localTestFailures, 1);
+  assert.equal(metrics.toolFrictionFailures, 0);
+});
+
 test("trajectory metrics classify malformed inline tests as harness friction", () => {
   const events: RunEvent[] = [
     { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "process.run" } } },

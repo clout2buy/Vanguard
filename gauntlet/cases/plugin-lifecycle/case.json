@@ -1,11 +1,12 @@
 {
   "id": "plugin-lifecycle",
-  "version": 5,
+  "version": 6,
   "track": "multi-file",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
   "publicCheck": { "command": "node", "args": ["tools/check.mjs"] },
+  "rawProcess": false,
   "protected": ["package.json", "tools/check.mjs"],
   "editableRoots": ["src/registry.mjs"],
   "maxSteps": 140
