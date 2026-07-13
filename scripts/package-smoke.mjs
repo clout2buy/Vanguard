@@ -43,11 +43,23 @@ try {
     "dist/src/cli.js",
     "dist/src/index.js",
     "dist/src/inference/providerProfiles.js",
+    "docs/ACCEPTANCE.md",
+    "docs/ARCHITECTURE.md",
+    "docs/ARES_INTEGRATION.md",
+    "docs/CERTIFICATION.md",
+    "docs/DELEGATION.md",
     "docs/ENGINE_PROTOCOL.md",
+    "docs/INDEPENDENCE.md",
+    "docs/LIVE_RESULTS.md",
     "docs/PROVIDERS.md",
     "docs/PORTABILITY.md",
     "docs/EXTENSIONS.md",
+    "docs/TESTING.md",
     "docs/THREAT_MODEL.md",
+    "gauntlet/README.md",
+    "scripts/credential.ps1",
+    "scripts/export-credential.ps1",
+    "scripts/set-project-secret.ps1",
     "scripts/vanguard",
     "scripts/vanguard.ps1",
   ]) {
@@ -67,6 +79,32 @@ try {
     'if (typeof api.createConfiguredProviderModel !== "function") throw new Error("provider runtime export unavailable");',
     'if (typeof api.AresVanguardAdapter !== "function") throw new Error("Ares adapter export unavailable");',
   ].join("\n")], consumer);
+  await writeFile(path.join(consumer, "consumer.ts"), [
+    'import { AresVanguardAdapter, VanguardEngine, VANGUARD_PROTOCOL_VERSION } from "vanguard";',
+    'const version: 1 = VANGUARD_PROTOCOL_VERSION;',
+    'const engineType: typeof VanguardEngine = VanguardEngine;',
+    'const adapterType: typeof AresVanguardAdapter = AresVanguardAdapter;',
+    'void version; void engineType; void adapterType;',
+  ].join("\n"), "utf8");
+  run(process.execPath, [
+    path.join(root, "node_modules", "typescript", "bin", "tsc"),
+    "--noEmit", "--strict", "--target", "ES2022", "--module", "NodeNext",
+    "--moduleResolution", "NodeNext", "--types", "node",
+    "--typeRoots", path.join(root, "node_modules", "@types"), "consumer.ts",
+  ], consumer);
+  const credentialHelper = path.join(consumer, "node_modules", "vanguard", "scripts", "export-credential.ps1");
+  const helperResult = spawnSync("powershell.exe", [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    "-File", credentialHelper, "-Provider", "deepseek",
+    "-Root", path.join(consumer, "node_modules", "vanguard"),
+  ], {
+    cwd: consumer,
+    encoding: "utf8",
+    env: { ...process.env, DEEPSEEK_API_KEY: "vanguard-pack-smoke-nonsecret" },
+    windowsHide: true,
+  });
+  assert.equal(helperResult.status, 0, helperResult.stderr);
+  assert.equal(helperResult.stdout, "vanguard-pack-smoke-nonsecret");
   const help = run(process.execPath, [path.join(consumer, "node_modules", "vanguard", "dist", "src", "cli.js"), "--help"], consumer);
   assert.match(help, /Vanguard expert coding agent/u);
   const installed = JSON.parse(await readFile(path.join(consumer, "node_modules", "vanguard", "package.json"), "utf8"));
