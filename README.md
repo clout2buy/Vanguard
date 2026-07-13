@@ -14,12 +14,22 @@ The same surface is available in TypeScript through `VanguardEngine`. See
 [`docs/ENGINE_PROTOCOL.md`](docs/ENGINE_PROTOCOL.md) and the clients under
 `examples/`.
 
+The off-by-default Ares migration adapter, rollout/kill-switch contract, and
+20-user beta protocol are documented in
+[`docs/ARES_INTEGRATION.md`](docs/ARES_INTEGRATION.md).
+
 Native provider support uses documented HTTP contracts plus API keys or an
 explicit custom endpoint; it never extracts another CLI's OAuth/session
 tokens. Versioned provider profiles and the offline conformance boundary are
 documented in [`docs/PROVIDERS.md`](docs/PROVIDERS.md). Supported Node/OS
 versions, launchers, and clean-tarball smoke testing are documented in
 [`docs/PORTABILITY.md`](docs/PORTABILITY.md).
+
+Security posture is explicit rather than implied. Interactive coding defaults
+to the compatibility-oriented `workspace` profile; evaluation can select the
+fail-closed `guarded` profile. Neither is advertised as a cross-language OS
+sandbox—untrusted repositories and certification runs need host-supplied
+container or VM isolation. See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 
 ## Core invariants
 

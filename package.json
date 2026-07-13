@@ -22,6 +22,7 @@
     "docs/PORTABILITY.md",
     "docs/PROVIDERS.md",
     "docs/ARES_INTEGRATION.md",
+    "docs/THREAT_MODEL.md",
     "examples",
     "scripts/vanguard",
     "scripts/vanguard.ps1",
