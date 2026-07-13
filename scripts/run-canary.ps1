@@ -261,6 +261,12 @@ finally {
         $GauntletExit = 3
       }
     }
+    $HarnessCommitStart = if ($null -eq $HarnessGitStart) { $null } else { $HarnessGitStart.commit }
+    $HarnessCommitEnd = if ($null -eq $HarnessGitEnd) { $null } else { $HarnessGitEnd.commit }
+    $HarnessChangesStart = [object[]]@()
+    $HarnessChangesEnd = [object[]]@()
+    if ($null -ne $HarnessGitStart) { $HarnessChangesStart = [object[]]@($HarnessGitStart.changes) }
+    if ($null -ne $HarnessGitEnd) { $HarnessChangesEnd = [object[]]@($HarnessGitEnd.changes) }
     $Wrapped = [pscustomobject]@{
       schemaVersion = 3
       layer = "development-canary"
@@ -290,10 +296,10 @@ finally {
       }
       evaluatorHarnessSource = [pscustomobject]@{
         repositoryRoot = $Root
-        commitStart = if ($null -eq $HarnessGitStart) { $null } else { $HarnessGitStart.commit }
-        commitEnd = if ($null -eq $HarnessGitEnd) { $null } else { $HarnessGitEnd.commit }
-        changesStart = if ($null -eq $HarnessGitStart) { @() } else { @($HarnessGitStart.changes) }
-        changesEnd = if ($null -eq $HarnessGitEnd) { @() } else { @($HarnessGitEnd.changes) }
+        commitStart = $HarnessCommitStart
+        commitEnd = $HarnessCommitEnd
+        changesStart = $HarnessChangesStart
+        changesEnd = $HarnessChangesEnd
         manifestStart = $HarnessSourceStart
         manifestEnd = $HarnessSourceEnd
       }
