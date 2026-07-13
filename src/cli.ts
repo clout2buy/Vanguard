@@ -487,7 +487,6 @@ async function buildExecutionRuntime(
       verification: options.verification,
       ...(options.publicCheck === undefined ? {} : { publicCheck: options.publicCheck }),
       protectedPaths: options.protectedPaths,
-      verifierEvidence: options.verifierEvidence,
       maxDurationMs: Math.min(options.maxDurationMs, 30 * 60 * 1_000),
       commandTimeoutMs,
       maxContextBytes: options.maxContextBytes,

@@ -28,7 +28,6 @@ export interface DelegateChildConfiguration {
   readonly verification: CommandSpec;
   readonly publicCheck?: CommandSpec;
   readonly protectedPaths?: readonly string[];
-  readonly verifierEvidence?: "full" | "summary";
   /** Hard wall-clock cap inherited from, and no greater than, the parent. */
   readonly maxDurationMs: number;
   readonly commandTimeoutMs: number;
@@ -197,9 +196,12 @@ export class CliDelegateRunner implements DelegateRunnerPort {
       // Children receive the fixed project check and syntax tools, but no
       // arbitrary subprocess surface. This keeps provider credentials in the
       // inference process rather than exposing them to model-authored code.
+      "--security-profile", "guarded",
       "--restrict-process", "true",
       "--expose-raw-process", "false",
-      "--verifier-evidence", configuration.verifierEvidence ?? "summary",
+      // A child's completion grader is always private, even when the parent
+      // interactive session elected to see full evidence from its own check.
+      "--verifier-evidence", "summary",
     ];
     if (configuration.endpoint !== undefined) args.push("--endpoint", configuration.endpoint);
     for (const argument of configuration.verification.args) args.push("--verify-arg", argument);
