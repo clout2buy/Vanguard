@@ -1,10 +1,13 @@
 # Portability and packaging
 
-Vanguard is a Node.js ESM package. The supported runtime range is
-`>=20.19 <25`, tested as the Node 20.19, 22, and 24 lines on Windows, macOS,
-and Linux. The CI definition is `.github/workflows/portability.yml`; it runs
-the full suite and a clean packed-artifact install on every matrix cell with
-no provider credentials.
+Vanguard is a Node.js ESM package. The declared runtime range is
+`>=20.19 <25`. The target matrix is Node 20.19, 22, and 24 on Windows, macOS,
+and Linux. The CI definition is `.github/workflows/portability.yml`; it is
+configured to run the full suite and a clean packed-artifact install on every
+matrix cell with no provider credentials. At this checkpoint the workflow is
+authored but has not produced a recorded nine-cell run, so only the local
+Windows checks and clean-package smoke recorded in `docs/MASTER_REPORT.md`
+count as executed evidence.
 
 ## Launch behavior
 

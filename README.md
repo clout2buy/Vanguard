@@ -2,7 +2,16 @@
 
 Vanguard is a clean-room, verification-first coding-agent kernel. Its purpose is not to sound capable; it must repeatedly produce correct, maintainable software under measured conditions.
 
-The repository begins with an intentionally small kernel and a private gauntlet. Vanguard will not replace Ares's core until it passes the acceptance gates in [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md).
+The repository began with an intentionally small kernel and a private gauntlet.
+Phases 0–12 are implemented locally, the Phase 13 certification drivetrain is
+built, and the Phase 14 Ares adapter is integration-ready. The current status
+is still **not competitively certified** and **external beta pending**: no
+Claude Code, Codex, or OpenCode parity/superiority claim is valid until the
+frozen external experiment in
+[`docs/CERTIFICATION.md`](docs/CERTIFICATION.md) selects one, and Vanguard
+must not replace Ares's coding core by default until the gates in
+[`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) and the external soak in
+[`docs/ARES_INTEGRATION.md`](docs/ARES_INTEGRATION.md) pass.
 
 It also exposes a versioned engine surface for embedding in other agents:
 

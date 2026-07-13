@@ -32,7 +32,10 @@ runtime rather than the prompt. Optional process-level caps are
 The child starts `vanguard run` against the *parent's disposable workspace*.
 Session materialization copies that tree before the child receives mutation
 tools. The provider, model, fixed public check, and sealed verification command
-are inherited. Credentials cross only through the inherited process
+are inherited. Every production child is nevertheless forced into the
+`guarded` security profile with restricted process execution, no raw process
+tool, and summary-only verifier feedback; a parent cannot downgrade those
+settings. Credentials cross only through the inherited process
 environment; they are never placed in argv, the delegation ledger, the review
 manifest, or public events. Endpoint URLs containing user info or secret-like
 query parameters are rejected rather than copied into child arguments.
@@ -85,7 +88,8 @@ must inspect its status and explicitly merge or ignore it.
 
 Delegation improves parallelism and separation of concerns; it does not by
 itself prove coding quality or competitive parity. Children currently inherit
-one provider/model and one fixed verifier from their parent. Cross-model panels,
-semantic patch composition, and OS job-object containment after a hard parent
-kill remain possible future layers. Certification still depends on the frozen,
-blinded Phase-13 evaluation rather than the existence of this feature.
+one provider/model and one fixed verifier command from their parent while the
+runtime independently forces guarded, summary-only execution. Cross-model
+panels, semantic patch composition, and OS job-object containment after a hard
+parent kill remain possible future layers. Certification still depends on the
+frozen, blinded Phase-13 evaluation rather than the existence of this feature.

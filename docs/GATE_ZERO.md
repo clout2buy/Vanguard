@@ -29,8 +29,10 @@ eventually certify it. It uses three strictly separated layers.
 
 ## Layer 2 — Shadow regression set (sealed, run at milestones)
 
-- **Contents:** sealed tasks authored at the Phase 6 milestone, stored outside
-  the working tree, never inspected during routine development.
+- **Contents:** sealed tasks stored outside the working tree and never
+  inspected during routine development. The planned Phase 6 authoring
+  milestone was missed; no shadow result may be claimed until an independent
+  owner supplies and freezes this set.
 - **Cadence:** run only at major milestones (after Phases 6, 10, and 12).
 - **Visibility:** only aggregate pass/fail counts and cost totals are exposed
   to development. Individual transcripts are not read unless a task is being
@@ -39,8 +41,10 @@ eventually certify it. It uses three strictly separated layers.
 
 ## Layer 3 — Certification holdout (never run before freeze)
 
-- **Contents:** the hidden corpus defined by `docs/EVALUATION_PROTOCOL.md`
-  (Phase 13): minimum 96 tasks across 24+ unfamiliar repositories.
+- **Contents:** the hidden corpus and statistical design defined by
+  `docs/CERTIFICATION.md` (Phase 13). The current planning draft targets 192
+  never-run tasks across at least 24 independently sourced repository groups;
+  it is not itself a frozen holdout manifest.
 - **Cadence:** executed exactly once, against the frozen Vanguard commit and
   frozen competitor versions, by an evaluator outside Vanguard's runtime.
 - **Rule:** no task in this layer may ever have been executed by any Vanguard

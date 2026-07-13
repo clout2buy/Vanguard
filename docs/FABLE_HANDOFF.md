@@ -1,5 +1,11 @@
 # Vanguard: Ares Core-Replacement Handoff
 
+> **Historical handoff, not current status.** This document preserves the
+> design brief and evidence available when Fable began the Elite Engine work.
+> Its phase labels, commit hashes, test counts, and open-item list are
+> intentionally archival. Use `MASTER_REPORT.md`, `CERTIFICATION.md`, and
+> `ARES_INTEGRATION.md` for current implementation and release status.
+
 > **Status update (2026-07-13, Fable):** P0 is implemented, with one deliberate deviation: instead of a separate `ConversationController` in front of the kernel, the kernel itself is now stateful (conversation → observe-only → clarification → contracted execution → waiting-for-user → verification), so one loop owns context assembly, journaling, and resume. `ModelDecision` is now `respond | ask_user | execute | tools | complete`; bare model text decodes as a reply/narration and can never trigger verification; completion requires an explicit `task.complete` call; `task.execute` contracts gate all mutation tools; the workspace copy materializes only at contract time; `launchConversationResponse()` is deleted. Parallel read-only tool calls landed as part of the same contract rework. Durable `user.ask` pauses work across resume (acceptance test 8), though mid-run steering IPC (test 9) and review/apply (P2) remain. Suite: 92/92.
 
 ## Executive brief

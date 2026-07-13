@@ -1,16 +1,45 @@
 # Vanguard Elite Engine — Master Report
 
-Continuously updated execution record for the master directive. Every phase
-records its commits, intended KPI, before/after canary metrics, regressions,
-invalidated results, and unresolved risks. Implementation completion is never
-described as competitive certification.
+Continuously updated execution record for the master directive. It tracks
+phase commits, intended KPIs, implementation and adversarial evidence,
+invalidated results, and unresolved risks. Canary metrics are recorded only
+when a run clears the Gate Zero validity boundary; missing runs stay explicit.
+Implementation completion is never described as competitive certification.
 
 Baseline: commit `4430711` (conversational kernel + streaming + steering),
 104 tests, live DeepSeek smoke verified. Pre-registered certificate outcomes:
 **none / overall parity / parity with scoped superiority / overall
 superiority** — the evidence selects the language afterward.
 
+## Current program status
+
+This table records implementation status, not certification or release-gate
+completion. A locally complete subsystem cannot substitute for a valid canary,
+sealed regression corpus, external competitive evaluation, or human beta.
+
+| Phase | Primary commits | Current status |
+|---|---|---|
+| 0 — Gate Zero | `d8c3e9f`, `a9aeae5` | Reproducible runner implemented; valid pinned final canary and sealed shadow set pending. |
+| 1 — stream lifecycle | `2a2dcff` | Locally implemented and adversarially tested. |
+| 2 — plan spine | `bd433b7`, `17d5b9a` | Locally implemented and adversarially tested. |
+| 3 — durable context/cost | `8fd8edb` | Locally implemented; paid cache-hit evidence pending. |
+| 4 — repository intelligence | `ba9c1d4`, `651ec1c` | Locally implemented at the documented deep/generic support tiers. |
+| 5 — review/apply/time travel | `cc0b85d` | Locally implemented and transaction-fault tested. |
+| 6 — adaptive recovery | `a89a9fd` | Locally implemented; live provider chaos remains external evidence. |
+| 7 — delegation | `d07ae76`, `d2c18e9` | Locally implemented; children are forced into guarded, summary-evidence mode. |
+| 8 — engine protocol | `9df3847` | Locally implemented and exported. |
+| 9 — extensibility | `3f62902` | Locally implemented within the documented trust boundary. |
+| 10 — product flow | `8c00d49`, `79d9a91` | TUI dogfoods the public engine; terminal/user study evidence pending. |
+| 11 — providers/portability | `df1d16a` | Offline conformance and local Windows package smoke complete; nine-cell CI run pending. |
+| 12 — security | `c811295` | Local boundary implemented; no OS-sandbox or penetration-test claim. |
+| 13 — certification | `0737521` | External-evaluator drivetrain locally complete; no holdout runs or certificate exist. |
+| 14 — Ares integration | `5c68915`, `c0aac44` | Off-by-default adapter locally complete; 20-user/200-attempt beta pending. |
+
 ## Phase ledger
+
+The numbered status table above is canonical. The detailed entries below
+retain their merge chronology, which is why the Phase 7–8 entries precede
+Phase 5–6 in this historical execution record.
 
 ### Phase 0 — Gate Zero infrastructure
 
@@ -172,8 +201,10 @@ superiority** — the evidence selects the language afterward.
   merged, and leaves the original project untouched. The compiled proof also
   confirms a depth-one child is not offered recursive delegation.
 - **Boundary:** this is execution infrastructure, not competitive
-  certification. Children currently inherit the parent's provider/model and
-  verifier. See `docs/DELEGATION.md`.
+  certification. Children inherit the parent's provider/model and fixed
+  verifier command, but production child launches are unconditionally forced
+  into the guarded security profile with summary-only verifier evidence. See
+  `docs/DELEGATION.md`.
 - **Tests:** full rebased Windows suite: 235 cases, 234 passed, one intentional
   POSIX-only mode-bit assertion skipped, zero failures.
 
@@ -435,15 +466,7 @@ superiority** — the evidence selects the language afterward.
   run is actually completed through that boundary. (Historical invalidations
   remain in `docs/LIVE_RESULTS.md`.)
 
-## Unresolved risks (program level)
-
-- Shadow regression set not yet authored (scheduled at Phase 6 milestone).
-- Certification holdout untouched by design; evaluator harness (outside
-  Vanguard's runtime) not yet built (Phase 13).
-- Canary layer runs on live DeepSeek and spends real credits; runs are
-  logged with commit provenance.
-
-## Phase 13 — external certification infrastructure (locally complete; no certificate)
+### Phase 13 — external certification infrastructure (locally complete; no certificate)
 
 - **Statistical correction:** schema v2 freezes repository/group provenance
   and resamples independence-group means only after repetitions are averaged
@@ -478,3 +501,52 @@ superiority** — the evidence selects the language afterward.
   real competitor adapters, 2,304 planned isolated executions, independent
   human reviews, and resulting clustered confidence intervals do not exist in
   this repository. Status remains **not certified** until those occur.
+
+### Phase 14 — guarded Ares integration (locally complete; beta pending)
+
+- **Intended KPI:** introduce Vanguard without silent double execution,
+  privacy expansion, event-order ambiguity, or an irreversible default-on
+  cutover. Competitive capability remains a separate Phase-13 question.
+- **Implemented:** an exported `AresVanguardAdapter` that consumes only the
+  public `VanguardEngine`; off-by-default deterministic cohorts; explicit
+  opt-in; a live kill switch; safe fallback only before any possible mutation;
+  terminal `manual_recovery` after a tool boundary, replay gap, uncertain
+  transport state, or unacknowledged interrupt; bounded, ordered, gap-aware
+  event projection; and HMAC-pseudonymous metadata-only beta telemetry.
+- **Integration proof:** tests cover rollout selection, non-consenting control
+  users, startup fallback, post-tool no-replay, kill-switch races, uncertain
+  cancellation, cursor gaps/order, telemetry schema rejection/redaction, and
+  the public engine adapter seam. `79d9a91` additionally closes an engine
+  double-advance race and contains queued steering callback failures.
+- **External gate remains:** `docs/ARES_INTEGRATION.md` pre-registers exactly
+  20 consenting users, 200 task attempts, four held waves, independent patch
+  review, incident gates, and a final seven-day observation period. None of
+  those user attempts or elapsed-time records has occurred. Status is
+  **integration-ready, beta pending**, not approved for default-on replacement.
+
+## Remaining release evidence
+
+- Produce a `status: valid` canary from the final pinned commit using the
+  hardened Gate Zero runner. This is regression evidence only, not a
+  competitive certificate.
+- Supply and freeze the missed sealed shadow regression set outside the
+  development tree, then run it without exposing task-level contents.
+- Execute the authored Windows/macOS/Linux × Node 20.19/22/24 workflow and
+  retain the nine-cell results; local Windows success cannot stand in for it.
+- Have an independent evaluator freeze the never-run Phase-13 holdout, engine
+  adapters and budgets, isolation trust roots, reviewer rubric, and cost
+  assumptions; then complete all planned 2,304 isolated executions and
+  blinded reviews. Only the resulting clustered certificate can support a
+  parity or superiority claim.
+- Complete the Phase-14 20-user/200-attempt beta, hold periods, incident
+  review, and seven-day final observation before enabling Vanguard as Ares's
+  default coding core.
+- For untrusted repositories, provide and attest the external container/VM
+  boundary described in `docs/THREAT_MODEL.md`; local security tests do not
+  establish OS isolation or third-party penetration-test assurance.
+
+Until those records exist, the strongest defensible project-level statement
+is: **Vanguard is a locally implemented supervised-alpha coding-engine candidate
+with promising scoped live results; it is not certified as equal or superior
+to Claude Code, Codex, or OpenCode, and it is not approved for default-on Ares
+replacement.**
