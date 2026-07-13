@@ -7,6 +7,18 @@
   "bin": {
     "vanguard": "./dist/src/cli.js"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "docs/ENGINE_PROTOCOL.md",
+    "examples",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",

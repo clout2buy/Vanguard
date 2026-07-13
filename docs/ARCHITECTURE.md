@@ -33,6 +33,16 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 5. **Gauntlet:** sealed tasks, deterministic graders, regression tracking, competitor-blind comparisons.
 6. **Ares adapter:** translation only; no Vanguard policy should live in the adapter.
 
+## Engine boundary
+
+Phase 8 adds a transport-neutral `VanguardEngine` above the runtime. It owns
+durable session registration, non-blocking advance/steer/cancel lifecycle,
+sanitized event ordering, and bounded replay. The `serve --stdio` adapter is a
+versioned NDJSON projection of that API; it contains no model prompts or
+completion policy. The existing CLI runtime currently runs as an isolated
+worker behind the engine, which keeps provider credentials and raw wire
+payloads outside the public protocol. See `docs/ENGINE_PROTOCOL.md`.
+
 ## Implemented foundation
 
 - Stateful conversational kernel: one loop owns conversation, observation, clarification, contracted execution, waiting-for-user, and verification as journal-restored modes

@@ -4,6 +4,16 @@ Vanguard is a clean-room, verification-first coding-agent kernel. Its purpose is
 
 The repository begins with an intentionally small kernel and a private gauntlet. Vanguard will not replace Ares's core until it passes the acceptance gates in [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md).
 
+It also exposes a versioned engine surface for embedding in other agents:
+
+```powershell
+vanguard serve --stdio
+```
+
+The same surface is available in TypeScript through `VanguardEngine`. See
+[`docs/ENGINE_PROTOCOL.md`](docs/ENGINE_PROTOCOL.md) and the clients under
+`examples/`.
+
 ## Core invariants
 
 1. A model proposes actions; it does not decide whether its own work succeeded.

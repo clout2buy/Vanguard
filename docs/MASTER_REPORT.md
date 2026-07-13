@@ -146,6 +146,39 @@ superiority** — the evidence selects the language afterward.
   structural on missing toolchain (no false failure), and gives unknown types
   no gate.
 
+### Phase 8 — Universal engine surface
+
+- **Intended KPI:** one stable engine contract usable by Vanguard's terminal,
+  Ares, and third-party agents without reimplementing session or verification
+  semantics; exact event order under long-running concurrent work; no private
+  provider state crossing the adapter.
+- **Implemented:** exported `VanguardEngine` TypeScript API; versioned v1
+  capability handshake; `create/resume/advance/steer/cancel/status/events`;
+  non-blocking concurrent sessions; per-session monotonic replay cursors with
+  explicit bounded-window gaps; deterministic restart reconstruction from the
+  validated journal; and `vanguard serve --stdio` with partial-chunk + CRLF
+  NDJSON framing, UTF-8 validation, 1 MiB frame limits, bounded/backpressured
+  output, request IDs, structured errors, and disconnect cancellation.
+- **Isolation:** stdout is protocol-only. The established CLI runtime executes
+  behind the engine worker seam; worker stdout and raw provider payloads are
+  never forwarded. Public events are property-allowlisted and credential-
+  redacted a second time, so reasoning/thinking/continuations cannot leak even
+  if a producer object grows new private fields.
+- **Adversarial proof:** arbitrary byte chunking, CRLF, malformed JSON, invalid
+  UTF-8, oversized-frame recovery, queue overflow, unknown versions and
+  operations, malformed params, two concurrently active sessions with
+  independent cursors, live steering, cancellation, disconnect cleanup,
+  bounded replay gaps, secret/raw/reasoning stripping, and restart/resume
+  replay from a hash-chained journal. Public embedding and stdio client
+  examples live under `examples/`.
+- **Tests:** 146/146 (134 inherited + 12 Phase-8 protocol/engine cases).
+- **Honest remaining work:** the current TUI still launches the legacy
+  `advance` child directly; making it dogfood `serve --stdio` is intentionally
+  deferred to the Phase 10 product rewrite rather than coupling protocol
+  correctness to terminal rendering. Restart replay includes durable journal
+  events, not provisional SSE deltas that were never committed. This is an
+  implementation milestone, not evidence of competitive coding parity.
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development
