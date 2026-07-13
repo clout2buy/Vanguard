@@ -209,7 +209,10 @@ export class AgentKernel {
     let mutationNeedsExecutionEvidence = restored.mutationNeedsExecutionEvidence;
     let mutationNeedsReview = restored.mutationNeedsReview;
     let pendingQuestion = restored.pendingQuestion;
-    let consecutiveNarrations = 0;
+    // Narration strikes survive restarts: a model that stalled in narration
+    // before an interruption must not get a fresh allowance on resume unless
+    // the user actually said something new.
+    let consecutiveNarrations = input.userMessage === undefined ? restored.trailingNarrations : 0;
     this.#sequence = restored.sequence;
 
     if (restored.completed) throw new Error("Cannot resume a completed Vanguard run.");
@@ -395,13 +398,22 @@ export class AgentKernel {
       }
 
       // decision.kind === "tools"
-      if (decision.calls.length === 0) {
+      const malformedBatch = decision.calls.length === 0
+        ? "The tools decision contained no calls."
+        : new Set(decision.calls.map((call) => call.id)).size !== decision.calls.length
+          ? "The tools decision reused a call id; every call in a batch needs a unique id."
+          : undefined;
+      if (malformedBatch !== undefined) {
         const observation: ToolObservation = {
-          callId: "empty-batch", tool: "tools", ok: false,
-          error: "The tools decision contained no calls.",
+          callId: "malformed-batch", tool: "tools", ok: false, error: malformedBatch,
         };
         transcript.push({ role: "observation", content: observation as unknown as JsonValue });
         await this.#record("tool.failed", observation as unknown as JsonValue);
+        const count = (actionFailures.get("malformed-batch") ?? 0) + 1;
+        actionFailures.set("malformed-batch", count);
+        if (count >= this.#options.maxRepeatedAction) {
+          return this.#fail("Repeated malformed tool batches.", step);
+        }
         continue;
       }
       const batchOutcome = await this.#executeBatch(decision.calls, {
@@ -541,6 +553,7 @@ interface RestoredSession {
   readonly completed: boolean;
   readonly pendingQuestion: string | undefined;
   readonly interruptedCalls: readonly ToolCall[];
+  readonly trailingNarrations: number;
 }
 
 function restoreSession(
@@ -565,6 +578,7 @@ function restoreSession(
   let pendingCompletion = false;
   let completed = false;
   let pendingQuestion: string | undefined;
+  let trailingNarrations = 0;
 
   const flushCompletion = () => {
     if (pendingCompletion && completionClaimFailed) failedVerificationAttempts += 1;
@@ -599,6 +613,7 @@ function restoreSession(
       const data = recordValue(event.data);
       if (typeof data?.text === "string") transcript.push({ role: "user", content: data.text });
       pendingQuestion = undefined;
+      trailingNarrations = 0;
       continue;
     }
     if (event.type === "run.waiting_for_user") {
@@ -617,6 +632,7 @@ function restoreSession(
       completedSteps += 1;
       pendingCalls = decision?.kind === "tools" ? [...decision.calls] : [];
       pendingCompletion = decision?.kind === "complete";
+      trailingNarrations = decision?.kind === "respond" ? trailingNarrations + 1 : 0;
       continue;
     }
     if (event.type === "tool.completed" || event.type === "tool.failed") {
@@ -671,6 +687,7 @@ function restoreSession(
     completed,
     pendingQuestion,
     interruptedCalls: pendingCalls,
+    trailingNarrations,
   };
 }
 

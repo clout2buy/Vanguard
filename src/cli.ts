@@ -179,6 +179,16 @@ async function advanceSession(
   if (!session.materialized) {
     session = await materializeSessionWorkspace(session);
     emitSessionReady(session, container, journalFile, scorecardFile, true);
+    if (session.sourceChangedDuringConversation === true) {
+      process.stderr.write("[Vanguard] The original project changed during the conversation; the workspace copy uses the current state. Stale-content preconditions will force fresh reads before any edit.\n");
+      streamPublicEvent({
+        type: "source.changed",
+        agentId: "main",
+        status: "info",
+        title: "Original project changed during conversation",
+        detail: "The workspace copy uses the current state",
+      });
+    }
   }
 
   const runtime = await buildExecutionRuntime(session, options, fileJournal, true);

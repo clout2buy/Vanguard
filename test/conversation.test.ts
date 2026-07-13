@@ -198,6 +198,70 @@ test("a completion claim before any contract is treated as an ordinary reply", a
   assert.equal(journal.events.some((event) => event.type === "verification.completed"), false);
 });
 
+test("a batch that reuses a call id is refused and repeated abuse fails the run", async () => {
+  const journal = new MemoryJournal();
+  const duplicate: ModelDecision = {
+    kind: "tools",
+    calls: [
+      { id: "same", name: "workspace.read", input: { path: "a.ts" } },
+      { id: "same", name: "workspace.read", input: { path: "b.ts" } },
+    ],
+  };
+  let reads = 0;
+  const kernel = new AgentKernel({
+    model: new CapturingModel([duplicate, duplicate]),
+    tools: [observeTool("workspace.read", () => { reads += 1; })],
+    verifiers: [neverVerifier],
+    journal,
+    options: { maxRepeatedAction: 2 },
+  });
+  const outcome = await kernel.run("survey");
+  assert.equal(reads, 0, "no call in a malformed batch may execute");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /malformed tool batches/);
+  assert.match(JSON.stringify(journal.events), /unique id/);
+});
+
+test("narration strikes persist across an interruption and resume", async () => {
+  const firstJournal = new MemoryJournal();
+  const first = new AgentKernel({
+    model: new CapturingModel([
+      { kind: "respond", message: "thinking" },
+      { kind: "respond", message: "still thinking" },
+    ]),
+    tools: [],
+    verifiers: [neverVerifier],
+    journal: firstJournal,
+  });
+  // The script runs out after two narrations, simulating an interruption.
+  assert.equal((await first.run("do the work")).status, "failed");
+
+  const resumed = new AgentKernel({
+    model: new CapturingModel([{ kind: "respond", message: "hmm" }]),
+    tools: [],
+    verifiers: [neverVerifier],
+    journal: new MemoryJournal(),
+  });
+  const outcome = await resumed.advance({}, new AbortController().signal,
+    firstJournal.events.filter((event) => event.type !== "run.failed"));
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /narration/,
+    "a restart must not grant a fresh narration allowance");
+
+  const steered = new AgentKernel({
+    model: new CapturingModel([{ kind: "respond", message: "adjusting per your note" }, { kind: "complete", answer: "done" }]),
+    tools: [],
+    verifiers: [{ name: "tests", async verify() { return { verifier: "tests", passed: true, evidence: "ok" }; } }],
+    journal: new MemoryJournal(),
+  });
+  const steeredOutcome = await steered.advance(
+    { userMessage: "Focus on the parser first." },
+    new AbortController().signal,
+    firstJournal.events.filter((event) => event.type !== "run.failed"),
+  );
+  assert.equal(steeredOutcome.status, "completed", "a new user message resets the narration allowance");
+});
+
 test("a conversation turn that never yields to the user fails its step budget honestly", async () => {
   const decisions: ModelDecision[] = Array.from({ length: 20 }, (_value, index) => ({
     kind: "tools" as const,
