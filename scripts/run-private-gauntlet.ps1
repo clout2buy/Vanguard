@@ -73,11 +73,15 @@ try {
       "--verify-arg", ".",
       "--restrict-process", "true",
       "--verifier-evidence", "summary",
-      "--max-duration-ms", "600000",
+      "--max-duration-ms", $(if ($null -eq $Case.maxDurationMs) { "600000" } else { [string]$Case.maxDurationMs }),
       "--max-verification-attempts", "3",
       "--max-steps", [string]$Case.maxSteps
     )
     if ($null -ne $Case.maxContextBytes) { $Arguments += @("--max-context-bytes", [string]$Case.maxContextBytes) }
+    if ($null -ne $Case.publicCheck) {
+      $Arguments += @("--check-command", [string]$Case.publicCheck.command)
+      foreach ($CheckArgument in $Case.publicCheck.args) { $Arguments += @("--check-arg", [string]$CheckArgument) }
+    }
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
     foreach ($EditableRoot in $Case.editableRoots) { $Arguments += @("--editable-root", [string]$EditableRoot) }
 

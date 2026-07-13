@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   CommandVerifier,
   DeleteFileTool,
+  FixedCommandTool,
   ListFilesTool,
   ProcessTool,
   ReadFileTool,
@@ -194,6 +195,25 @@ test("process tool enforces its command allowlist", async () => {
         : "",
       "ok",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fixed command tool exposes a trusted check without model-controlled arguments", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-fixed-command-"));
+  try {
+    const processTool = new ProcessTool(new WorkspaceBoundary(root), { allowedCommands: [process.execPath] });
+    const tool = new FixedCommandTool(
+      "project.check",
+      "run fixed check",
+      processTool,
+      { command: process.execPath, args: ["-e", "process.stdout.write('fixed')"] },
+    );
+    const result = await tool.execute({}, context);
+    assert.equal(result.ok, true);
+    assert.match(JSON.stringify(result.output), /fixed/);
+    await assert.rejects(() => tool.execute({ args: ["malicious"] }, context), /does not accept arguments/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

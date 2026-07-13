@@ -1,15 +1,17 @@
 {
   "id": "ward-mod",
-  "version": 1,
+  "version": 2,
   "track": "long-horizon-mod",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
+  "publicCheck": { "command": "node", "args": ["tools/check.mjs"] },
   "protected": [
     "package.json",
     "build.gradle",
     "settings.gradle",
     "tools/check.mjs",
+    "tools/PublicWardHarness.java",
     "src/main/java/dev/vanguard/ward/api/BlockPos.java",
     "src/main/java/dev/vanguard/ward/api/PlayerContext.java",
     "src/main/java/dev/vanguard/ward/CommandResult.java"
@@ -24,5 +26,6 @@
     "src/main/resources/assets/ward/lang/en_us.json"
   ],
   "maxSteps": 260,
-  "maxContextBytes": 120000
+  "maxContextBytes": 120000,
+  "maxDurationMs": 7200000
 }

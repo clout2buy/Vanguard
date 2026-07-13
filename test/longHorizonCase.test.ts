@@ -12,11 +12,14 @@ test("ward-mod sealed grader rejects stubs and accepts the independent reference
   const root = path.resolve("gauntlet", "cases", "ward-mod");
   const grader = path.join(root, "grader.mjs");
   await assert.rejects(() => execute(process.execPath, [grader, path.join(root, "workspace")], { maxBuffer: 5_000_000 }));
+  await assert.rejects(() => execute(process.execPath, [path.join(root, "workspace", "tools", "check.mjs")], { maxBuffer: 5_000_000 }));
   const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-ward-reference-"));
   const workspace = path.join(container, "workspace");
   try {
     await cp(path.join(root, "workspace"), workspace, { recursive: true });
     await cp(path.join(root, "reference"), workspace, { recursive: true, force: true });
+    const publicCheck = await execute(process.execPath, [path.join(workspace, "tools", "check.mjs")], { maxBuffer: 5_000_000 });
+    assert.match(publicCheck.stdout, /public compile and behavior checks passed/);
     const { stdout } = await execute(process.execPath, [grader, workspace], { maxBuffer: 5_000_000 });
     assert.match(stdout, /sealed grader passed/);
   } finally {

@@ -43,7 +43,9 @@ public final class WardHarness {
     store.claim(stranger, "nether", new BlockPos(0, 0, 0), new BlockPos(2, 2, 2));
     rejects(() -> store.claim(owner, "overworld", new BlockPos(10, 0, 0), new BlockPos(11, 1, 1)), "owner limit enforced");
     try { store.all().clear(); throw new AssertionError("snapshot immutable"); } catch (UnsupportedOperationException expected) {}
-    rejects(() -> store.remove(first.getId(), stranger, false), "stranger cannot remove");
+    boolean unauthorizedRemoval = false;
+    try { unauthorizedRemoval = store.remove(first.getId(), stranger, false); } catch (SecurityException acceptable) {}
+    check(!unauthorizedRemoval && store.findById(first.getId()).isPresent(), "stranger cannot remove");
 
     PermissionService permissions = new PermissionService(store);
     PlayerContext ownerContext = new PlayerContext(owner, "overworld", new BlockPos(1, 1, 1), false);
