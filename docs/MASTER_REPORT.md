@@ -476,39 +476,73 @@ Phase 5–6 in this historical execution record.
 
 ### Phase 13 — external certification infrastructure (locally complete; no certificate)
 
-- **Statistical correction:** schema v2 freezes repository/group provenance
+- **Statistical correction:** schema v3 freezes repository/group provenance
   and resamples independence-group means only after repetitions are averaged
   within tasks. Reports expose raw paired runs, tasks, repositories, and true
   independent groups. Individual repetitions can no longer inflate a
   confidence interval.
 - **Method freeze:** executable and environment digests plus provider, model,
   reasoning effort, tool/step/token budgets, and exact CLI arguments are
-  mandatory per engine and task track. An omitted effort knob invalidates the
-  manifest instead of inheriting a vendor default.
+  mandatory per engine, comparison track, and category. Both
+  `harness-controlled` and `product-native` tracks are mandatory and reported/
+  gated separately; controlled categories require identical model, effort, and
+  budgets across engines. Claim thresholds cannot weaken past 95% confidence,
+  -0.10 non-inferiority, 2x cost, or zero extra interventions. An omitted or
+  exceeded knob fails closed.
+- **Closed input contract:** manifest schema v3 closes every nested public
+  schema and freezes an `inputBundleSha256` over the exact prompt/specification
+  and immutable task inputs. Unknown identity hints, prompt overrides, or
+  runtime knobs are rejected, and the input bundle is bound through the
+  engine commitment and signed host attestation.
 - **Blinded patch review:** every result requires two distinct independent
   blinded reviewers with rubric/evidence/conflict-disclosure bindings. A
   material score disagreement requires a third distinct blinded adjudicator
   with rationale and evidence.
 - **Evaluator drivetrain:** public/private assignment artifacts have tagged
-  audiences and exact bindings; only an explicit external-evaluator authority
-  can join identities. The external-run port journals start/interruption/
+  audiences and exact schemas; only an explicit external-evaluator authority
+  can join identities. Alias permutations use per-task/repetition,
+  domain-separated HMAC streams with full-width rejection sampling; public
+  assignment ordering has a separate stream. Private
+  execution bindings use an evaluator-only HMAC salt, preventing public-seed
+  reconstruction and engine-ID dictionary attacks. The external-run port journals start/interruption/
   timeout/failure/completion with compare-and-swap persistence, deterministic
   orphan resume, idempotent completed-run skipping, isolation, interventions,
   normalized usage, cost, grader, and artifact evidence.
 - **Isolation attestation:** real certification mode requires an independently
-  verified Ed25519 host attestation bound to manifest/run/assignment/source/
-  grader and a validity window. The fake adapter/verifier use a distinct
-  `dry-run` mode whose evidence cannot enter the result ledger.
+  verified Ed25519 host attestation bound to the public/private assignment,
+  full engine/executable/environment configuration, frozen comparison-track
+  policy, task, attempt, unique invocation, input bundle, source/grader, and a
+  bounded freshness window. Allowed mechanisms and exact network/resource
+  policy digests are frozen and enforced, not merely named. The fake adapter/
+  verifier use a distinct `dry-run` mode whose evidence cannot enter the
+  result ledger.
+- **Signed outcome authority:** the manifest freezes separate host and external
+  evaluator Ed25519 trust material. The evaluator signs the complete persisted
+  execution outcome and later the complete reviewed result. Versioned,
+  domain-separated envelopes bind evidence kind, manifest, evaluator/key,
+  issue time, and statement digest; proof extraction re-verifies both host and
+  evaluator signatures after persistence. Rebuilding an unkeyed hash chain
+  after changing success, cost, usage, review, or isolation evidence therefore
+  cannot forge a certificate.
 - **Local proof only:** the deterministic no-provider dry run exercises all
   assignments and a second invocation skips every completed run. Tamper,
   wrong mapping, orphan, timeout/abort, bad isolation binding, forged host
-  signature, reviewer disagreement, and repetition-pseudoreplication tests
-  fail closed. This spends no provider credit and proves no competitive
-  capability.
+  signature, evaluator-signature tampering/replay, future-dated outcome,
+  replayed/wrong engine configuration, reviewer disagreement,
+  unnecessary adjudication, incomplete cost/usage, track collapse, controlled
+  fairness drift, budget overrun, and repetition-pseudoreplication tests fail
+  closed. This spends no provider credit and proves no competitive capability.
+- **Verification:** full Windows suite passes: 249 cases, 248 passed, one
+  intentional dependency-sensitive skip, zero failures. The Phase 13 focused
+  red-team subset passes 20/20. No provider calls were made.
 - **External gate remains:** the never-run holdout, evaluator trust roots,
   real competitor adapters, 2,304 planned isolated executions, independent
   human reviews, and resulting clustered confidence intervals do not exist in
   this repository. Status remains **not certified** until those occur.
+- **Legacy-control boundary:** the 2,304 planned runs cover Vanguard, Claude
+  Code, Codex, and OpenCode—not current Ares. Phase 14 cannot become default-on
+  until a pre-registered legacy-Ares comparison or an explicitly approved
+  equivalent rollout gate supplies that missing replacement evidence.
 
 ### Phase 14 — guarded Ares integration (locally complete; beta pending)
 

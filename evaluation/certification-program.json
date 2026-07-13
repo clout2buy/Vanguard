@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "status": "awaiting-external-holdout-freeze",
   "program": "Vanguard Elite Engine Certification 1",
   "observedAt": "2026-07-13T00:00:00-04:00",
@@ -7,6 +7,13 @@
   "plannedRepetitions": 3,
   "plannedRuns": 2304,
   "plannedIndependentRepositoryGroups": 24,
+  "comparisonTracks": [
+    "harness-controlled",
+    "product-native"
+  ],
+  "comparisonTrackPolicy": "both tracks require independent parity gates; harness-controlled freezes identical provider/model/effort/budgets across engines",
+  "inputPolicy": "closed manifest schema; SHA-256 of the exact prompt/specification and immutable input bundle is shared across engines and signed by the host",
+  "isolationPolicy": "freeze allowed mechanisms plus exact network/resource policy SHA-256 digests; host and evaluator Ed25519 signatures are reverified after persistence",
   "statisticalUnit": "independenceGroupId after repetition-within-task aggregation",
   "reviewPolicy": {
     "requiredPrimaryReviewers": 2,
@@ -58,12 +65,13 @@
   },
   "externalRequirements": [
     "An evaluator independent of Vanguard implementation",
-    "A never-run holdout bundle with frozen source and grader SHA-256 digests",
+    "A never-run holdout bundle with frozen input-bundle, source, and grader SHA-256 digests",
     "Fresh competitor sessions with pinned CLI versions and identical task/model/budget policy",
     "Provider, model, reasoning effort, tool/step/token budgets, executable/environment digests, and arguments frozen per engine/track",
     "Provider cost assumptions or complete normalized usage for every run",
     "Two independent blinded maintainability reviews per run and evidence-bound third-party adjudication above the disagreement threshold",
     "Signed external container/VM isolation attestation verified against evaluator-owned trust roots",
-    "Cluster bootstrap over independent repository groups, never individual repetitions"
+    "Cluster bootstrap over independent repository groups, never individual repetitions",
+    "A pre-registered legacy-Ares control before the Phase 14 adapter can become default-on (not included in the 2,304-run competitive draft)"
   ]
 }

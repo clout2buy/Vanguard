@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import test from "node:test";
 import type {
   BlindRunResult,
@@ -12,8 +13,10 @@ import type {
 import {
   appendCertificationResult,
   authorizeExternalEvaluator,
+  canonicalCertificationJson,
   createBlindedAssignments,
   estimateCertificationCost,
+  evaluatorEvidenceSigningEnvelope,
   evaluateCertificate,
   manifestSha256,
   validateAssignmentArtifacts,
@@ -22,15 +25,23 @@ import {
 } from "../src/index.js";
 
 const hash = (character: string): string => character.repeat(64);
+const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
+const evaluatorKeys = generateKeyPairSync("ed25519");
+const isolationKeys = generateKeyPairSync("ed25519");
+const evaluatorPublicKeyPem = evaluatorKeys.publicKey.export({ type: "spki", format: "pem" }).toString();
+const isolationPublicKeyPem = isolationKeys.publicKey.export({ type: "spki", format: "pem" }).toString();
 
+const trackPolicy = () => ({ provider: "paired-provider", model: "same-model", reasoningEffort: "high", toolCallBudget: 240, stepBudget: 240, inputTokenBudget: 200_000, outputTokenBudget: 32_000, commandArguments: ["--json"] });
 const trackPolicies = () => ({
-  repair: { provider: "paired-provider", model: "same-model", reasoningEffort: "high", toolCallBudget: 240, stepBudget: 240, inputTokenBudget: 200_000, outputTokenBudget: 32_000, commandArguments: ["--json"] },
-  "multi-file": { provider: "paired-provider", model: "same-model", reasoningEffort: "high", toolCallBudget: 240, stepBudget: 240, inputTokenBudget: 200_000, outputTokenBudget: 32_000, commandArguments: ["--json"] },
+  "harness-controlled:repair": trackPolicy(),
+  "harness-controlled:multi-file": trackPolicy(),
+  "product-native:repair": trackPolicy(),
+  "product-native:multi-file": trackPolicy(),
 });
 
 function manifest(overrides: Partial<CertificationManifest> = {}): CertificationManifest {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     program: "Vanguard Elite Engine certification 2",
     frozenAt: "2026-07-13T00:00:00.000Z",
     vanguardCommit: hash("a"),
@@ -53,11 +64,13 @@ function manifest(overrides: Partial<CertificationManifest> = {}): Certification
         id: `holdout-${String(index + 1).padStart(3, "0")}`,
         layer: "holdout" as const,
         category: index % 2 === 0 ? "repair" : "multi-file",
+        comparisonTrack: index < 15 ? "harness-controlled" as const : "product-native" as const,
         language: index % 3 === 0 ? "TypeScript" : "Python",
         repositoryId: `repository-${String(index + 1).padStart(3, "0")}`,
         independenceGroupId: `independent-family-${String(group + 1).padStart(2, "0")}`,
         independenceEvidenceSha256: hash(group % 2 === 0 ? "b" : "c"),
-        sourceSha256: hash(index % 2 === 0 ? "d" : "e"),
+        inputBundleSha256: digest(`input-bundle-${index + 1}`),
+        sourceSha256: digest(`source-${index + 1}`),
         graderSha256: hash(index % 2 === 0 ? "f" : "1"),
         maxDurationMs: 7_200_000,
         priorRunCount: 0,
@@ -68,6 +81,19 @@ function manifest(overrides: Partial<CertificationManifest> = {}): Certification
       rubricSha256: hash("2"),
       requiredPrimaryReviewers: 2,
       disagreementThreshold: 0.2,
+    },
+    isolationPolicy: {
+      verifierId: "external-attestation-verifier",
+      policyId: "certification-isolation-v1",
+      allowedMechanisms: ["external-vm"],
+      networkPolicySha256: hash("a"),
+      resourcePolicySha256: hash("b"),
+      trustedIssuers: [{ issuerId: "external-vm-host", keyId: "host-key-2026-07", publicKeyPem: isolationPublicKeyPem }],
+    },
+    evaluatorSigningKey: {
+      evaluatorId: "independent-lab",
+      keyId: "evaluator-key-2026-07",
+      publicKeyPem: evaluatorPublicKeyPem,
     },
     thresholds: {
       parityOverallLowerBound: -0.03,
@@ -101,7 +127,7 @@ function result(
     blinded: true as const,
     independent: true as const,
   }));
-  return {
+  return signResult(frozen, {
     runId: assignment.runId,
     taskId: assignment.taskId,
     repetition: assignment.repetition,
@@ -123,7 +149,49 @@ function result(
     durationMs: 10_000,
     criticalIncident: false,
     evaluatorId,
+  });
+}
+
+function signResult(
+  frozen: CertificationManifest,
+  unsigned: Omit<BlindRunResult, "evaluatorAttestation">,
+  issuedAt = "2026-07-13T01:00:00.000Z",
+): BlindRunResult {
+  const serialized = canonicalCertificationJson(unsigned as never);
+  const attestation = {
+    protocolVersion: 1 as const,
+    kind: "reviewed-result" as const,
+    evaluatorId: frozen.evaluatorId,
+    keyId: frozen.evaluatorSigningKey.keyId,
+    manifestSha256: manifestSha256(frozen),
+    issuedAt,
+    statementSha256: createHash("sha256").update(serialized).digest("hex"),
   };
+  const envelope = canonicalCertificationJson(evaluatorEvidenceSigningEnvelope(attestation));
+  return {
+    ...unsigned,
+    evaluatorAttestation: {
+      ...attestation,
+      signatureBase64: sign(null, Buffer.from(envelope), evaluatorKeys.privateKey).toString("base64"),
+    },
+  };
+}
+
+function resignResult(frozen: CertificationManifest, item: BlindRunResult): BlindRunResult {
+  const { evaluatorAttestation: _attestation, ...unsigned } = item;
+  return signResult(frozen, unsigned);
+}
+
+function rehashResultLedger(entries: CertificationLedgerEntry[]): CertificationLedgerEntry[] {
+  let previousHash = "0".repeat(64);
+  return entries.map((entry, offset) => {
+    const index = offset + 1;
+    const hashValue = createHash("sha256").update(previousHash).update("\n").update(String(index)).update("\n")
+      .update(canonicalCertificationJson(entry.result as never)).digest("hex");
+    const next = { ...entry, index, previousHash, hash: hashValue };
+    previousHash = hashValue;
+    return next;
+  });
 }
 
 function ledgerFor(
@@ -156,6 +224,22 @@ function executionProofs(ledger: readonly CertificationLedgerEntry[]): readonly 
 
 test("manifest validation rejects contamination, weak independent coverage, and internal scoring", () => {
   assert.doesNotThrow(() => validateCertificationManifest(manifest()));
+  assert.throws(() => validateCertificationManifest({
+    ...manifest(),
+    privateBindingSha256: hash("9"),
+  } as never), /Unexpected field.*manifest/);
+  const leakedEngine = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...leakedEngine,
+    engines: leakedEngine.engines.map((engine, index) => index === 0
+      ? { ...engine, engineId: "secret-alias" } : engine),
+  } as never), /Unexpected field.*engine/);
+  const unknownTaskKnob = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...unknownTaskKnob,
+    tasks: unknownTaskKnob.tasks.map((task, index) => index === 0
+      ? { ...task, promptOverride: "engine-specific prompt" } : task),
+  } as never), /Unexpected field.*task/);
   const contaminated = manifest();
   assert.throws(() => validateCertificationManifest({
     ...contaminated,
@@ -170,7 +254,7 @@ test("manifest validation rejects contamination, weak independent coverage, and 
       ...engine,
       trackPolicies: {
         ...engine.trackPolicies,
-        repair: { ...engine.trackPolicies.repair!, reasoningEffort: "" },
+          "harness-controlled:repair": { ...engine.trackPolicies["harness-controlled:repair"]!, reasoningEffort: "" },
       },
     } : engine),
   }), /unpinned model\/effort\/tool budget/);
@@ -185,13 +269,96 @@ test("manifest validation rejects contamination, weak independent coverage, and 
     tasks: inconsistent.tasks.map((task, index) => index === 1
       ? { ...task, repositoryId: inconsistent.tasks[0]!.repositoryId, independenceGroupId: "different-family" } : task),
   }), /inconsistent independence provenance/);
+  assert.throws(() => validateCertificationManifest(manifest({ seed: "" })), /seed/);
+  assert.throws(() => validateCertificationManifest(manifest({
+    thresholds: { ...manifest().thresholds, superiorityOverallLowerBound: -1 },
+  })), /Superiority/);
+  assert.throws(() => validateCertificationManifest(manifest({
+    thresholds: { ...manifest().thresholds, confidence: 0.9 },
+  })), /\[0\.95, 1\)/);
+  assert.throws(() => validateCertificationManifest(manifest({
+    thresholds: { ...manifest().thresholds, parityOverallLowerBound: -0.11 },
+  })), /weaker than -0\.10/);
+  assert.throws(() => validateCertificationManifest(manifest({
+    thresholds: { ...manifest().thresholds, maxCostRatio: 2.01 },
+  })), /\(0, 2\]/);
+  assert.throws(() => validateCertificationManifest(manifest({
+    thresholds: { ...manifest().thresholds, maxInterventionDelta: 1 },
+  })), /more human interventions/);
+  const malformedRuntime = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...malformedRuntime,
+    engines: malformedRuntime.engines.map((engine, index) => index === 0
+      ? { ...engine, authMode: "borrowed-cookie" as never } : engine),
+  }), /fully pinned/);
+  const unfairControlled = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...unfairControlled,
+    engines: unfairControlled.engines.map((engine, index) => index === 1 ? {
+      ...engine,
+      trackPolicies: {
+        ...engine.trackPolicies,
+        "harness-controlled:repair": {
+          ...engine.trackPolicies["harness-controlled:repair"]!,
+          model: "different-controlled-model",
+        },
+      },
+    } : engine),
+  }), /Harness-controlled.*same model\/effort\/budgets/);
+  const malformedLayer = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...malformedLayer,
+    tasks: malformedLayer.tasks.map((task, index) => index === 0
+      ? { ...task, layer: "secret-holdout" as never } : task),
+  }), /evaluation layer/);
+  const malformedPrior = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...malformedPrior,
+    tasks: malformedPrior.tasks.map((task, index) => index === 0
+      ? { ...task, layer: "shadow" as const, priorRunCount: -1 } : task),
+  }), /prior-run count/);
+  const duplicateSnapshot = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...duplicateSnapshot,
+    tasks: duplicateSnapshot.tasks.map((task, index) => index === 1
+      ? { ...task, sourceSha256: duplicateSnapshot.tasks[0]!.sourceSha256 } : task),
+  }), /Source snapshot.*inconsistent independence groups/);
+  const visibleSnapshot = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...visibleSnapshot,
+    tasks: [...visibleSnapshot.tasks, {
+      ...visibleSnapshot.tasks[0]!,
+      id: "visible-canary-copy",
+      layer: "canary" as const,
+      priorRunCount: 1,
+    }],
+  }), /previously visible/);
+  const visibleInput = manifest();
+  assert.throws(() => validateCertificationManifest({
+    ...visibleInput,
+    tasks: [...visibleInput.tasks, {
+      ...visibleInput.tasks[0]!,
+      id: "visible-input-only",
+      layer: "shadow" as const,
+      sourceSha256: digest("different-visible-source"),
+      priorRunCount: 1,
+    }],
+  }), /reuses an input bundle/);
 });
 
 test("blinding separates artifacts, binds every field, and requires evaluator authority", () => {
   const frozen = manifest();
   const one = createBlindedAssignments(frozen, "s".repeat(32));
   const two = createBlindedAssignments(frozen, "s".repeat(32));
+  const otherSecret = createBlindedAssignments(frozen, "t".repeat(32));
   assert.deepEqual(one, two);
+  assert.notDeepEqual(one.publicArtifact, otherSecret.publicArtifact);
+  assert.ok(one.privateArtifact.assignments.some((assignment) => {
+    const counterpart = otherSecret.privateArtifact.assignments.find((candidate) =>
+      candidate.taskId === assignment.taskId && candidate.repetition === assignment.repetition
+      && candidate.alias === assignment.alias);
+    return counterpart !== undefined && counterpart.engineId !== assignment.engineId;
+  }), "a different blinding secret must change at least one secret alias permutation");
   assert.equal(one.publicArtifact.manifestSha256, manifestSha256(frozen));
   assert.equal(one.publicArtifact.assignments.length, 90);
   assert.equal(JSON.stringify(one.publicArtifact).includes("engineId"), false);
@@ -205,6 +372,17 @@ test("blinding separates artifacts, binds every field, and requires evaluator au
   const first = tampered.assignments[0]!;
   (tampered.assignments as PublicAssignment[])[0] = { ...first, taskId: frozen.tasks[1]!.id };
   assert.throws(() => validateAssignmentArtifacts(frozen, tampered, one.privateArtifact, authority), /binding mismatch/);
+  const leaking = structuredClone(one.publicArtifact) as unknown as { assignments: Array<Record<string, unknown>> };
+  leaking.assignments[0]!.engineHint = "vanguard";
+  assert.throws(() => validateAssignmentArtifacts(frozen, leaking as never, one.privateArtifact, authority), /Unexpected field/);
+
+  const privateAssignment = one.privateArtifact.assignments[0]!;
+  const { privateBindingSha256: _private, engineId, ...publicFields } = privateAssignment;
+  const dictionaryGuess = createHash("sha256").update(manifestSha256(frozen)).update("\n")
+    .update(JSON.stringify({ ...publicFields, engineId }, Object.keys({ ...publicFields, engineId }).sort()))
+    .digest("hex");
+  assert.notEqual(privateAssignment.privateBindingSha256, dictionaryGuess,
+    "private bindings must not be a public-dictionary hash of engine ids");
 });
 
 test("two blinded reviewers are mandatory and material disagreement requires adjudication", () => {
@@ -224,6 +402,23 @@ test("two blinded reviewers are mandatory and material disagreement requires adj
   };
   const accepted = appendCertificationResult(frozen, [], result(frozen, assignment, true, frozen.evaluatorId, [0.9, 0.5], adjudication));
   assert.equal(accepted.length, 1);
+  assert.throws(() => appendCertificationResult(
+    frozen, [], result(frozen, assignment, true, frozen.evaluatorId, [0.8, 0.8], adjudication),
+  ), /only permitted for material/);
+  const acceptedResult = accepted[0]!.result;
+  const { evaluatorAttestation: _attestation, ...unsigned } = acceptedResult;
+  assert.throws(() => appendCertificationResult(
+    frozen, [], signResult(frozen, unsigned, "2026-07-13T00:00:30.000Z"),
+  ), /predates.*maintainability evidence/);
+  assert.throws(() => appendCertificationResult(frozen, [], {
+    ...acceptedResult,
+    engineId: assignment.engineId,
+  } as never), /Unexpected field.*reviewed result/);
+  const leakedReview = structuredClone(acceptedResult) as BlindRunResult & {
+    maintainability: { primaryReviews: Array<Record<string, unknown>>; adjudication: MaintainabilityAdjudication | null };
+  };
+  leakedReview.maintainability.primaryReviews[0]!.engineHint = assignment.engineId;
+  assert.throws(() => appendCertificationResult(frozen, [], leakedReview), /Unexpected field.*review/);
 });
 
 test("the result ledger rejects duplicates and detects tampering", () => {
@@ -234,6 +429,15 @@ test("the result ledger rejects duplicates and detects tampering", () => {
   assert.throws(() => appendCertificationResult(frozen, ledger, first), /Duplicate result/);
   const tampered = [{ ...ledger[0]!, result: { ...ledger[0]!.result, success: false } }];
   assert.throws(() => validateCertificationLedger(frozen, tampered), /integrity failure/);
+  const recomputed = rehashResultLedger(structuredClone(tampered));
+  assert.throws(() => validateCertificationLedger(frozen, recomputed), /evidence signature/);
+
+  const crossManifest = { ...frozen, program: `${frozen.program} replay target` };
+  assert.throws(() => appendCertificationResult(frozen, [], {
+    ...first,
+    evaluatorAttestation: { ...first.evaluatorAttestation, kind: "execution-outcome" },
+  }), /not bound|signature/);
+  assert.throws(() => appendCertificationResult(crossManifest, [], first), /not bound|signature/);
 });
 
 test("a certificate refuses missing, mismatched, or critical-incident results", () => {
@@ -245,11 +449,48 @@ test("a certificate refuses missing, mismatched, or critical-incident results", 
   let ledger: readonly CertificationLedgerEntry[] = [];
   for (const [index, assignment] of bundle.privateArtifact.assignments.entries()) {
     const base = result(frozen, assignment, true);
-    ledger = appendCertificationResult(frozen, ledger, index === 0 ? { ...base, criticalIncident: true } : base);
+    ledger = appendCertificationResult(frozen, ledger, index === 0
+      ? resignResult(frozen, { ...base, criticalIncident: true }) : base);
   }
-  const report = evaluateCertificate(frozen, bundle.publicArtifact, bundle.privateArtifact, ledger, executionProofs(ledger), authority);
+  const proofs = executionProofs(ledger);
+  const report = evaluateCertificate(frozen, bundle.publicArtifact, bundle.privateArtifact, ledger, proofs, authority);
   assert.equal(report.certifiable, false);
   assert.ok(report.blockers.some((blocker) => blocker.includes("Critical incident")));
+  const leakingProofs = structuredClone(proofs) as Array<CertificationExecutionProof & Record<string, unknown>>;
+  leakingProofs[0]!.engineId = "vanguard";
+  const leakingProofReport = evaluateCertificate(
+    frozen, bundle.publicArtifact, bundle.privateArtifact, ledger, leakingProofs, authority,
+  );
+  assert.equal(leakingProofReport.certifiable, false);
+  assert.ok(leakingProofReport.blockers.some((blocker) => blocker.includes("Unexpected field in certification execution proof")));
+});
+
+test("missing cost or incomplete/non-provider usage is not certifiable evidence", () => {
+  const frozen = manifest();
+  const bundle = createBlindedAssignments(frozen, "usage-evidence".repeat(3));
+  const authority = authorizeExternalEvaluator(frozen, frozen.evaluatorId);
+  const build = (mutate: (item: BlindRunResult, index: number) => BlindRunResult) => {
+    let ledger: readonly CertificationLedgerEntry[] = [];
+    for (const [index, assignment] of bundle.privateArtifact.assignments.entries()) {
+      ledger = appendCertificationResult(frozen, ledger, mutate(result(frozen, assignment, true), index));
+    }
+    return ledger;
+  };
+  const missingCost = build((item, index) => index === 0
+    ? resignResult(frozen, { ...item, costUsd: null }) : item);
+  const costReport = evaluateCertificate(frozen, bundle.publicArtifact, bundle.privateArtifact,
+    missingCost, executionProofs(missingCost), authority);
+  assert.equal(costReport.certifiable, false);
+  assert.ok(costReport.blockers.some((blocker) => blocker.includes("cost evidence")));
+
+  const incompleteUsage = build((item, index) => index === 0 ? resignResult(frozen, {
+    ...item,
+    usage: { ...item.usage, providerReported: false, inputTokens: null },
+  }) : item);
+  const usageReport = evaluateCertificate(frozen, bundle.publicArtifact, bundle.privateArtifact,
+    incompleteUsage, executionProofs(incompleteUsage), authority);
+  assert.equal(usageReport.certifiable, false);
+  assert.ok(usageReport.blockers.some((blocker) => blocker.includes("provider-reported usage")));
 });
 
 test("paired evidence uses independence groups, never repetitions, as bootstrap samples", () => {
@@ -273,6 +514,27 @@ test("paired evidence uses independence groups, never repetitions, as bootstrap 
     assert.equal(comparison.successDifference.samples, 15);
     assert.equal(comparison.successDifference.pairedTasks, 30);
     assert.equal(comparison.successDifference.pairedRuns, 90);
+    assert.equal(comparison.comparisonTracks["harness-controlled"].independentGroups, 15);
+    assert.equal(comparison.comparisonTracks["product-native"].independentGroups, 15);
+  }
+});
+
+test("a strong product-native track cannot hide failure on the harness-controlled track", () => {
+  const frozen = manifest();
+  const bundle = createBlindedAssignments(frozen, "split-track".repeat(4));
+  const authority = authorizeExternalEvaluator(frozen, frozen.evaluatorId);
+  const ledger = ledgerFor(frozen, bundle.privateArtifact.assignments, (assignment) => {
+    const track = frozen.tasks.find((task) => task.id === assignment.taskId)!.comparisonTrack;
+    return assignment.engineId === "vanguard" ? track === "product-native" : track === "harness-controlled";
+  });
+  const report = evaluateCertificate(frozen, bundle.publicArtifact, bundle.privateArtifact,
+    ledger, executionProofs(ledger), authority);
+  assert.equal(report.outcome, "none");
+  for (const comparison of report.comparisons) {
+    assert.equal(comparison.successDifference.estimate, 0);
+    assert.equal(comparison.comparisonTracks["harness-controlled"].parity, false);
+    assert.equal(comparison.parity, false);
+    assert.ok(comparison.reasons.some((reason) => reason.includes("harness-controlled")));
   }
 });
 

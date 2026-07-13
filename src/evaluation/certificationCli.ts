@@ -15,6 +15,7 @@ import {
   manifestSha256,
   validateCertificationLedger,
   validateCertificationManifest,
+  validateAssignmentArtifacts,
 } from "./certification.js";
 import {
   CertificationExecutionOrchestrator,
@@ -75,8 +76,11 @@ export async function runCertificationCli(argv: readonly string[]): Promise<Json
     const executionStore = new FileCertificationExecutionLedger(required(options, "execution-ledger"));
     const executionLedger = await executionStore.load();
     const authority = authorizeExternalEvaluator(manifest, required(options, "evaluator-id"));
+    validateAssignmentArtifacts(manifest, publicArtifact, privateArtifact, authority);
     validateCertificationLedger(manifest, ledger);
-    const proofs = extractCertificationExecutionProofs(executionLedger, publicArtifact);
+    const proofs = extractCertificationExecutionProofs(
+      manifest, executionLedger, publicArtifact, privateArtifact, authority,
+    );
     return evaluateCertificate(manifest, publicArtifact, privateArtifact, ledger, proofs, authority) as unknown as JsonOutput;
   }
   if (command === "dry-run") {
@@ -107,10 +111,14 @@ export async function runCertificationCli(argv: readonly string[]): Promise<Json
     };
   }
   if (command === "audit-execution") {
+    const manifest = await readJson<CertificationManifest>(required(options, "manifest"));
     const publicArtifact = await readJson<PublicAssignmentArtifact>(required(options, "public"));
+    const privateArtifact = await readJson<PrivateAssignmentArtifact>(required(options, "private"));
+    const authority = authorizeExternalEvaluator(manifest, required(options, "evaluator-id"));
+    validateAssignmentArtifacts(manifest, publicArtifact, privateArtifact, authority);
     const store = new FileCertificationExecutionLedger(required(options, "execution-ledger"));
     const ledger = await store.load();
-    validateExecutionLedger(ledger, publicArtifact);
+    validateExecutionLedger(ledger, publicArtifact, privateArtifact);
     return { ok: true, entries: ledger.length, ledgerHead: ledger.at(-1)?.hash ?? "0".repeat(64) };
   }
   if (command === "estimate") {

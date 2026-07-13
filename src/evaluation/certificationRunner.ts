@@ -1,10 +1,12 @@
-import { createHash, randomUUID, verify as verifySignature } from "node:crypto";
+import { createHash, createHmac, randomUUID, verify as verifySignature } from "node:crypto";
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue } from "../kernel/contracts.js";
 import type {
   CertificationManifest,
+  CertificationIsolationPolicy,
   CertificationExecutionProof,
+  EvaluatorEvidenceAttestation,
   EvaluationEngine,
   EvaluationTask,
   ExternalEvaluatorAuthority,
@@ -13,14 +15,18 @@ import type {
   PrivateAssignmentArtifact,
   PublicAssignment,
   PublicAssignmentArtifact,
+  TrustedIsolationIssuer,
 } from "./certification.js";
 import {
   canonicalCertificationJson,
+  evaluationTrackKey,
   validateAssignmentArtifacts,
+  verifyEvaluatorEvidenceAttestation,
 } from "./certification.js";
 
 const EXECUTION_GENESIS = "0".repeat(64);
 const SHA256 = /^[a-f0-9]{64}$/u;
+const ATTESTATION_EXPIRY_GRACE_MS = 15 * 60_000;
 
 export interface EvaluatorRunRequest {
   readonly manifestSha256: string;
@@ -29,6 +35,13 @@ export interface EvaluatorRunRequest {
   readonly engine: EvaluationEngine;
   readonly task: EvaluationTask;
   readonly attempt: number;
+  /** Unique per scheduled attempt; prevents replay after crash recovery. */
+  readonly invocationId: string;
+  /**
+   * Evaluator-keyed commitment to the private mapping, full engine pin,
+   * category track policy, task, attempt, and invocation. Safe to journal.
+   */
+  readonly engineExecutionBindingSha256: string;
 }
 
 export interface IsolationEvidence {
@@ -36,6 +49,7 @@ export interface IsolationEvidence {
   readonly mechanism: string;
   readonly cleanAtStart: boolean;
   readonly originalWorkspaceUnmodified: boolean;
+  readonly inputBundleSha256: string;
   readonly sourceSha256: string;
   readonly graderSha256: string;
   readonly evidenceSha256: string;
@@ -46,6 +60,11 @@ export interface HostIsolationAttestation {
   readonly runId: string;
   readonly manifestSha256: string;
   readonly assignmentBindingSha256: string;
+  readonly privateBindingSha256: string;
+  readonly engineExecutionBindingSha256: string;
+  readonly attempt: number;
+  readonly invocationId: string;
+  readonly inputBundleSha256: string;
   readonly sourceSha256: string;
   readonly graderSha256: string;
   readonly workspaceId: string;
@@ -53,6 +72,8 @@ export interface HostIsolationAttestation {
   readonly isolationEvidenceSha256: string;
   readonly networkPolicySha256: string;
   readonly resourcePolicySha256: string;
+  readonly cleanAtStart: true;
+  readonly originalWorkspaceUnmodified: true;
   readonly readOnlyInputs: true;
   readonly noHostCredentials: true;
   readonly disposableWorkspace: true;
@@ -68,6 +89,7 @@ export interface HostIsolationAttestation {
 export interface IsolationAttestationVerification {
   readonly verifierId: string;
   readonly policyId: string;
+  readonly executionMode: "externally-isolated" | "dry-run";
   readonly verifiedAt: string;
   readonly verificationEvidenceSha256: string;
   readonly valid: true;
@@ -87,6 +109,8 @@ export interface ExternalRunOutcome {
   readonly executionMode: "externally-isolated" | "dry-run";
   readonly success: boolean;
   readonly criticalIncident: boolean;
+  readonly toolCalls: number;
+  readonly steps: number;
   readonly isolation: IsolationEvidence;
   readonly interventions: readonly InterventionEvidence[];
   readonly usage: NormalizedUsageEvidence;
@@ -94,6 +118,7 @@ export interface ExternalRunOutcome {
   readonly costEvidenceSha256: string;
   readonly graderEvidenceSha256: string;
   readonly artifactEvidenceSha256: string;
+  readonly evaluatorAttestation: EvaluatorEvidenceAttestation;
 }
 
 /** Implemented by the external evaluator, never by the candidate engine. */
@@ -106,6 +131,7 @@ export interface ExternalRunAdapter {
 /** A separately configured trust root verifies host/container attestations. */
 export interface IsolationAttestationVerifierPort {
   readonly verifierId: string;
+  readonly policyId: string;
   readonly executionMode: "externally-isolated" | "dry-run";
   verify(
     request: EvaluatorRunRequest,
@@ -211,6 +237,11 @@ export class CertificationExecutionOrchestrator {
     if (adapter.executionMode !== attestationVerifier.executionMode || adapter.adapterId === attestationVerifier.verifierId) {
       throw new Error("Execution adapter and independent isolation verifier modes/identities must match.");
     }
+    if (adapter.executionMode === "externally-isolated"
+      && (attestationVerifier.verifierId !== manifest.isolationPolicy.verifierId
+        || attestationVerifier.policyId !== manifest.isolationPolicy.policyId)) {
+      throw new Error("External isolation verifier does not match the frozen manifest policy.");
+    }
     const maxAttempts = options.maxInfrastructureAttempts ?? 2;
     if (!Number.isSafeInteger(maxAttempts) || maxAttempts < 1 || maxAttempts > 5) {
       throw new Error("Infrastructure attempt budget must be between 1 and 5.");
@@ -233,7 +264,7 @@ export class CertificationExecutionOrchestrator {
     // execution ledger merely because construction happened earlier.
     validateAssignmentArtifacts(this.#manifest, this.#publicArtifact, this.#privateArtifact, this.#authority);
     let ledger = await this.#store.load();
-    validateExecutionLedger(ledger, this.#publicArtifact);
+    validateExecutionLedger(ledger, this.#publicArtifact, this.#privateArtifact);
     let resumedOrphans = 0;
     let skippedCompleted = 0;
     let skippedExhausted = 0;
@@ -281,6 +312,8 @@ export class CertificationExecutionOrchestrator {
       const engine = engineById.get(privateAssignment.engineId)!;
       const attempt = attempts + 1;
       scheduled += 1;
+      const invocationId = this.#invocationId();
+      if (invocationId.trim().length === 0) throw new Error("Certification invocation id cannot be empty.");
       ledger = await appendExecutionEvent(this.#store, ledger, {
         kind: "execution.started",
         runId: publicAssignment.runId,
@@ -288,22 +321,33 @@ export class CertificationExecutionOrchestrator {
         assignmentBindingSha256: publicAssignment.assignmentBindingSha256,
         privateBindingSha256: privateAssignment.privateBindingSha256,
         occurredAt: this.#now().toISOString(),
-        invocationId: this.#invocationId(),
+        invocationId,
       });
       const startedAt = this.#now().getTime();
-      const request: EvaluatorRunRequest = {
+      const request: EvaluatorRunRequest = deepFreeze(structuredClone({
         manifestSha256: this.#publicArtifact.manifestSha256,
         publicAssignment,
         privateAssignment,
         engine,
         task,
         attempt,
-      };
+        invocationId,
+        engineExecutionBindingSha256: certificationEngineExecutionBinding(
+          this.#privateArtifact.privateBindingSalt,
+          this.#publicArtifact.manifestSha256,
+          publicAssignment,
+          privateAssignment,
+          engine,
+          task,
+          attempt,
+          invocationId,
+        ),
+      }));
       try {
         const { outcome, isolationVerification } = await withTimeout(
           async (runSignal) => {
             const candidate = await this.#adapter.run(request, runSignal);
-            validateExternalOutcome(request, candidate);
+            validateExternalOutcome(this.#manifest, request, candidate);
             if (candidate.executionMode !== this.#adapter.executionMode) {
               throw new NonRetryableCertificationAdapterError("execution-mode-mismatch");
             }
@@ -460,11 +504,19 @@ export async function appendExecutionEvent(
 export function validateExecutionLedger(
   ledger: readonly CertificationExecutionLedgerEntry[],
   assignments?: PublicAssignmentArtifact,
+  privateAssignments?: PrivateAssignmentArtifact,
 ): void {
+  if (privateAssignments !== undefined && assignments === undefined) {
+    throw new Error("Private execution bindings require the matching public assignment artifact.");
+  }
   let previousHash = EXECUTION_GENESIS;
   const publicByRun = assignments === undefined
     ? undefined : new Map(assignments.assignments.map((assignment) => [assignment.runId, assignment]));
+  const privateByRun = privateAssignments === undefined
+    ? undefined : new Map(privateAssignments.assignments.map((assignment) => [assignment.runId, assignment]));
   for (const [offset, entry] of ledger.entries()) {
+    assertExactKeys(entry as unknown as Record<string, unknown>,
+      ["index", "previousHash", "hash", "event"], "certification execution ledger entry");
     validateExecutionEvent(entry.event);
     if (entry.index !== offset + 1 || entry.previousHash !== previousHash
       || entry.hash !== executionLedgerHash(previousHash, entry.index, entry.event)) {
@@ -474,6 +526,11 @@ export function validateExecutionLedger(
     if (publicByRun !== undefined && (assignment === undefined
       || assignment.assignmentBindingSha256 !== entry.event.assignmentBindingSha256)) {
       throw new Error(`Execution event is not bound to public assignment '${entry.event.runId}'.`);
+    }
+    const privateAssignment = privateByRun?.get(entry.event.runId);
+    if (privateByRun !== undefined && (privateAssignment === undefined
+      || privateAssignment.privateBindingSha256 !== entry.event.privateBindingSha256)) {
+      throw new Error(`Execution event is not bound to private assignment '${entry.event.runId}'.`);
     }
     previousHash = entry.hash;
   }
@@ -488,15 +545,53 @@ export function executionEvidence(
 }
 
 export function extractCertificationExecutionProofs(
+  manifest: CertificationManifest,
   ledger: readonly CertificationExecutionLedgerEntry[],
   assignments: PublicAssignmentArtifact,
+  privateAssignments: PrivateAssignmentArtifact,
+  authority: ExternalEvaluatorAuthority,
 ): readonly CertificationExecutionProof[] {
-  validateExecutionLedger(ledger, assignments);
+  validateAssignmentArtifacts(manifest, assignments, privateAssignments, authority);
+  validateExecutionLedger(ledger, assignments, privateAssignments);
+  const publicByRun = new Map(assignments.assignments.map((assignment) => [assignment.runId, assignment]));
+  const privateByRun = new Map(privateAssignments.assignments.map((assignment) => [assignment.runId, assignment]));
+  const taskById = new Map(manifest.tasks.map((task) => [task.id, task]));
+  const engineById = new Map(manifest.engines.map((engine) => [engine.id, engine]));
   const proofs: CertificationExecutionProof[] = [];
   for (const entry of ledger) {
     if (entry.event.kind !== "execution.completed") continue;
     const { event } = entry;
-    if (event.outcome.executionMode !== "externally-isolated") {
+    if (eventsFor(ledger, event.runId).filter((candidate) => candidate.kind === "execution.started").length !== 1) {
+      throw new Error(`Execution '${event.runId}' has multiple attempts without complete cost/intervention accounting.`);
+    }
+    const publicAssignment = publicByRun.get(event.runId)!;
+    const privateAssignment = privateByRun.get(event.runId)!;
+    const task = taskById.get(publicAssignment.taskId)!;
+    const engine = engineById.get(privateAssignment.engineId)!;
+    const started = eventsFor(ledger, event.runId).find((candidate) => candidate.kind === "execution.started");
+    if (started?.kind !== "execution.started") throw new Error(`Execution '${event.runId}' lacks its signed start.`);
+    const request: EvaluatorRunRequest = {
+      manifestSha256: assignments.manifestSha256,
+      publicAssignment,
+      privateAssignment,
+      engine,
+      task,
+      attempt: started.attempt,
+      invocationId: started.invocationId,
+      engineExecutionBindingSha256: certificationEngineExecutionBinding(
+        privateAssignments.privateBindingSalt,
+        assignments.manifestSha256,
+        publicAssignment,
+        privateAssignment,
+        engine,
+        task,
+        started.attempt,
+        started.invocationId,
+      ),
+    };
+    revalidatePersistedExternalExecution(manifest, request, event);
+    if (event.outcome.executionMode !== "externally-isolated"
+      || event.isolationVerification.executionMode !== "externally-isolated") {
       throw new Error(`Execution '${event.runId}' is dry-run evidence and cannot support certification.`);
     }
     proofs.push({
@@ -538,11 +633,14 @@ export class DeterministicDryRunAdapter implements ExternalRunAdapter {
       executionMode: "dry-run",
       success: true,
       criticalIncident: false,
+      toolCalls: 0,
+      steps: 0,
       isolation: {
         workspaceId: `dry-${request.publicAssignment.runId.slice(0, 12)}`,
         mechanism: "fake-no-process",
         cleanAtStart: true,
         originalWorkspaceUnmodified: true,
+        inputBundleSha256: request.task.inputBundleSha256,
         sourceSha256: request.task.sourceSha256,
         graderSha256: request.task.graderSha256,
         evidenceSha256: evidence,
@@ -560,6 +658,16 @@ export class DeterministicDryRunAdapter implements ExternalRunAdapter {
       costEvidenceSha256: evidence,
       graderEvidenceSha256: evidence,
       artifactEvidenceSha256: evidence,
+      evaluatorAttestation: {
+        protocolVersion: 1,
+        kind: "execution-outcome",
+        evaluatorId: "deterministic-dry-run/no-evaluator",
+        keyId: "not-a-real-key",
+        manifestSha256: request.manifestSha256,
+        issuedAt: "1970-01-01T00:00:00.000Z",
+        statementSha256: evidence,
+        signatureBase64: Buffer.from(evidence).toString("base64"),
+      },
     };
   }
 }
@@ -567,6 +675,7 @@ export class DeterministicDryRunAdapter implements ExternalRunAdapter {
 /** Test-only trust root; its mode prevents use with a real execution adapter. */
 export class DeterministicDryRunIsolationVerifier implements IsolationAttestationVerifierPort {
   readonly verifierId = "deterministic-dry-run/attestation-verifier";
+  readonly policyId = "dry-run-only/not-certifiable";
   readonly executionMode = "dry-run" as const;
 
   async verify(
@@ -582,18 +691,13 @@ export class DeterministicDryRunIsolationVerifier implements IsolationAttestatio
     }
     return {
       verifierId: this.verifierId,
-      policyId: "dry-run-only/not-certifiable",
+      policyId: this.policyId,
+      executionMode: "dry-run",
       verifiedAt: "1970-01-01T00:00:00.000Z",
       verificationEvidenceSha256: digest(expected as unknown as JsonValue),
       valid: true,
     };
   }
-}
-
-export interface TrustedIsolationIssuer {
-  readonly issuerId: string;
-  readonly keyId: string;
-  readonly publicKeyPem: string;
 }
 
 /**
@@ -603,26 +707,32 @@ export interface TrustedIsolationIssuer {
  */
 export class SignedIsolationAttestationVerifier implements IsolationAttestationVerifierPort {
   readonly verifierId: string;
+  readonly policyId: string;
   readonly executionMode = "externally-isolated" as const;
-  readonly #policyId: string;
   readonly #issuers: ReadonlyMap<string, TrustedIsolationIssuer>;
+  readonly #allowedMechanisms: ReadonlySet<string>;
+  readonly #networkPolicySha256: string;
+  readonly #resourcePolicySha256: string;
   readonly #now: () => Date;
 
   constructor(
-    verifierId: string,
-    policyId: string,
-    issuers: readonly TrustedIsolationIssuer[],
+    policy: CertificationIsolationPolicy,
     now: () => Date = () => new Date(),
   ) {
-    if ([verifierId, policyId].some((value) => value.trim().length === 0) || issuers.length === 0) {
+    if ([policy.verifierId, policy.policyId].some((value) => value.trim().length === 0)
+      || policy.trustedIssuers.length === 0 || policy.allowedMechanisms.length === 0
+      || !SHA256.test(policy.networkPolicySha256) || !SHA256.test(policy.resourcePolicySha256)) {
       throw new Error("External isolation verifier requires an identity, policy, and trusted issuer.");
     }
-    if (new Set(issuers.map((issuer) => issuer.issuerId)).size !== issuers.length) {
+    if (new Set(policy.trustedIssuers.map((issuer) => issuer.issuerId)).size !== policy.trustedIssuers.length) {
       throw new Error("Duplicate trusted isolation issuer.");
     }
-    this.verifierId = verifierId;
-    this.#policyId = policyId;
-    this.#issuers = new Map(issuers.map((issuer) => [issuer.issuerId, issuer]));
+    this.verifierId = policy.verifierId;
+    this.policyId = policy.policyId;
+    this.#issuers = new Map(policy.trustedIssuers.map((issuer) => [issuer.issuerId, issuer]));
+    this.#allowedMechanisms = new Set(policy.allowedMechanisms);
+    this.#networkPolicySha256 = policy.networkPolicySha256;
+    this.#resourcePolicySha256 = policy.resourcePolicySha256;
     this.#now = now;
   }
 
@@ -634,6 +744,11 @@ export class SignedIsolationAttestationVerifier implements IsolationAttestationV
     if (signal.aborted) throw signal.reason;
     const attestation = evidence.attestation;
     validateAttestationBinding(request, evidence);
+    if (!this.#allowedMechanisms.has(attestation.mechanism)
+      || attestation.networkPolicySha256 !== this.#networkPolicySha256
+      || attestation.resourcePolicySha256 !== this.#resourcePolicySha256) {
+      throw new NonRetryableCertificationAdapterError("isolation-policy-mismatch");
+    }
     const issuer = this.#issuers.get(attestation.issuerId);
     if (issuer === undefined || issuer.keyId !== attestation.keyId) {
       throw new NonRetryableCertificationAdapterError("untrusted-isolation-attestation-issuer");
@@ -644,17 +759,23 @@ export class SignedIsolationAttestationVerifier implements IsolationAttestationV
       || !verifySignature(null, Buffer.from(serialized), issuer.publicKeyPem, Buffer.from(attestation.signatureBase64, "base64"))) {
       throw new NonRetryableCertificationAdapterError("invalid-isolation-attestation-signature");
     }
-    const now = this.#now().getTime();
-    if (now < Date.parse(attestation.issuedAt) || now > Date.parse(attestation.expiresAt)) {
+    const verifiedAt = this.#now();
+    const now = verifiedAt.getTime();
+    const issuedAt = Date.parse(attestation.issuedAt);
+    const expiresAt = Date.parse(attestation.expiresAt);
+    const maximumValidityMs = request.task.maxDurationMs + ATTESTATION_EXPIRY_GRACE_MS;
+    if (now < issuedAt || now > expiresAt || expiresAt - issuedAt > maximumValidityMs) {
       throw new NonRetryableCertificationAdapterError("expired-isolation-attestation");
     }
     return {
       verifierId: this.verifierId,
-      policyId: this.#policyId,
-      verifiedAt: this.#now().toISOString(),
+      policyId: this.policyId,
+      executionMode: "externally-isolated",
+      verifiedAt: verifiedAt.toISOString(),
       verificationEvidenceSha256: digest({
         verifierId: this.verifierId,
-        policyId: this.#policyId,
+        policyId: this.policyId,
+        executionMode: this.executionMode,
         attestationStatementSha256: attestation.statementSha256,
       } as unknown as JsonValue),
       valid: true,
@@ -662,7 +783,16 @@ export class SignedIsolationAttestationVerifier implements IsolationAttestationV
   }
 }
 
-function validateExternalOutcome(request: EvaluatorRunRequest, outcome: ExternalRunOutcome): void {
+function validateExternalOutcome(
+  manifest: CertificationManifest,
+  request: EvaluatorRunRequest,
+  outcome: ExternalRunOutcome,
+): void {
+  try {
+    validateStoredOutcome(outcome);
+  } catch {
+    throw new NonRetryableCertificationAdapterError("invalid-outcome-schema");
+  }
   if (outcome.runId !== request.publicAssignment.runId
     || outcome.assignmentBindingSha256 !== request.publicAssignment.assignmentBindingSha256
     || outcome.privateBindingSha256 !== request.privateAssignment.privateBindingSha256) {
@@ -670,6 +800,7 @@ function validateExternalOutcome(request: EvaluatorRunRequest, outcome: External
   }
   const isolation = outcome.isolation;
   if (!isolation.cleanAtStart || !isolation.originalWorkspaceUnmodified
+    || isolation.inputBundleSha256 !== request.task.inputBundleSha256
     || isolation.sourceSha256 !== request.task.sourceSha256 || isolation.graderSha256 !== request.task.graderSha256
     || isolation.workspaceId.trim().length === 0 || isolation.mechanism.trim().length === 0
     || !SHA256.test(isolation.evidenceSha256)) {
@@ -682,30 +813,137 @@ function validateExternalOutcome(request: EvaluatorRunRequest, outcome: External
       throw new NonRetryableCertificationAdapterError("invalid-intervention-evidence");
     }
   }
+  if (outcome.executionMode === "externally-isolated"
+    && (!manifest.isolationPolicy.allowedMechanisms.includes(isolation.mechanism)
+      || isolation.attestation.networkPolicySha256 !== manifest.isolationPolicy.networkPolicySha256
+      || isolation.attestation.resourcePolicySha256 !== manifest.isolationPolicy.resourcePolicySha256)) {
+    throw new NonRetryableCertificationAdapterError("isolation-policy-mismatch");
+  }
   validateRunnerUsage(outcome.usage);
+  const trackPolicy = request.engine.trackPolicies[evaluationTrackKey(request.task)];
+  if (trackPolicy === undefined) throw new NonRetryableCertificationAdapterError("missing-frozen-track-policy");
+  if (!Number.isSafeInteger(outcome.toolCalls) || outcome.toolCalls < 0 || outcome.toolCalls > trackPolicy.toolCallBudget
+    || !Number.isSafeInteger(outcome.steps) || outcome.steps < 0 || outcome.steps > trackPolicy.stepBudget
+    || (outcome.usage.inputTokens !== null && outcome.usage.inputTokens > trackPolicy.inputTokenBudget)
+    || (outcome.usage.outputTokens !== null && outcome.usage.outputTokens > trackPolicy.outputTokenBudget)) {
+    throw new NonRetryableCertificationAdapterError("frozen-track-budget-exceeded");
+  }
   if (outcome.costUsd !== null && (!Number.isFinite(outcome.costUsd) || outcome.costUsd < 0)) {
     throw new NonRetryableCertificationAdapterError("invalid-cost-evidence");
   }
   for (const value of [outcome.costEvidenceSha256, outcome.graderEvidenceSha256, outcome.artifactEvidenceSha256]) {
     if (!SHA256.test(value)) throw new NonRetryableCertificationAdapterError("malformed-evidence-digest");
   }
+  if (outcome.executionMode === "externally-isolated") {
+    try {
+      verifyEvaluatorEvidenceAttestation(
+        manifest, outcome.evaluatorAttestation, externalRunOutcomeStatement(outcome), "execution-outcome",
+      );
+    } catch {
+      throw new NonRetryableCertificationAdapterError("invalid-evaluator-outcome-signature");
+    }
+  }
+}
+
+function revalidatePersistedExternalExecution(
+  manifest: CertificationManifest,
+  request: EvaluatorRunRequest,
+  event: Extract<CertificationExecutionEvent, { readonly kind: "execution.completed" }>,
+): void {
+  if (event.outcome.executionMode !== "externally-isolated"
+    || event.isolationVerification.executionMode !== "externally-isolated") {
+    throw new Error(`Execution '${event.runId}' is dry-run/non-external evidence and cannot support certification.`);
+  }
+  validateExternalOutcome(manifest, request, event.outcome);
+  if (event.durationMs > request.task.maxDurationMs) {
+    throw new Error(`Execution '${event.runId}' exceeded its frozen duration budget.`);
+  }
+  const verification = event.isolationVerification;
+  if (verification.verifierId !== manifest.isolationPolicy.verifierId
+    || verification.policyId !== manifest.isolationPolicy.policyId
+    || verification.valid !== true) {
+    throw new Error(`Execution '${event.runId}' used an unfrozen isolation verifier policy.`);
+  }
+  const evidence = event.outcome.isolation;
+  validateAttestationBinding(request, evidence);
+  const attestation = evidence.attestation;
+  const issuer = manifest.isolationPolicy.trustedIssuers.find((candidate) =>
+    candidate.issuerId === attestation.issuerId && candidate.keyId === attestation.keyId);
+  if (issuer === undefined) throw new Error(`Execution '${event.runId}' used an untrusted isolation issuer.`);
+  const statement = isolationAttestationStatement(attestation);
+  const serialized = canonicalCertificationJson(statement);
+  if (attestation.statementSha256 !== digest(statement)
+    || !verifySignature(null, Buffer.from(serialized), issuer.publicKeyPem, Buffer.from(attestation.signatureBase64, "base64"))) {
+    throw new Error(`Execution '${event.runId}' has an invalid persisted host signature.`);
+  }
+  const issuedAt = Date.parse(attestation.issuedAt);
+  const expiresAt = Date.parse(attestation.expiresAt);
+  const verifiedAt = Date.parse(verification.verifiedAt);
+  const completedAt = Date.parse(event.occurredAt);
+  const evaluatorIssuedAt = Date.parse(event.outcome.evaluatorAttestation.issuedAt);
+  if (issuedAt < Date.parse(manifest.frozenAt) || verifiedAt < issuedAt || verifiedAt > expiresAt
+    || evaluatorIssuedAt < issuedAt || evaluatorIssuedAt > completedAt
+    || completedAt < verifiedAt || expiresAt - issuedAt > request.task.maxDurationMs + ATTESTATION_EXPIRY_GRACE_MS) {
+    throw new Error(`Execution '${event.runId}' has stale/replayed isolation evidence.`);
+  }
+  const expectedVerificationEvidence = digest({
+    verifierId: verification.verifierId,
+    policyId: verification.policyId,
+    executionMode: verification.executionMode,
+    attestationStatementSha256: attestation.statementSha256,
+  } as unknown as JsonValue);
+  if (verification.verificationEvidenceSha256 !== expectedVerificationEvidence) {
+    throw new Error(`Execution '${event.runId}' has altered isolation verification evidence.`);
+  }
+}
+
+export function externalRunOutcomeStatement(outcome: ExternalRunOutcome): JsonValue {
+  const { evaluatorAttestation: _attestation, ...statement } = outcome;
+  return statement as unknown as JsonValue;
 }
 
 function validateAttestationBinding(request: EvaluatorRunRequest, evidence: IsolationEvidence): void {
+  assertExactKeys(evidence as unknown as Record<string, unknown>, [
+    "workspaceId", "mechanism", "cleanAtStart", "originalWorkspaceUnmodified", "inputBundleSha256",
+    "sourceSha256", "graderSha256", "evidenceSha256", "attestation",
+  ], "isolation evidence");
   const { attestation } = evidence;
+  assertExactKeys(attestation as unknown as Record<string, unknown>, [
+    "runId", "manifestSha256", "assignmentBindingSha256", "privateBindingSha256",
+    "engineExecutionBindingSha256", "attempt", "invocationId", "inputBundleSha256", "sourceSha256",
+    "graderSha256", "workspaceId", "mechanism", "isolationEvidenceSha256", "networkPolicySha256",
+    "resourcePolicySha256", "cleanAtStart", "originalWorkspaceUnmodified", "readOnlyInputs",
+    "noHostCredentials", "disposableWorkspace", "teardownRequired", "issuerId", "keyId", "issuedAt",
+    "expiresAt", "statementSha256", "signatureBase64",
+  ], "host isolation attestation");
   if (attestation.runId !== request.publicAssignment.runId
     || attestation.manifestSha256 !== request.manifestSha256
     || attestation.assignmentBindingSha256 !== request.publicAssignment.assignmentBindingSha256
-    || attestation.sourceSha256 !== request.task.sourceSha256
-    || attestation.graderSha256 !== request.task.graderSha256
+    || attestation.privateBindingSha256 !== request.privateAssignment.privateBindingSha256
+    || attestation.engineExecutionBindingSha256 !== request.engineExecutionBindingSha256
+    || attestation.attempt !== request.attempt
+    || attestation.invocationId !== request.invocationId
+    || evidence.inputBundleSha256 !== request.task.inputBundleSha256
+    || evidence.sourceSha256 !== request.task.sourceSha256
+    || evidence.graderSha256 !== request.task.graderSha256
+    || attestation.inputBundleSha256 !== evidence.inputBundleSha256
+    || attestation.sourceSha256 !== evidence.sourceSha256
+    || attestation.graderSha256 !== evidence.graderSha256
     || attestation.workspaceId !== evidence.workspaceId
     || attestation.mechanism !== evidence.mechanism
-    || attestation.isolationEvidenceSha256 !== evidence.evidenceSha256) {
+    || attestation.isolationEvidenceSha256 !== evidence.evidenceSha256
+    || attestation.cleanAtStart !== evidence.cleanAtStart
+    || attestation.originalWorkspaceUnmodified !== evidence.originalWorkspaceUnmodified) {
     throw new NonRetryableCertificationAdapterError("isolation-attestation-binding-mismatch");
   }
-  if ([attestation.issuerId, attestation.keyId, attestation.signatureBase64].some((value) => value.trim().length === 0)
+  if ([attestation.issuerId, attestation.keyId, attestation.signatureBase64,
+    attestation.invocationId].some((value) => value.trim().length === 0)
+    || !Number.isSafeInteger(attestation.attempt) || attestation.attempt < 1
+    || !SHA256.test(attestation.privateBindingSha256)
+    || !SHA256.test(attestation.engineExecutionBindingSha256)
     || !SHA256.test(attestation.statementSha256)
     || !SHA256.test(attestation.networkPolicySha256) || !SHA256.test(attestation.resourcePolicySha256)
+    || attestation.cleanAtStart !== true || attestation.originalWorkspaceUnmodified !== true
     || attestation.readOnlyInputs !== true || attestation.noHostCredentials !== true
     || attestation.disposableWorkspace !== true || attestation.teardownRequired !== true
     || !Number.isFinite(Date.parse(attestation.issuedAt)) || !Number.isFinite(Date.parse(attestation.expiresAt))
@@ -718,7 +956,11 @@ function validateIsolationVerification(
   verifier: IsolationAttestationVerifierPort,
   verification: IsolationAttestationVerification,
 ): void {
+  assertExactKeys(verification as unknown as Record<string, unknown>,
+    ["verifierId", "policyId", "executionMode", "verifiedAt", "verificationEvidenceSha256", "valid"],
+    "isolation verification");
   if (verification.valid !== true || verification.verifierId !== verifier.verifierId
+    || verification.executionMode !== verifier.executionMode
     || verification.policyId.trim().length === 0 || !Number.isFinite(Date.parse(verification.verifiedAt))
     || !SHA256.test(verification.verificationEvidenceSha256)) {
     throw new NonRetryableCertificationAdapterError("invalid-isolation-verification-evidence");
@@ -731,22 +973,52 @@ function validateRunnerUsage(usage: NormalizedUsageEvidence): void {
       throw new NonRetryableCertificationAdapterError("invalid-usage-evidence");
     }
   }
-  if (!SHA256.test(usage.evidenceSha256)
+  if (typeof usage.providerReported !== "boolean" || !SHA256.test(usage.evidenceSha256)
     || (usage.providerReported && (usage.inputTokens === null || usage.outputTokens === null))) {
     throw new NonRetryableCertificationAdapterError("invalid-usage-evidence");
   }
 }
 
 function validateExecutionEvent(event: CertificationExecutionEvent): void {
+  const common = ["kind", "runId", "attempt", "assignmentBindingSha256", "privateBindingSha256", "occurredAt"];
+  const variant = event.kind === "execution.started" ? ["invocationId"]
+    : event.kind === "execution.interrupted" ? ["reason"]
+      : event.kind === "execution.timed-out" ? ["timeoutMs", "failureEvidenceSha256"]
+        : event.kind === "execution.failed" ? ["failureCode", "retryable", "failureEvidenceSha256"]
+          : event.kind === "execution.completed"
+            ? ["durationMs", "executionEvidenceSha256", "isolationVerification", "outcome"]
+            : [];
+  assertExactKeys(event as unknown as Record<string, unknown>, [...common, ...variant], "certification execution event");
   if (!SHA256.test(event.runId) || !SHA256.test(event.assignmentBindingSha256)
     || !SHA256.test(event.privateBindingSha256) || !Number.isSafeInteger(event.attempt) || event.attempt < 1
     || !Number.isFinite(Date.parse(event.occurredAt))) {
     throw new Error("Malformed certification execution event.");
   }
-  if (event.kind === "execution.completed") {
+  if (event.kind === "execution.started") {
+    if (event.invocationId.trim().length === 0) throw new Error("Execution start lacks an invocation id.");
+  } else if (event.kind === "execution.interrupted") {
+    if (event.reason !== "orphaned-on-resume" && event.reason !== "evaluator-cancelled") {
+      throw new Error("Execution interruption reason is invalid.");
+    }
+  } else if (event.kind === "execution.timed-out") {
+    if (!Number.isSafeInteger(event.timeoutMs) || event.timeoutMs < 1 || !SHA256.test(event.failureEvidenceSha256)) {
+      throw new Error("Execution timeout evidence is invalid.");
+    }
+  } else if (event.kind === "execution.failed") {
+    if (event.failureCode.trim().length === 0 || event.failureCode.length > 64
+      || typeof event.retryable !== "boolean" || !SHA256.test(event.failureEvidenceSha256)) {
+      throw new Error("Execution failure evidence is invalid.");
+    }
+  } else if (event.kind === "execution.completed") {
+    if (!Number.isSafeInteger(event.durationMs) || event.durationMs < 0
+      || !SHA256.test(event.executionEvidenceSha256)) {
+      throw new Error("Completed execution duration/evidence is invalid.");
+    }
+    validateStoredOutcome(event.outcome);
     validateIsolationVerification({
       verifierId: event.isolationVerification.verifierId,
-      executionMode: event.outcome.executionMode,
+      policyId: event.isolationVerification.policyId,
+      executionMode: event.isolationVerification.executionMode,
       verify: async () => event.isolationVerification,
     }, event.isolationVerification);
     if (event.outcome.runId !== event.runId
@@ -755,6 +1027,73 @@ function validateExecutionEvent(event: CertificationExecutionEvent): void {
       || event.executionEvidenceSha256 !== executionEvidence(event.outcome, event.isolationVerification)) {
       throw new Error("Completed execution event evidence binding is invalid.");
     }
+  }
+}
+
+function validateStoredOutcome(outcome: ExternalRunOutcome): void {
+  assertExactKeys(outcome as unknown as Record<string, unknown>, [
+    "runId", "assignmentBindingSha256", "privateBindingSha256", "executionMode", "success", "criticalIncident",
+    "toolCalls", "steps", "isolation", "interventions", "usage", "costUsd", "costEvidenceSha256",
+    "graderEvidenceSha256", "artifactEvidenceSha256", "evaluatorAttestation",
+  ], "external run outcome");
+  assertExactKeys(outcome.isolation as unknown as Record<string, unknown>, [
+    "workspaceId", "mechanism", "cleanAtStart", "originalWorkspaceUnmodified", "inputBundleSha256",
+    "sourceSha256", "graderSha256", "evidenceSha256", "attestation",
+  ], "isolation evidence");
+  assertExactKeys(outcome.isolation.attestation as unknown as Record<string, unknown>, [
+    "runId", "manifestSha256", "assignmentBindingSha256", "privateBindingSha256",
+    "engineExecutionBindingSha256", "attempt", "invocationId", "inputBundleSha256", "sourceSha256",
+    "graderSha256", "workspaceId", "mechanism", "isolationEvidenceSha256", "networkPolicySha256",
+    "resourcePolicySha256", "cleanAtStart", "originalWorkspaceUnmodified", "readOnlyInputs",
+    "noHostCredentials", "disposableWorkspace", "teardownRequired", "issuerId", "keyId", "issuedAt",
+    "expiresAt", "statementSha256", "signatureBase64",
+  ], "host isolation attestation");
+  assertExactKeys(outcome.usage as unknown as Record<string, unknown>,
+    ["inputTokens", "outputTokens", "cachedInputTokens", "providerReported", "evidenceSha256"], "execution usage evidence");
+  assertExactKeys(outcome.evaluatorAttestation as unknown as Record<string, unknown>, [
+    "protocolVersion", "kind", "evaluatorId", "keyId", "manifestSha256", "issuedAt", "statementSha256",
+    "signatureBase64",
+  ], "execution evaluator attestation");
+  if (!SHA256.test(outcome.runId) || !SHA256.test(outcome.assignmentBindingSha256)
+    || !SHA256.test(outcome.privateBindingSha256)
+    || (outcome.executionMode !== "externally-isolated" && outcome.executionMode !== "dry-run")
+    || typeof outcome.success !== "boolean" || typeof outcome.criticalIncident !== "boolean"
+    || !Number.isSafeInteger(outcome.toolCalls) || outcome.toolCalls < 0
+    || !Number.isSafeInteger(outcome.steps) || outcome.steps < 0) {
+    throw new Error("Stored execution outcome metadata is invalid.");
+  }
+  validateRunnerUsage(outcome.usage);
+  if (outcome.costUsd !== null && (!Number.isFinite(outcome.costUsd) || outcome.costUsd < 0)) {
+    throw new Error("Stored execution cost is invalid.");
+  }
+  for (const value of [outcome.costEvidenceSha256, outcome.graderEvidenceSha256,
+    outcome.artifactEvidenceSha256, outcome.isolation.evidenceSha256]) {
+    if (!SHA256.test(value)) throw new Error("Stored execution evidence digest is malformed.");
+  }
+  const evaluatorAttestation = outcome.evaluatorAttestation;
+  if (evaluatorAttestation.protocolVersion !== 1 || evaluatorAttestation.kind !== "execution-outcome"
+    || [evaluatorAttestation.evaluatorId, evaluatorAttestation.keyId,
+    evaluatorAttestation.signatureBase64].some((value) => value.trim().length === 0)
+    || !SHA256.test(evaluatorAttestation.manifestSha256)
+    || !SHA256.test(evaluatorAttestation.statementSha256)
+    || !Number.isFinite(Date.parse(evaluatorAttestation.issuedAt))) {
+    throw new Error("Stored evaluator outcome attestation is malformed.");
+  }
+  for (const intervention of outcome.interventions) {
+    assertExactKeys(intervention as unknown as Record<string, unknown>,
+      ["kind", "actorId", "occurredAt", "evidenceSha256"], "intervention evidence");
+    if ([intervention.kind, intervention.actorId].some((value) => value.trim().length === 0)
+      || !Number.isFinite(Date.parse(intervention.occurredAt)) || !SHA256.test(intervention.evidenceSha256)) {
+      throw new Error("Stored intervention evidence is invalid.");
+    }
+  }
+}
+
+function assertExactKeys(value: Record<string, unknown>, allowed: readonly string[], name: string): void {
+  const expected = new Set(allowed);
+  const keys = Object.keys(value);
+  if (keys.length !== expected.size || keys.some((key) => !expected.has(key))) {
+    throw new Error(`Unexpected field in ${name}.`);
   }
 }
 
@@ -801,11 +1140,55 @@ function digest(value: JsonValue): string {
   return createHash("sha256").update(canonicalCertificationJson(value)).digest("hex");
 }
 
-function isolationAttestationStatement(attestation: HostIsolationAttestation): JsonValue {
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+export function certificationEngineExecutionBinding(
+  privateBindingSalt: string,
+  manifestDigest: string,
+  publicAssignment: PublicAssignment,
+  privateAssignment: PrivateAssignment,
+  engine: EvaluationEngine,
+  task: EvaluationTask,
+  attempt: number,
+  invocationId: string,
+): string {
+  const trackPolicy = engine.trackPolicies[evaluationTrackKey(task)];
+  if (trackPolicy === undefined) throw new Error(`Engine '${engine.id}' lacks frozen track '${task.category}'.`);
+  return createHmac("sha256", privateBindingSalt).update(canonicalCertificationJson({
+    manifestSha256: manifestDigest,
+    runId: publicAssignment.runId,
+    assignmentBindingSha256: publicAssignment.assignmentBindingSha256,
+    privateBindingSha256: privateAssignment.privateBindingSha256,
+    engine,
+    comparisonTrack: task.comparisonTrack,
+    category: task.category,
+    track: evaluationTrackKey(task),
+    trackPolicy,
+    taskId: task.id,
+    inputBundleSha256: task.inputBundleSha256,
+    sourceSha256: task.sourceSha256,
+    graderSha256: task.graderSha256,
+    attempt,
+    invocationId,
+  } as unknown as JsonValue)).digest("hex");
+}
+
+export function isolationAttestationStatement(attestation: HostIsolationAttestation): JsonValue {
   return {
     runId: attestation.runId,
     manifestSha256: attestation.manifestSha256,
     assignmentBindingSha256: attestation.assignmentBindingSha256,
+    privateBindingSha256: attestation.privateBindingSha256,
+    engineExecutionBindingSha256: attestation.engineExecutionBindingSha256,
+    attempt: attestation.attempt,
+    invocationId: attestation.invocationId,
+    inputBundleSha256: attestation.inputBundleSha256,
     sourceSha256: attestation.sourceSha256,
     graderSha256: attestation.graderSha256,
     workspaceId: attestation.workspaceId,
@@ -813,6 +1196,8 @@ function isolationAttestationStatement(attestation: HostIsolationAttestation): J
     isolationEvidenceSha256: attestation.isolationEvidenceSha256,
     networkPolicySha256: attestation.networkPolicySha256,
     resourcePolicySha256: attestation.resourcePolicySha256,
+    cleanAtStart: attestation.cleanAtStart,
+    originalWorkspaceUnmodified: attestation.originalWorkspaceUnmodified,
     readOnlyInputs: attestation.readOnlyInputs,
     noHostCredentials: attestation.noHostCredentials,
     disposableWorkspace: attestation.disposableWorkspace,
@@ -829,6 +1214,11 @@ function dryRunAttestation(request: EvaluatorRunRequest, evidenceSha256: string)
     runId: request.publicAssignment.runId,
     manifestSha256: request.manifestSha256,
     assignmentBindingSha256: request.publicAssignment.assignmentBindingSha256,
+    privateBindingSha256: request.privateAssignment.privateBindingSha256,
+    engineExecutionBindingSha256: request.engineExecutionBindingSha256,
+    attempt: request.attempt,
+    invocationId: request.invocationId,
+    inputBundleSha256: request.task.inputBundleSha256,
     sourceSha256: request.task.sourceSha256,
     graderSha256: request.task.graderSha256,
     workspaceId: `dry-${request.publicAssignment.runId.slice(0, 12)}`,
@@ -836,6 +1226,8 @@ function dryRunAttestation(request: EvaluatorRunRequest, evidenceSha256: string)
     isolationEvidenceSha256: evidenceSha256,
     networkPolicySha256: evidenceSha256,
     resourcePolicySha256: evidenceSha256,
+    cleanAtStart: true as const,
+    originalWorkspaceUnmodified: true as const,
     readOnlyInputs: true as const,
     noHostCredentials: true as const,
     disposableWorkspace: true as const,
