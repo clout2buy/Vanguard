@@ -40,6 +40,7 @@ export * from "./engine/ndjson.js";
 export * from "./engine/cliRunner.js";
 export * from "./engine/vanguardEngine.js";
 export * from "./engine/stdioServer.js";
+export * from "./delegation/coordinator.js";
 export * from "./extensions/config.js";
 export * from "./extensions/skills.js";
 export * from "./extensions/customTools.js";
