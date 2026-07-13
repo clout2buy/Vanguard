@@ -57,9 +57,11 @@ public final class Claim {
         String[] fields = record.split("\\t", -1);
         if (fields.length != 9) throw new IllegalArgumentException("malformed claim record");
         try {
+            int minX = Integer.parseInt(fields[3]); int minY = Integer.parseInt(fields[4]); int minZ = Integer.parseInt(fields[5]);
+            int maxX = Integer.parseInt(fields[6]); int maxY = Integer.parseInt(fields[7]); int maxZ = Integer.parseInt(fields[8]);
+            if (minX > maxX || minY > maxY || minZ > maxZ) throw new IllegalArgumentException("unnormalized claim record");
             return new Claim(fields[0], UUID.fromString(fields[1]), fields[2],
-                new BlockPos(Integer.parseInt(fields[3]), Integer.parseInt(fields[4]), Integer.parseInt(fields[5])),
-                new BlockPos(Integer.parseInt(fields[6]), Integer.parseInt(fields[7]), Integer.parseInt(fields[8])));
+                new BlockPos(minX, minY, minZ), new BlockPos(maxX, maxY, maxZ));
         } catch (RuntimeException error) { throw new IllegalArgumentException("malformed claim record", error); }
     }
 }

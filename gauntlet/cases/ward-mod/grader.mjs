@@ -32,6 +32,7 @@ public final class WardHarness {
     check(normalized.volume() == 48L, "exact inclusive volume");
     check(Claim.deserialize(normalized.serialize()).serialize().equals(normalized.serialize()), "persistence round trip");
     rejects(() -> Claim.deserialize("bad"), "malformed record rejected");
+    rejects(() -> Claim.deserialize("manual\\t00000000-0000-0000-0000-000000000001\\toverworld\\t5\\t0\\t0\\t1\\t1\\t1"), "unnormalized persistence rejected");
     rejects(() -> new Claim("bad\\tid", owner, "overworld", new BlockPos(0, 0, 0), new BlockPos(0, 0, 0)), "tabbed id rejected");
     rejects(() -> new Claim("id", owner, "bad\\ndimension", new BlockPos(0, 0, 0), new BlockPos(0, 0, 0)), "line-separated dimension rejected");
     rejects(() -> new Claim("huge", owner, "overworld", new BlockPos(Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE), new BlockPos(Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE)), "overflow rejected");
@@ -45,6 +46,7 @@ public final class WardHarness {
     store.claim(stranger, "nether", new BlockPos(0, 0, 0), new BlockPos(2, 2, 2));
     rejects(() -> store.claim(owner, "overworld", new BlockPos(10, 0, 0), new BlockPos(11, 1, 1)), "owner limit enforced");
     try { store.all().clear(); throw new AssertionError("snapshot immutable"); } catch (UnsupportedOperationException expected) {}
+    try { store.list(owner).clear(); throw new AssertionError("owner snapshot immutable"); } catch (UnsupportedOperationException expected) {}
     boolean unauthorizedRemoval = false;
     try { unauthorizedRemoval = store.remove(first.getId(), stranger, false); } catch (SecurityException acceptable) {}
     check(!unauthorizedRemoval && store.findById(first.getId()).isPresent(), "stranger cannot remove");
@@ -93,6 +95,9 @@ public final class WardHarness {
     try { ClaimStore.load(data, 3); throw new AssertionError("duplicate persistence rejected"); } catch (java.io.IOException expected) {}
     Files.write(data, Arrays.asList(lines.get(0).replaceFirst("^C[0-9]+", "C1")), StandardCharsets.UTF_8);
     try { ClaimStore.load(data, 3); throw new AssertionError("noncanonical id rejected"); } catch (Exception expected) {}
+    Files.write(data, Arrays.asList(lines.get(0).replaceFirst("^C[0-9]+", "C1000000")), StandardCharsets.UTF_8);
+    ClaimStore wideIds = ClaimStore.load(data, 3);
+    check(wideIds.claim(stranger, "wide", new BlockPos(0, 0, 0), new BlockPos(0, 0, 0)).getId().equals("C1000001"), "wide canonical ids continue");
 
     WardMod mod = new WardMod(2);
     mod.getStore().claim(owner, "overworld", new BlockPos(0, 0, 0), new BlockPos(1, 1, 1));
