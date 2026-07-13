@@ -10,6 +10,7 @@ import type {
   VerifierPort,
   VerificationResult,
   WorkingStatePort,
+  RunEvent,
 } from "./contracts.js";
 import { EvidenceContextPolicy } from "./contextPolicy.js";
 
@@ -85,15 +86,36 @@ export class AgentKernel {
     }
   }
 
-  async run(task: string, signal = new AbortController().signal): Promise<RunOutcome> {
-    const transcript: TranscriptEntry[] = [{ role: "task", content: task }];
-    const actionFailures = new Map<string, number>();
-    let failedVerificationAttempts = 0;
-    let mutationNeedsExecutionEvidence = false;
-    let mutationNeedsReview = false;
-    await this.#record("run.started", { task });
+  async run(
+    task: string,
+    signal = new AbortController().signal,
+    priorEvents: readonly RunEvent[] = [],
+  ): Promise<RunOutcome> {
+    const restored = restoreRun(task, priorEvents, this.#tools);
+    const transcript = [...restored.transcript];
+    const actionFailures = restored.actionFailures;
+    let failedVerificationAttempts = restored.failedVerificationAttempts;
+    let mutationNeedsExecutionEvidence = restored.mutationNeedsExecutionEvidence;
+    let mutationNeedsReview = restored.mutationNeedsReview;
+    this.#sequence = restored.sequence;
+    if (priorEvents.length === 0) {
+      await this.#record("run.started", { task });
+    } else {
+      if (priorEvents.some((event) => event.type === "run.completed")) {
+        throw new Error("Cannot resume a completed Vanguard run.");
+      }
+      if (restored.interruptedCall !== undefined) {
+        const observation = {
+          ok: false,
+          error: `Tool '${restored.interruptedCall.name}' was interrupted before its result was journaled. Inspect workspace state before retrying.`,
+        };
+        transcript.push({ role: "observation", content: observation });
+        await this.#record("tool.failed", observation);
+      }
+      await this.#record("run.resumed", { completedSteps: restored.completedSteps });
+    }
 
-    for (let step = 1; step <= this.#options.maxSteps; step += 1) {
+    for (let step = restored.completedSteps + 1; step <= this.#options.maxSteps; step += 1) {
       if (signal.aborted) {
         return this.#fail("Run aborted.", step - 1);
       }
@@ -223,6 +245,101 @@ export class AgentKernel {
     await this.#record("run.failed", { reason, steps });
     return { status: "failed", reason, steps };
   }
+}
+
+interface RestoredRun {
+  readonly transcript: readonly TranscriptEntry[];
+  readonly actionFailures: Map<string, number>;
+  readonly failedVerificationAttempts: number;
+  readonly mutationNeedsExecutionEvidence: boolean;
+  readonly mutationNeedsReview: boolean;
+  readonly completedSteps: number;
+  readonly sequence: number;
+  readonly interruptedCall?: { readonly name: string; readonly input: JsonValue };
+}
+
+function restoreRun(
+  task: string,
+  events: readonly RunEvent[],
+  tools: ReadonlyMap<string, ToolPort>,
+): RestoredRun {
+  const transcript: TranscriptEntry[] = [{ role: "task", content: task }];
+  const actionFailures = new Map<string, number>();
+  const started = events.find((event) => event.type === "run.started");
+  if (started !== undefined) {
+    const originalTask = typeof started.data === "object" && started.data !== null && !Array.isArray(started.data)
+      ? started.data.task
+      : undefined;
+    if (originalTask !== task) throw new Error("Resume task does not match the journaled task.");
+  }
+
+  let pendingTool: { name: string; input: JsonValue } | undefined;
+  let mutationNeedsExecutionEvidence = false;
+  let mutationNeedsReview = false;
+  let completedSteps = 0;
+  let failedVerificationAttempts = 0;
+  let completionClaimFailed = false;
+  let pendingCompletion = false;
+
+  const flushCompletion = () => {
+    if (pendingCompletion && completionClaimFailed) failedVerificationAttempts += 1;
+    pendingCompletion = false;
+    completionClaimFailed = false;
+  };
+
+  for (const event of events) {
+    if (event.type === "model.decided") {
+      flushCompletion();
+      const decision = event.data as unknown as ModelDecision;
+      transcript.push({ role: "decision", content: event.data });
+      completedSteps += 1;
+      if (decision.kind === "tool") {
+        pendingTool = { name: decision.call.name, input: decision.call.input };
+      } else {
+        pendingTool = undefined;
+        pendingCompletion = true;
+      }
+      continue;
+    }
+    if (event.type === "tool.completed" || event.type === "tool.failed") {
+      transcript.push({ role: "observation", content: event.data });
+      if (pendingTool !== undefined) {
+        const fingerprint = stableFingerprint(pendingTool.name, pendingTool.input);
+        const succeeded = event.type === "tool.completed";
+        if (succeeded) {
+          actionFailures.delete(fingerprint);
+          const effect = tools.get(pendingTool.name)?.definition.effect;
+          if (effect === "mutate") {
+            actionFailures.clear();
+            mutationNeedsExecutionEvidence = true;
+            mutationNeedsReview = [...tools.values()].some((tool) => tool.definition.effect === "review");
+          }
+          if (effect === "execute") mutationNeedsExecutionEvidence = false;
+          if (effect === "review") mutationNeedsReview = false;
+        } else {
+          actionFailures.set(fingerprint, (actionFailures.get(fingerprint) ?? 0) + 1);
+        }
+      }
+      pendingTool = undefined;
+      continue;
+    }
+    if (event.type === "verification.completed") {
+      transcript.push({ role: "verification", content: event.data });
+      const result = event.data as unknown as Partial<VerificationResult>;
+      if (result.passed === false) completionClaimFailed = true;
+    }
+  }
+  flushCompletion();
+  return {
+    transcript,
+    actionFailures,
+    failedVerificationAttempts,
+    mutationNeedsExecutionEvidence,
+    mutationNeedsReview,
+    completedSteps,
+    sequence: events.reduce((maximum, event) => Math.max(maximum, event.sequence), 0),
+    ...(pendingTool === undefined ? {} : { interruptedCall: pendingTool }),
+  };
 }
 
 function stableFingerprint(name: string, input: JsonValue): string {

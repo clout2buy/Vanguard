@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { FileJournal } from "../src/index.js";
+import { CheckpointTool, FileJournal, RunCheckpointLedger } from "../src/index.js";
 
 test("file journal survives reopening and validates its hash chain", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-journal-"));
@@ -21,6 +21,34 @@ test("file journal survives reopening and validates its hash chain", async () =>
     const contents = await readFile(file, "utf8");
     await writeFile(file, contents.replace("repair", "tampered"));
     await assert.rejects(() => FileJournal.open(file), /integrity failure/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("checkpoint state survives process-style reopening", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-checkpoint-"));
+  const file = path.join(root, "checkpoint.json");
+  try {
+    const ledger = await RunCheckpointLedger.open(file);
+    const tool = new CheckpointTool(ledger);
+    await tool.execute({
+      summary: "Mapped the mod project and repaired registration.",
+      completed: ["mapped source", "fixed registration"],
+      next: ["run integration suite"],
+      evidence: ["unit tests passed"],
+      risks: ["loader version compatibility"],
+    }, { task: "long project", step: 12, signal: new AbortController().signal });
+
+    const reopened = await RunCheckpointLedger.open(file);
+    assert.deepEqual(reopened.snapshot(), {
+      revision: 1,
+      summary: "Mapped the mod project and repaired registration.",
+      completed: ["mapped source", "fixed registration"],
+      next: ["run integration suite"],
+      evidence: ["unit tests passed"],
+      risks: ["loader version compatibility"],
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }

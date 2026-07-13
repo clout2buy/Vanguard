@@ -1,4 +1,4 @@
-import { cp, mkdtemp, realpath, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -25,3 +25,24 @@ export async function createCodingSession(source: string): Promise<CodingSession
   return { id, sourceRoot, workspaceRoot, metadataFile };
 }
 
+export async function openCodingSession(location: string): Promise<CodingSession> {
+  let requested = path.resolve(location);
+  const metadata = await stat(requested);
+  if (metadata.isFile()) requested = path.dirname(requested);
+  if (path.basename(requested).toLocaleLowerCase() === "workspace") requested = path.dirname(requested);
+  const metadataFile = path.join(requested, "session.json");
+  const parsed = JSON.parse(await readFile(metadataFile, "utf8")) as Partial<CodingSession>;
+  if (typeof parsed.id !== "string" || typeof parsed.sourceRoot !== "string" || typeof parsed.workspaceRoot !== "string") {
+    throw new Error("Session metadata is malformed.");
+  }
+  const workspaceRoot = await realpath(parsed.workspaceRoot);
+  if (path.dirname(workspaceRoot) !== await realpath(requested)) {
+    throw new Error("Session workspace does not belong to the requested session container.");
+  }
+  return {
+    id: parsed.id,
+    sourceRoot: await realpath(parsed.sourceRoot),
+    workspaceRoot,
+    metadataFile,
+  };
+}

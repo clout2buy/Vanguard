@@ -89,3 +89,96 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     if (isolatedRoot !== undefined) await rm(isolatedRoot, { recursive: true, force: true });
   }
 });
+
+test("compiled CLI resumes a failed session from its durable journal", async () => {
+  const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-resume-source-"));
+  await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 40;\n");
+  await writeFile(path.join(source, "test.mjs"), "import {answer} from './answer.mjs'; if(answer()!==42) process.exit(1);\n");
+  await writeFile(path.join(source, "package.json"), JSON.stringify({ scripts: { test: "node test.mjs" } }));
+
+  let inferencePaused = true;
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => { body += chunk; });
+    request.on("end", () => {
+      const payload = JSON.parse(body) as { transcript: Array<{ role: string; content: unknown }> };
+      const decisions = payload.transcript.filter((entry) => entry.role === "decision").length;
+      if (decisions > 0 && inferencePaused) {
+        response.writeHead(400, { "content-type": "text/plain" });
+        response.end("intentional test interruption");
+        return;
+      }
+      const observation = [...payload.transcript].reverse().find((entry) => entry.role === "observation")?.content as {
+        output?: { sha256?: string };
+      } | undefined;
+      const decision = decisions === 0
+        ? { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } }
+        : decisions === 1
+          ? {
+              kind: "tool",
+              call: {
+                id: "edit",
+                name: "workspace.replace",
+                input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "40", after: "42" },
+              },
+            }
+          : decisions === 2
+            ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
+            : decisions === 3
+              ? { kind: "tool", call: { id: "review", name: "workspace.changes", input: {} } }
+              : { kind: "complete", answer: "Resumed, fixed, and tested." };
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(decision));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  let sessionRoot: string | undefined;
+  try {
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Mock server failed to bind.");
+    const cli = path.resolve("dist", "src", "cli.js");
+    let failedStdout = "";
+    try {
+      await executeFile(process.execPath, [
+        cli, "run",
+        "--workspace", source,
+        "--task", "Make answer() return 42.",
+        "--provider", "http",
+        "--model", "mock",
+        "--endpoint", `http://127.0.0.1:${address.port}`,
+        "--max-steps", "10",
+        "--protect", "package.json",
+        "--editable-root", "answer.mjs",
+        "--restrict-process", "true",
+        "--verifier-evidence", "summary",
+      ], { maxBuffer: 5_000_000 });
+      assert.fail("initial interrupted run should fail");
+    } catch (error) {
+      failedStdout = String((error as { stdout?: string }).stdout ?? "");
+    }
+    const failedScorecard = JSON.parse(failedStdout) as { workspaceRoot: string; outcome: { status: string } };
+    sessionRoot = path.dirname(failedScorecard.workspaceRoot);
+    assert.equal(failedScorecard.outcome.status, "failed");
+
+    inferencePaused = false;
+    const { stdout } = await executeFile(process.execPath, [cli, "resume", "--session", sessionRoot], {
+      maxBuffer: 5_000_000,
+    });
+    const resumed = JSON.parse(stdout) as {
+      resumed: boolean;
+      outcome: { status: string };
+      workspaceRoot: string;
+      journalFile: string;
+    };
+    assert.equal(resumed.resumed, true);
+    assert.equal(resumed.outcome.status, "completed");
+    assert.match(await readFile(path.join(resumed.workspaceRoot, "answer.mjs"), "utf8"), /42/);
+    assert.match(await readFile(resumed.journalFile, "utf8"), /"type":"run.resumed"/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(source, { recursive: true, force: true });
+    if (sessionRoot !== undefined) await rm(sessionRoot, { recursive: true, force: true });
+  }
+});

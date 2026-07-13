@@ -6,8 +6,11 @@ import type {
   ToolResult,
   WorkingStatePort,
 } from "./contracts.js";
+import { randomUUID } from "node:crypto";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import path from "node:path";
 
-interface CheckpointState {
+export interface CheckpointState {
   readonly revision: number;
   readonly summary: string;
   readonly completed: readonly string[];
@@ -18,9 +21,28 @@ interface CheckpointState {
 
 export class RunCheckpointLedger implements WorkingStatePort {
   #state: CheckpointState | undefined;
+  readonly #file: string | undefined;
 
-  update(state: Omit<CheckpointState, "revision">): CheckpointState {
+  constructor(initial?: CheckpointState, file?: string) {
+    this.#state = initial;
+    this.#file = file;
+  }
+
+  static async open(file: string): Promise<RunCheckpointLedger> {
+    const absolute = path.resolve(file);
+    try {
+      const state = JSON.parse(await readFile(absolute, "utf8")) as CheckpointState;
+      validateState(state);
+      return new RunCheckpointLedger(state, absolute);
+    } catch (error) {
+      if (!isMissing(error)) throw error;
+      return new RunCheckpointLedger(undefined, absolute);
+    }
+  }
+
+  async update(state: Omit<CheckpointState, "revision">): Promise<CheckpointState> {
     this.#state = { ...state, revision: (this.#state?.revision ?? 0) + 1 };
+    if (this.#file !== undefined) await atomicJsonWrite(this.#file, this.#state);
     return this.#state;
   }
 
@@ -59,7 +81,7 @@ export class CheckpointTool implements ToolPort {
     if (typeof summary !== "string" || summary.length === 0 || summary.length > 4_000) {
       throw new Error("Checkpoint summary must contain 1 to 4,000 characters.");
     }
-    const state = this.ledger.update({
+    const state = await this.ledger.update({
       summary,
       completed: stringList(input.completed, "completed"),
       next: stringList(input.next, "next"),
@@ -68,6 +90,32 @@ export class CheckpointTool implements ToolPort {
     });
     return { ok: true, output: state as unknown as JsonValue };
   }
+}
+
+function validateState(state: CheckpointState): void {
+  if (!Number.isSafeInteger(state.revision) || state.revision < 1 || typeof state.summary !== "string") {
+    throw new Error("Persisted checkpoint is malformed.");
+  }
+  for (const value of [state.completed, state.next, state.evidence, state.risks]) {
+    if (!Array.isArray(value) || !value.every((item) => typeof item === "string")) {
+      throw new Error("Persisted checkpoint is malformed.");
+    }
+  }
+}
+
+async function atomicJsonWrite(file: string, state: CheckpointState): Promise<void> {
+  await mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporary, JSON.stringify(state, null, 2), { encoding: "utf8", flag: "wx" });
+    await rename(temporary, file);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+function isMissing(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 function stringList(value: JsonValue | undefined, name: string): readonly string[] {

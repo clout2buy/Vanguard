@@ -285,3 +285,63 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
     risks: ["edge-case escaping"],
   });
 });
+
+test("kernel resumes journaled transcript and sequence without replaying completed tools", async () => {
+  let toolExecutions = 0;
+  const readTool: ToolPort = {
+    name: "read",
+    definition: { ...toolDefinition("read"), effect: "observe" },
+    async execute() {
+      toolExecutions += 1;
+      return { ok: true, output: { contents: "durable evidence" } };
+    },
+  };
+  const firstJournal = new MemoryJournal();
+  const first = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tool", call: { id: "read-1", name: "read", input: { path: "state.txt" } } },
+    ]),
+    tools: [readTool],
+    verifiers: [passingVerifier],
+    journal: firstJournal,
+  });
+  assert.equal((await first.run("resume me")).status, "failed");
+  assert.equal(toolExecutions, 1);
+
+  const resumedModel = new CapturingModel([{ kind: "complete", answer: "continued from evidence" }]);
+  const resumedJournal = new MemoryJournal();
+  const resumed = new AgentKernel({
+    model: resumedModel,
+    tools: [readTool],
+    verifiers: [passingVerifier],
+    journal: resumedJournal,
+  });
+  const outcome = await resumed.run("resume me", new AbortController().signal, firstJournal.events);
+  assert.equal(outcome.status, "completed");
+  assert.equal(toolExecutions, 1);
+  assert.equal(resumedModel.requests[0]?.transcript.some((entry) => entry.role === "observation"
+    && JSON.stringify(entry.content).includes("durable evidence")), true);
+  assert.equal(resumedJournal.events[0]?.type, "run.resumed");
+  assert.equal(resumedJournal.events[0]?.sequence, Math.max(...firstJournal.events.map((event) => event.sequence)) + 1);
+});
+
+test("kernel closes an orphaned tool call with interruption evidence on resume", async () => {
+  const prior = [
+    { sequence: 1, type: "run.started" as const, data: { task: "recover orphan" } },
+    {
+      sequence: 2,
+      type: "model.decided" as const,
+      data: { kind: "tool", call: { id: "orphan", name: "write", input: { path: "a" } } },
+    },
+  ];
+  const model = new CapturingModel([{ kind: "complete", answer: "recovered" }]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  });
+  assert.equal((await kernel.run("recover orphan", new AbortController().signal, prior)).status, "completed");
+  assert.equal(model.requests[0]?.transcript.some((entry) => entry.role === "observation"
+    && JSON.stringify(entry.content).includes("interrupted")), true);
+});

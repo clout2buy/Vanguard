@@ -29,6 +29,7 @@ import {
   analyzePatch,
   scoreExecutionQuality,
   classifyOutcome,
+  openCodingSession,
 } from "./index.js";
 
 interface CommandSpec {
@@ -54,16 +55,27 @@ interface CliOptions {
 }
 
 async function main(): Promise<void> {
-  if (process.argv[2] !== "run") {
+  const command = process.argv[2];
+  if (command !== "run" && command !== "resume") {
     printUsage();
     process.exitCode = 2;
     return;
   }
-  const options = await parseOptions(process.argv.slice(3));
-  const session = await createCodingSession(options.workspace);
+  const resuming = command === "resume";
+  const session = resuming
+    ? await openCodingSession(parseResumeSession(process.argv.slice(3)))
+    : await createCodingSession(requiredArgument(process.argv.slice(3), "--workspace"));
+  const container = path.dirname(session.workspaceRoot);
+  const configurationFile = path.join(container, "run-config.json");
+  const options = resuming
+    ? await readRunConfiguration(configurationFile)
+    : await parseOptions(process.argv.slice(3));
+  if (!resuming) {
+    await writeFile(configurationFile, JSON.stringify({ version: 1, options }, null, 2));
+  }
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
   const versions = new WorkspaceVersionLedger();
-  const workingState = new RunCheckpointLedger();
+  const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
   const agentAllowedCommands = options.restrictProcess
     ? [...new Set(["node", ...options.allowedCommands])]
@@ -82,10 +94,10 @@ async function main(): Promise<void> {
     timeoutMs: 600_000,
     maxOutputBytes: 2_000_000,
   });
-  const container = path.dirname(session.workspaceRoot);
   const journalFile = path.join(container, "run.jsonl");
   const scorecardFile = path.join(container, "scorecard.json");
   const fileJournal = await FileJournal.open(journalFile);
+  const priorEvents = resuming ? await fileJournal.readValidated() : [];
   const journal = progressJournal(fileJournal);
   const model = createModel(options);
   const verifiers: VerifierPort[] = [
@@ -127,14 +139,14 @@ async function main(): Promise<void> {
   const controller = new AbortController();
   const durationTimer = setTimeout(() => controller.abort(), options.maxDurationMs);
   const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${mutationPolicy.describe()}`;
-  const outcome = await kernel.run(runtimeTask, controller.signal).finally(() => clearTimeout(durationTimer));
+  const outcome = await kernel.run(runtimeTask, controller.signal, priorEvents).finally(() => clearTimeout(durationTimer));
   const trajectory = analyzeTrajectory(await fileJournal.readValidated());
   const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
   const verified = outcome.status === "completed";
   const classification = classifyOutcome(outcome);
   const executionQuality = scoreExecutionQuality(verified, trajectory, patch);
   const scorecard = {
-    version: 1,
+    version: 2,
     sessionId: session.id,
     sourceRoot: session.sourceRoot,
     workspaceRoot: session.workspaceRoot,
@@ -155,6 +167,9 @@ async function main(): Promise<void> {
     durationMs: Date.now() - startedAt,
     journalFile,
     completedAt: new Date().toISOString(),
+    resumed: resuming,
+    sessionFile: session.metadataFile,
+    configurationFile,
   };
   await writeFile(scorecardFile, JSON.stringify(scorecard, null, 2));
   process.stdout.write(`${JSON.stringify({ ...scorecard, scorecardFile }, null, 2)}\n`);
@@ -191,7 +206,7 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   const model = required(values, "--model");
   const maxSteps = Number(single(values, "--max-steps") ?? "60");
   if (!Number.isSafeInteger(maxSteps) || maxSteps < 1) throw new Error("--max-steps must be a positive integer.");
-  const maxDurationMs = Number(single(values, "--max-duration-ms") ?? "900000");
+  const maxDurationMs = Number(single(values, "--max-duration-ms") ?? "7200000");
   if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1) {
     throw new Error("--max-duration-ms must be a positive integer.");
   }
@@ -222,6 +237,28 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
   };
+}
+
+async function readRunConfiguration(file: string): Promise<CliOptions> {
+  const parsed = JSON.parse(await readFile(file, "utf8")) as { version?: number; options?: CliOptions };
+  if (parsed.version !== 1 || parsed.options === undefined) {
+    throw new Error("Session run configuration is missing or unsupported.");
+  }
+  return parsed.options;
+}
+
+function parseResumeSession(args: readonly string[]): string {
+  if (args.length !== 2 || args[0] !== "--session" || args[1] === undefined || args[1].length === 0) {
+    throw new Error("Resume usage: vanguard resume --session SESSION_PATH");
+  }
+  return args[1];
+}
+
+function requiredArgument(args: readonly string[], name: string): string {
+  for (let index = 0; index < args.length; index += 2) {
+    if (args[index] === name && args[index + 1] !== undefined) return args[index + 1]!;
+  }
+  throw new Error(`${name} is required.`);
 }
 
 async function detectVerification(workspace: string): Promise<CommandSpec | undefined> {
@@ -315,7 +352,7 @@ function progressJournal(fileJournal: FileJournal): JournalPort {
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Agent step budget (default: 60)\n  --max-duration-ms N      Wall-clock run budget (default: 900000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {
