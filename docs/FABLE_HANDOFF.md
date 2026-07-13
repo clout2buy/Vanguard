@@ -13,6 +13,8 @@ Branch: `codex/vanguard-preview`
 Last implementation baseline before this handoff: `7bca9a8`  
 Test status at handoff: **74/74 passing**
 
+Companion visible conversation export: [`FABLE_CHAT_TRANSCRIPT.md`](./FABLE_CHAT_TRANSCRIPT.md)
+
 ## The north star
 
 Vanguard exists to solve Ares's fundamental problem: quality and reliability degrade as coding sessions become longer and more agentic. Ares can appear capable at the beginning of a task, then accumulate weak edits, tool errors, lost context, broken browser/computer actions, false completion claims, and regressions.
