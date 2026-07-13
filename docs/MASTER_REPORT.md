@@ -106,6 +106,35 @@ superiority** — the evidence selects the language afterward.
   not one per turn). Live cache-hit-rate measurement against real providers
   is deferred to Phase 11 conformance.
 
+### Phase 4 — Repository intelligence + progressive verification
+
+- **Intended KPI:** correct handling of unfamiliar repositories across
+  ecosystems; broken edits caught before build cost. Reported separately for
+  deep-support (TS/JS, Python, Rust, Go) and generic-support ecosystems, per
+  the accepted amendment.
+- **Implemented:** `buildRepositoryModel` (deterministic scan → languages
+  with support tier, build systems, entry points, test topology, generated
+  directories, git state, instruction files) behind the `repository.map`
+  observe tool; `LANGUAGE_PROFILES` tier registry (deep: TS/JS, Python, Rust,
+  Go; generic: Java/Kotlin/C#/C++/Ruby/PHP); `PostEditSyntaxChecker` +
+  `verify.syntax` tool — first-party parse CLIs (`node --check`,
+  `py_compile`, `gofmt -e`) with a hard-allowlisted `SyntaxCommandRunner`,
+  a structural delimiter-balance fallback for TypeScript/generic/missing
+  toolchains that never false-passes a truncated edit, and an explicit
+  "no check" for unknown types. System prompts point the model at both tools.
+- **Scope note (amendment):** full LSP-grade diagnostics/definitions/
+  call-hierarchy across eight ecosystems is deliberately NOT built here; the
+  syntax rung + repo model are the high-leverage, deterministic core. Deeper
+  type/lint rungs run through the project's own toolchain via targeted
+  checks (the existing process/project.check tools). Certification will weight
+  ecosystems by the corpus and report deep vs generic separately.
+- **Adversarial proof:** ecosystem matrix (TS npm, Python, Rust, Go, Java,
+  C#, mixed frontend/backend); generated dirs excluded from source; delimiter
+  check catches broken braces/strings while ignoring strings/comments; syntax
+  checker uses CLIs for deep langs, reports real CLI failures, falls back to
+  structural on missing toolchain (no false failure), and gives unknown types
+  no gate.
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development
