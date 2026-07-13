@@ -1,5 +1,6 @@
 import type { JsonValue, ModelPort, VerificationResult, VerifierPort } from "../kernel/contracts.js";
 import type { RepositoryModel } from "../runtime/repositoryModel.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 export interface ExtensionIdentity {
   readonly name: string;
@@ -72,7 +73,7 @@ export class VanguardExtensionRegistry {
   manifest(): readonly ExtensionRegistryEntry[] {
     return [...this.#entries.values()]
       .map(({ kind, name, version, provenance }) => ({ kind, name, version, provenance }))
-      .sort((left, right) => `${left.kind}:${left.name}`.localeCompare(`${right.kind}:${right.name}`));
+      .sort((left, right) => compareOrdinal(`${left.kind}:${left.name}`, `${right.kind}:${right.name}`));
   }
 }
 

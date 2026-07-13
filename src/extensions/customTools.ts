@@ -1,5 +1,6 @@
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import type { CustomToolDeclaration, ExtensionEffect, ExtensionPermissions } from "./config.js";
+import { compareOrdinal, lowercaseInvariant } from "../deterministicText.js";
 
 export interface CustomToolImplementation {
   readonly definition: ToolDefinition & { readonly effect: ExtensionEffect };
@@ -83,11 +84,11 @@ export class CustomToolRegistry {
   }
 
   tools(): readonly ToolPort[] {
-    return [...this.#tools.values()].sort((left, right) => left.name.localeCompare(right.name));
+    return [...this.#tools.values()].sort((left, right) => compareOrdinal(left.name, right.name));
   }
 
   provenance(): readonly RegisteredToolProvenance[] {
-    return [...this.#provenance.values()].sort((left, right) => left.name.localeCompare(right.name));
+    return [...this.#provenance.values()].sort((left, right) => compareOrdinal(left.name, right.name));
   }
 }
 
@@ -228,5 +229,5 @@ function assertNamespaced(name: string): void {
 }
 
 function normalizeCommand(command: string): string {
-  return process.platform === "win32" ? command.trim().toLocaleLowerCase() : command.trim();
+  return process.platform === "win32" ? lowercaseInvariant(command.trim()) : command.trim();
 }

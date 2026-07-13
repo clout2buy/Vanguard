@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { copyFile, cp, lstat, mkdtemp, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { asciiLowercase } from "../deterministicText.js";
 import {
   SESSION_EXCLUDED_DIRECTORIES,
   atomicWriteJson,
@@ -138,7 +139,7 @@ export async function openCodingSession(location: string): Promise<CodingSession
   let requested = path.resolve(location);
   const metadata = await stat(requested);
   if (metadata.isFile()) requested = path.dirname(requested);
-  if (path.basename(requested).toLocaleLowerCase() === "workspace") requested = path.dirname(requested);
+  if (asciiLowercase(path.basename(requested)) === "workspace") requested = path.dirname(requested);
   const container = await realpath(requested);
   const metadataFile = path.join(container, "session.json");
   const parsed = JSON.parse(await readFile(metadataFile, "utf8")) as Partial<CodingSession>;

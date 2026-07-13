@@ -1,4 +1,5 @@
 import type { JsonValue, RunEvent } from "../kernel/contracts.js";
+import { asciiLowercase } from "../deterministicText.js";
 
 export interface TrajectoryMetrics {
   readonly modelDecisions: number;
@@ -63,7 +64,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     }
     if (event.type === "tool.failed") {
       toolFailures += 1;
-      const serialized = JSON.stringify(event.data).toLocaleLowerCase();
+      const serialized = asciiLowercase(JSON.stringify(event.data));
       const output = record(data?.output);
       const failedToolName = typeof data?.tool === "string" ? data.tool : pendingToolNames[0];
       const isLocalTestFailure = (failedToolName === "process.run" || failedToolName === "project.check")

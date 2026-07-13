@@ -1,5 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { asciiLowercase, lowercaseInvariant } from "../deterministicText.js";
 
 export type NodePackageManager = "npm" | "npx";
 
@@ -61,7 +62,7 @@ export function resolveNodePackageManagerAlias(
       if (!existsSync(command)) continue;
       try {
         const resolved = realpathSync(command);
-        if (path.basename(resolved).toLocaleLowerCase() === entrypoint) candidates.push(resolved);
+        if (asciiLowercase(path.basename(resolved)) === entrypoint) candidates.push(resolved);
       } catch {
         // A stale or inaccessible PATH entry is not a fatal configuration.
       }
@@ -71,10 +72,10 @@ export function resolveNodePackageManagerAlias(
   const seen = new Set<string>();
   for (const candidate of candidates) {
     const normalized = path.resolve(candidate);
-    const key = process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+    const key = process.platform === "win32" ? lowercaseInvariant(normalized) : normalized;
     if (seen.has(key)) continue;
     seen.add(key);
-    if (path.basename(normalized).toLocaleLowerCase() !== entrypoint) continue;
+    if (asciiLowercase(path.basename(normalized)) !== entrypoint) continue;
     if (!existsSync(normalized)) continue;
     return { executable: nodeExecutable, argsPrefix: [normalized] };
   }

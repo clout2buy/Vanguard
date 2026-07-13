@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { PublicRunEvent } from "../runtime/publicRunEvents.js";
 import { createSecretRedactor, sanitizePublicEvent } from "../engine/security.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 export type DelegateState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted" | "merged";
 
@@ -158,7 +159,8 @@ export class DelegationCoordinator {
   }
 
   list(): readonly DelegateRecord[] {
-    return [...this.#records.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+    return [...this.#records.values()].sort((left, right) =>
+      compareOrdinal(left.createdAt, right.createdAt) || compareOrdinal(left.id, right.id));
   }
 
   get(id: string): DelegateRecord {

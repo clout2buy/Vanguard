@@ -6,6 +6,7 @@ import { WorkspaceBoundary } from "../runtime/workspace.js";
 import type { McpServerDeclaration } from "./config.js";
 import { ExtensionPermissionPolicy, validateJsonSchema, validateSchemaDefinition } from "./customTools.js";
 import type { ExtensionAuditPort } from "./hooks.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 const SUPPORTED_PROTOCOLS = new Set(["2024-11-05", "2025-03-26"]);
 
@@ -163,7 +164,7 @@ export class McpStdioClient {
     const tools = listed.tools.map(parseToolDescriptor).filter((tool) => allowed.has(tool.name));
     const missing = this.declaration.tools.filter((name) => !tools.some((tool) => tool.name === name));
     if (missing.length > 0) throw new Error(`MCP server did not provide allowlisted tools: ${missing.join(", ")}.`);
-    this.#state = { server: this.declaration.name, protocolVersion, capabilities, tools: tools.sort((a, b) => a.name.localeCompare(b.name)) };
+    this.#state = { server: this.declaration.name, protocolVersion, capabilities, tools: tools.sort((a, b) => compareOrdinal(a.name, b.name)) };
   }
 
   #request(method: string, params: JsonValue): Promise<JsonValue> {

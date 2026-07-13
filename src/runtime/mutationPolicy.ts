@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { JsonValue, ToolResult } from "../kernel/contracts.js";
+import { lowercaseInvariant } from "../deterministicText.js";
 
 export class WorkspaceMutationPolicy {
   readonly #editableRoots: readonly string[];
@@ -40,7 +41,7 @@ export class WorkspaceMutationPolicy {
 
 function normalizeScope(value: string): string {
   const normalized = path.normalize(value).replaceAll("\\", "/").replace(/^\.\//u, "").replace(/\/$/u, "");
-  return process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+  return process.platform === "win32" ? lowercaseInvariant(normalized) : normalized;
 }
 
 function contains(scope: string, target: string): boolean {

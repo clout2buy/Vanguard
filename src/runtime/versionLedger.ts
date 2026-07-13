@@ -1,4 +1,5 @@
 import path from "node:path";
+import { lowercaseInvariant } from "../deterministicText.js";
 
 export class WorkspaceVersionLedger {
   readonly #versions = new Map<string, string>();
@@ -18,5 +19,5 @@ export class WorkspaceVersionLedger {
 
 function key(relativePath: string): string {
   const normalized = path.normalize(relativePath).replaceAll("\\", "/");
-  return process.platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+  return process.platform === "win32" ? lowercaseInvariant(normalized) : normalized;
 }

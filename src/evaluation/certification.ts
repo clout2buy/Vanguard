@@ -1,5 +1,6 @@
 import { createHash, createHmac, createPublicKey, verify as verifySignature } from "node:crypto";
 import type { JsonValue } from "../kernel/contracts.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 export type EvaluationLayer = "canary" | "shadow" | "holdout";
 export type ComparisonTrack = "harness-controlled" | "product-native";
@@ -1242,7 +1243,7 @@ export function evaluatorEvidenceSigningEnvelope(attestation: Omit<EvaluatorEvid
 function canonicalJson(value: JsonValue): string {
   return JSON.stringify(value, (_key, item: unknown) => {
     if (item === null || typeof item !== "object" || Array.isArray(item)) return item;
-    return Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)));
+    return Object.fromEntries(Object.entries(item as Record<string, unknown>).sort(([left], [right]) => compareOrdinal(left, right)));
   });
 }
 

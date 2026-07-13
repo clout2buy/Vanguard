@@ -3,6 +3,7 @@ import { access } from "node:fs/promises";
 import path from "node:path";
 import { detectProjectVerification, type CommandSpec } from "./projectVerification.js";
 import { resolveNodePackageManagerAlias } from "./nodePackageManager.js";
+import { asciiLowercase } from "../deterministicText.js";
 
 export interface AutomaticVerificationResult {
   readonly status: "passed" | "failed" | "missing";
@@ -57,7 +58,7 @@ async function runCommand(specification: CommandSpec, workspace: string): Promis
 }
 
 function resolveCommand(specification: CommandSpec): CommandSpec {
-  if (specification.command.toLocaleLowerCase() !== "npm") return specification;
+  if (asciiLowercase(specification.command) !== "npm") return specification;
   const npm = resolveNodePackageManagerAlias("npm");
   if (npm === undefined) {
     throw new Error("Could not locate npm-cli.js. Install npm with Node or launch Vanguard from an npm-managed environment.");

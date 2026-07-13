@@ -175,7 +175,7 @@ async function validateScorecardBinding(input, scorecard, scorecardFile, violati
   const workspace = await canonicalDirectory(scorecard.workspaceRoot, "reported workspaceRoot");
   if (samePath(source, workspace)) violations.push("candidate edited the source workspace instead of an isolated session");
   const sessionRoot = path.dirname(workspace);
-  if (path.basename(workspace).toLocaleLowerCase() !== "workspace") {
+  if (asciiLowercase(path.basename(workspace)) !== "workspace") {
     violations.push("scorecard workspaceRoot is not the canonical session workspace");
   }
   if (!samePath(scorecardFile, path.join(sessionRoot, "scorecard.json"))) {
@@ -463,7 +463,7 @@ function sortValue(value) {
 }
 
 function manifestHash(files) {
-  const canonical = [...files.entries()].sort(([left], [right]) => left.localeCompare(right))
+  const canonical = [...files.entries()].sort(([left], [right]) => compareOrdinal(left, right))
     .map(([name, value]) => `${name}\t${value.bytes.length}\t${value.sha256}`).join("\n");
   return createHash("sha256").update(canonical).digest("hex");
 }
@@ -484,7 +484,7 @@ function sanitizedEnvironment() {
 
 function classifyFailure(reason) {
   if (typeof reason !== "string") return "capability_failure";
-  const lower = reason.toLocaleLowerCase();
+  const lower = asciiLowercase(reason);
   const infrastructureMarkers = [
     "inference endpoint returned http",
     "missing credential environment variable",
@@ -525,8 +525,17 @@ function samePath(left, right) {
   const resolvedLeft = path.resolve(left);
   const resolvedRight = path.resolve(right);
   return process.platform === "win32"
-    ? resolvedLeft.toLocaleLowerCase() === resolvedRight.toLocaleLowerCase()
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
     : resolvedLeft === resolvedRight;
+}
+
+function compareOrdinal(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function asciiLowercase(value) {
+  return value.replace(/[A-Z]/gu, (character) =>
+    String.fromCharCode(character.charCodeAt(0) + 0x20));
 }
 
 function requireString(value, label) {

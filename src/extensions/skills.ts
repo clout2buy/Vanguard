@@ -3,6 +3,7 @@ import { lstat, readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { SkillPolicyConfig } from "./config.js";
 import { WorkspaceBoundary } from "../runtime/workspace.js";
+import { asciiLowercase, compareOrdinal } from "../deterministicText.js";
 
 export interface SkillMetadata {
   readonly name: string;
@@ -38,7 +39,7 @@ export async function loadWorkspaceSkills(
     const absolute = await workspace.existing(root);
     await collectSkillFiles(workspace, absolute, candidates, policy.maxFiles);
   }
-  candidates.sort((left, right) => left.localeCompare(right));
+  candidates.sort(compareOrdinal);
   if (candidates.length > policy.maxFiles) throw new Error(`Skill file count exceeds ${policy.maxFiles}.`);
 
   let totalBytes = 0;
@@ -47,7 +48,7 @@ export async function loadWorkspaceSkills(
   for (const skillFile of candidates) {
     const directory = path.dirname(skillFile);
     const resources = await collectResources(workspace, directory, policy);
-    const descriptor = resources.find((resource) => path.basename(resource.path).toLocaleLowerCase() === "skill.md");
+    const descriptor = resources.find((resource) => asciiLowercase(path.basename(resource.path)) === "skill.md");
     if (descriptor === undefined) throw new Error(`Skill '${directory}' has no SKILL.md resource.`);
     totalBytes += resources.reduce((sum, resource) => sum + resource.bytes, 0);
     if (totalBytes > policy.maxTotalBytes) throw new Error(`Skill corpus exceeds ${policy.maxTotalBytes} bytes.`);
@@ -89,7 +90,7 @@ async function collectSkillFiles(
   maxFiles: number,
 ): Promise<void> {
   const entries = await readdir(directory, { withFileTypes: true });
-  for (const entry of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+  for (const entry of entries.sort((a, b) => compareOrdinal(a.name, b.name))) {
     if (output.length > maxFiles) return;
     const absolute = path.join(directory, entry.name);
     if (entry.isSymbolicLink()) continue;
@@ -97,7 +98,7 @@ async function collectSkillFiles(
       const relative = path.relative(workspace.root, absolute);
       const resolved = await workspace.existing(relative);
       await collectSkillFiles(workspace, resolved, output, maxFiles);
-    } else if (entry.isFile() && entry.name.toLocaleLowerCase() === "skill.md") {
+    } else if (entry.isFile() && asciiLowercase(entry.name) === "skill.md") {
       const resolved = await realpath(absolute);
       assertInside(workspace.root, resolved, "Skill file");
       output.push(resolved);
@@ -112,7 +113,7 @@ async function collectResources(
 ): Promise<readonly SkillResource[]> {
   const output: SkillResource[] = [];
   const walk = async (current: string): Promise<void> => {
-    for (const entry of (await readdir(current, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const entry of (await readdir(current, { withFileTypes: true })).sort((a, b) => compareOrdinal(a.name, b.name))) {
       const absolute = path.join(current, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) {
@@ -134,7 +135,7 @@ async function collectResources(
     }
   };
   await walk(directory);
-  return output.sort((left, right) => left.path.localeCompare(right.path));
+  return output.sort((left, right) => compareOrdinal(left.path, right.path));
 }
 
 function parseSkill(text: string, source: string): Pick<LoadedSkill, "metadata" | "instructions"> {

@@ -1,4 +1,5 @@
 import type { RunOutcome } from "../kernel/run.js";
+import { asciiLowercase } from "../deterministicText.js";
 
 export type OutcomeClassification = "verified" | "capability_failure" | "infrastructure_error";
 
@@ -12,7 +13,7 @@ export function classifyOutcome(outcome: RunOutcome): OutcomeClassification {
     "network error",
     "request timed out",
   ];
-  const reason = outcome.reason.toLocaleLowerCase();
+  const reason = asciiLowercase(outcome.reason);
   if (outcome.reason.startsWith("Model failure:")
     && infrastructureMarkers.some((marker) => reason.includes(marker))) return "infrastructure_error";
   return "capability_failure";

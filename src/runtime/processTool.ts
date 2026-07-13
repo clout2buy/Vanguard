@@ -3,6 +3,7 @@ import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } fro
 import { objectInput, optionalStringField, stringArrayField, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
 import { sanitizedChildEnvironment } from "../engine/security.js";
+import { asciiLowercase } from "../deterministicText.js";
 
 export interface ProcessToolOptions {
   readonly allowedCommands: readonly string[];
@@ -64,13 +65,13 @@ export class ProcessTool implements ToolPort {
       return { ok: false, output: { error: "Command is not allowed.", command } };
     }
     const deniedArgument = args.find((argument) =>
-      this.#deniedArgumentPrefixes.some((prefix) => argument.toLocaleLowerCase().startsWith(prefix.toLocaleLowerCase())),
+      this.#deniedArgumentPrefixes.some((prefix) => asciiLowercase(argument).startsWith(asciiLowercase(prefix))),
     );
     if (deniedArgument !== undefined) {
       return { ok: false, output: { error: "Argument is blocked by process policy.", argument: deniedArgument } };
     }
     const deniedSubstring = this.#deniedArgumentSubstrings.find((substring) =>
-      args.some((argument) => argument.toLocaleLowerCase().includes(substring.toLocaleLowerCase())),
+      args.some((argument) => asciiLowercase(argument).includes(asciiLowercase(substring))),
     );
     if (deniedSubstring !== undefined) {
       return {
@@ -141,5 +142,5 @@ async function runProcess(
 }
 
 function normalizeCommand(command: string): string {
-  return command.trim().toLocaleLowerCase();
+  return asciiLowercase(command.trim());
 }

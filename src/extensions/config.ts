@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import type { JsonValue, ToolDefinition } from "../kernel/contracts.js";
 import { WorkspaceBoundary } from "../runtime/workspace.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 export type ExtensionEffect = NonNullable<ToolDefinition["effect"]>;
 export type HookFailurePolicy = "fail-open" | "fail-closed";
@@ -182,7 +183,7 @@ function mergeNamed<T extends { readonly name: string }>(
   if (incoming === undefined) return current;
   const merged = new Map(current.map((item) => [item.name, item]));
   for (const item of incoming) merged.set(item.name, item);
-  return [...merged.values()].sort((left, right) => left.name.localeCompare(right.name));
+  return [...merged.values()].sort((left, right) => compareOrdinal(left.name, right.name));
 }
 
 function intersectPermissions(requested: ExtensionPermissions, ceiling: ExtensionPermissions): ExtensionPermissions {

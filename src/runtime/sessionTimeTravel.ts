@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { copyFile, cp, mkdir, readFile, readdir, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
+import { compareOrdinal } from "../deterministicText.js";
 import { FileJournal } from "../kernel/fileJournal.js";
 import {
   createForkedCodingSession,
@@ -126,7 +127,8 @@ export async function listSessionCheckpoints(session: CodingSession): Promise<re
     if (!child.startsWith("checkpoint-")) continue;
     checkpoints.push(await loadSessionCheckpoint(session, child));
   }
-  checkpoints.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+  checkpoints.sort((left, right) =>
+    compareOrdinal(left.createdAt, right.createdAt) || compareOrdinal(left.id, right.id));
   return checkpoints;
 }
 

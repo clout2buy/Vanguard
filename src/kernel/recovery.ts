@@ -9,6 +9,7 @@ import type {
   RunEvent,
   RunEventType,
 } from "./contracts.js";
+import { asciiLowercase, asciiUppercase } from "../deterministicText.js";
 
 export interface RecoveryClock {
   now(): number;
@@ -197,10 +198,10 @@ export function classifyFailure(error: unknown, context: FailureClassificationCo
   const existing = failureDescriptor(error);
   if (existing !== undefined) return existing;
   const message = boundedMessage(error);
-  const lower = message.toLocaleLowerCase();
+  const lower = asciiLowercase(message);
   const status = context.status ?? numericProperty(error, "status");
   const retryAfterMs = context.retryAfterMs ?? numericProperty(error, "retryAfterMs");
-  const code = stringProperty(error, "code").toLocaleUpperCase();
+  const code = asciiUppercase(stringProperty(error, "code"));
   const base = {
     version: 1 as const,
     message,

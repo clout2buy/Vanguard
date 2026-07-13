@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { JsonValue, RunEvent } from "./contracts.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 export interface DurableStateAnchor {
   readonly tool: string;
@@ -43,7 +44,7 @@ function canonicalJson(value: JsonValue): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   return `{${Object.entries(value)
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareOrdinal(left, right))
     .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
     .join(",")}}`;
 }

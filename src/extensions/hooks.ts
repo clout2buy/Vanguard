@@ -7,6 +7,7 @@ import { createSecretRedactor } from "../engine/security.js";
 import { WorkspaceBoundary } from "../runtime/workspace.js";
 import type { HookDeclaration, HookWhen } from "./config.js";
 import { ExtensionPermissionPolicy } from "./customTools.js";
+import { compareOrdinal } from "../deterministicText.js";
 
 export interface ExtensionAuditEvent {
   readonly type: "hook.outcome" | "mcp.lifecycle";
@@ -90,7 +91,8 @@ export class HookRunner {
 
   async run(when: HookWhen, signal: AbortSignal): Promise<readonly HookOutcome[]> {
     const outcomes: HookOutcome[] = [];
-    for (const hook of this.hooks.filter((candidate) => candidate.when === when).sort((a, b) => a.name.localeCompare(b.name))) {
+    for (const hook of this.hooks.filter((candidate) => candidate.when === when)
+      .sort((a, b) => compareOrdinal(a.name, b.name))) {
       this.policy.authorizeHook(hook.name);
       this.policy.authorizeCommand(hook.command);
       const outcome = await this.#execute(hook, signal);

@@ -34,7 +34,8 @@ child.once("close", (code, signal) => {
 async function collectTests(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
   const discovered = [];
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name, "en"))) {
+  for (const entry of entries.sort((left, right) =>
+    left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
     const absolute = path.join(directory, entry.name);
     if (entry.isDirectory()) discovered.push(...await collectTests(absolute));
     else if (entry.isFile() && entry.name.endsWith(".test.js")) discovered.push(absolute);

@@ -1,4 +1,5 @@
 import type { PublicRunEvent } from "../runtime/publicRunEvents.js";
+import { asciiUppercase } from "../deterministicText.js";
 
 const SECRET_NAME = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|password|secret)/i;
 const SECRET_ASSIGNMENT = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|password|secret)(\s*[=:]\s*)([^\s,;]+)/gi;
@@ -69,7 +70,7 @@ export function sanitizedChildEnvironment(environment: NodeJS.ProcessEnv = proce
   const output: NodeJS.ProcessEnv = {};
   for (const [name, value] of Object.entries(environment)) {
     if (value === undefined) continue;
-    const normalized = name.toLocaleUpperCase();
+    const normalized = asciiUppercase(name);
     if (SECRET_NAME.test(name) || DANGEROUS_CHILD_ENVIRONMENT.has(normalized)) continue;
     output[name] = value;
   }

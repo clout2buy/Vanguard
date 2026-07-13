@@ -23,6 +23,7 @@ import type {
   RunEvent,
 } from "./contracts.js";
 import { CONTROL_TOOL_NAMES, PLAN_TOOL_NAME, normalizeDecision, renderContract } from "./contracts.js";
+import { compareOrdinal } from "../deterministicText.js";
 import { EvidenceContextPolicy } from "./contextPolicy.js";
 import {
   RecoveryController,
@@ -1107,7 +1108,7 @@ function isNarrowPlanFreeMutation(call: ToolCall): boolean {
 
 function objectKeySorter(_key: string, value: unknown): unknown {
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)));
+    return Object.fromEntries(Object.entries(value).sort(([left], [right]) => compareOrdinal(left, right)));
   }
   return value;
 }

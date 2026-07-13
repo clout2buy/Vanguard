@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { lowercaseInvariant } from "../deterministicText.js";
 import type { JsonValue } from "../kernel/contracts.js";
 import type { FileJournal } from "../kernel/fileJournal.js";
 import type { CodingSession } from "./session.js";
@@ -647,7 +648,7 @@ function transactionRoot(session: CodingSession, id: string): string {
 async function withSourceLock<T>(sourceRoot: string, action: () => Promise<T>): Promise<T> {
   const directory = path.join(os.tmpdir(), "vanguard-apply-locks");
   await mkdir(directory, { recursive: true });
-  const file = path.join(directory, `${sha256(path.resolve(sourceRoot).toLocaleLowerCase())}.lock`);
+  const file = path.join(directory, `${sha256(lowercaseInvariant(path.resolve(sourceRoot)))}.lock`);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
