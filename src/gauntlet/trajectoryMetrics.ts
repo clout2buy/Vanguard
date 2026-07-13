@@ -11,6 +11,7 @@ export interface TrajectoryMetrics {
   readonly verificationAttempts: number;
   readonly verificationFailures: number;
   readonly policyBlocks: number;
+  readonly contextCompactions: number;
   readonly toolCallsByName: Readonly<Record<string, number>>;
 }
 
@@ -25,6 +26,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   let verificationAttempts = 0;
   let verificationFailures = 0;
   let policyBlocks = 0;
+  let contextCompactions = 0;
   const toolCallsByName: Record<string, number> = {};
   let pendingToolName: string | undefined;
 
@@ -63,6 +65,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       verificationAttempts += 1;
       if (data?.passed === false) verificationFailures += 1;
     }
+    if (event.type === "context.compacted") contextCompactions += 1;
   }
 
   return {
@@ -76,6 +79,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     verificationAttempts,
     verificationFailures,
     policyBlocks,
+    contextCompactions,
     toolCallsByName,
   };
 }

@@ -122,9 +122,20 @@ export class AgentKernel {
 
       let decision: ModelDecision;
       try {
+        const selectedTranscript = this.#contextPolicy.select(task, transcript, this.#options.maxContextBytes);
+        const fullContextBytes = Buffer.byteLength(JSON.stringify(transcript));
+        const selectedContextBytes = Buffer.byteLength(JSON.stringify(selectedTranscript));
+        if (selectedContextBytes < fullContextBytes) {
+          await this.#record("context.compacted", {
+            fullEntries: transcript.length,
+            selectedEntries: selectedTranscript.length,
+            fullBytes: fullContextBytes,
+            selectedBytes: selectedContextBytes,
+          });
+        }
         decision = await this.#model.decide({
           task,
-          transcript: this.#contextPolicy.select(task, transcript, this.#options.maxContextBytes),
+          transcript: selectedTranscript,
           tools: [...this.#tools.values()].map((tool) => tool.definition),
           remainingSteps: this.#options.maxSteps - step + 1,
           signal,

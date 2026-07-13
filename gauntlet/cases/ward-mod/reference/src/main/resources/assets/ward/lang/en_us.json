@@ -1,0 +1,6 @@
+{
+  "ward.claim.created": "Claim created",
+  "ward.claim.overlap": "That area overlaps another claim",
+  "ward.claim.limit": "You have reached your claim limit",
+  "ward.build.denied": "You cannot build here"
+}

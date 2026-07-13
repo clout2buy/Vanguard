@@ -25,6 +25,7 @@ test("trajectory metrics distinguish clean completion from recovery and policy f
     verificationAttempts: 2,
     verificationFailures: 1,
     policyBlocks: 1,
+    contextCompactions: 0,
     toolCallsByName: { "workspace.read": 1, "process.run": 1 },
   });
 });

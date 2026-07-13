@@ -80,6 +80,7 @@ export interface VerifierPort {
 export type RunEventType =
   | "run.started"
   | "run.resumed"
+  | "context.compacted"
   | "model.decided"
   | "tool.completed"
   | "tool.failed"

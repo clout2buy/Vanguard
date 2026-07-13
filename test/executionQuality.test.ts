@@ -9,7 +9,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
   };
   const clean = scoreExecutionQuality(true, {
     modelDecisions: 4, toolCalls: 3, toolFailures: 0, localTestFailures: 0, testHarnessFailures: 0, toolFrictionFailures: 0, completionClaims: 1,
-    verificationAttempts: 1, verificationFailures: 0, policyBlocks: 0,
+    verificationAttempts: 1, verificationFailures: 0, policyBlocks: 0, contextCompactions: 0,
     toolCallsByName: { "workspace.write": 1, "process.run": 1 },
   }, patch);
   assert.equal(clean.score, 1);
@@ -18,7 +18,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
 
   const productive = scoreExecutionQuality(true, {
     modelDecisions: 7, toolCalls: 6, toolFailures: 1, localTestFailures: 1, testHarnessFailures: 0, toolFrictionFailures: 0, completionClaims: 1,
-    verificationAttempts: 1, verificationFailures: 0, policyBlocks: 0,
+    verificationAttempts: 1, verificationFailures: 0, policyBlocks: 0, contextCompactions: 0,
     toolCallsByName: { "workspace.write": 1, "workspace.replace": 1, "process.run": 2 },
   }, { ...patch, afterLines: 50 });
   assert.equal(productive.score, 1);
@@ -28,7 +28,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
 
   const churn = scoreExecutionQuality(true, {
     modelDecisions: 12, toolCalls: 9, toolFailures: 2, localTestFailures: 1, testHarnessFailures: 0, toolFrictionFailures: 1, completionClaims: 3,
-    verificationAttempts: 3, verificationFailures: 2, policyBlocks: 0,
+    verificationAttempts: 3, verificationFailures: 2, policyBlocks: 0, contextCompactions: 0,
     toolCallsByName: { "workspace.write": 4, "process.run": 2 },
   }, patch);
   assert.equal(churn.score < clean.score, true);
@@ -39,7 +39,7 @@ test("execution quality distinguishes clean verified work from churn", () => {
 function churnTrajectory() {
   return {
     modelDecisions: 12, toolCalls: 9, toolFailures: 2, localTestFailures: 1, testHarnessFailures: 0, toolFrictionFailures: 1, completionClaims: 3,
-    verificationAttempts: 3, verificationFailures: 2, policyBlocks: 0,
+    verificationAttempts: 3, verificationFailures: 2, policyBlocks: 0, contextCompactions: 0,
     toolCallsByName: { "workspace.write": 4, "process.run": 2 },
   };
 }

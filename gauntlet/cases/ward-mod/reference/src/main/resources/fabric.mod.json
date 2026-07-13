@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "ward",
+  "name": "Ward",
+  "version": "1.0.0",
+  "entrypoints": { "main": ["dev.vanguard.ward.WardMod"] }
+}

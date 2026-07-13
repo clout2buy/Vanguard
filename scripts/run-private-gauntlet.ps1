@@ -77,6 +77,7 @@ try {
       "--max-verification-attempts", "3",
       "--max-steps", [string]$Case.maxSteps
     )
+    if ($null -ne $Case.maxContextBytes) { $Arguments += @("--max-context-bytes", [string]$Case.maxContextBytes) }
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
     foreach ($EditableRoot in $Case.editableRoots) { $Arguments += @("--editable-root", [string]$EditableRoot) }
 
@@ -102,6 +103,7 @@ try {
         verificationFailures = $Scorecard.trajectory.verificationFailures
         completionClaims = $Scorecard.trajectory.completionClaims
         policyBlocks = $Scorecard.trajectory.policyBlocks
+        contextCompactions = $Scorecard.trajectory.contextCompactions
         executionQuality = $Scorecard.grade.executionQuality.score
         changedFiles = $Scorecard.patch.changedFiles.Count
         filesAdded = $Scorecard.patch.filesAdded
@@ -132,6 +134,7 @@ try {
         verificationFailures = 0
         completionClaims = 0
         policyBlocks = 0
+        contextCompactions = 0
         executionQuality = 0
         changedFiles = 0
         filesAdded = 0
@@ -157,7 +160,7 @@ try {
   $InfrastructureErrors = $Total - $Evaluated
   $Passed = @($EvaluatedResults | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 6
+    version = 7
     provider = $Provider
     model = $Model
     passed = $Passed
@@ -178,6 +181,7 @@ try {
       verificationFailures = [int](($Results | Measure-Object -Property verificationFailures -Sum).Sum)
       completionClaims = [int](($Results | Measure-Object -Property completionClaims -Sum).Sum)
       policyBlocks = [int](($Results | Measure-Object -Property policyBlocks -Sum).Sum)
+      contextCompactions = [int](($Results | Measure-Object -Property contextCompactions -Sum).Sum)
     }
     patch = [pscustomobject]@{
       changedFiles = [int](($Results | Measure-Object -Property changedFiles -Sum).Sum)

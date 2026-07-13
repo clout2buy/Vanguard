@@ -1,0 +1,28 @@
+{
+  "id": "ward-mod",
+  "version": 1,
+  "track": "long-horizon-mod",
+  "workspace": "workspace",
+  "task": "TASK.md",
+  "grader": "grader.mjs",
+  "protected": [
+    "package.json",
+    "build.gradle",
+    "settings.gradle",
+    "tools/check.mjs",
+    "src/main/java/dev/vanguard/ward/api/BlockPos.java",
+    "src/main/java/dev/vanguard/ward/api/PlayerContext.java",
+    "src/main/java/dev/vanguard/ward/CommandResult.java"
+  ],
+  "editableRoots": [
+    "src/main/java/dev/vanguard/ward/Claim.java",
+    "src/main/java/dev/vanguard/ward/ClaimStore.java",
+    "src/main/java/dev/vanguard/ward/PermissionService.java",
+    "src/main/java/dev/vanguard/ward/WardCommand.java",
+    "src/main/java/dev/vanguard/ward/WardMod.java",
+    "src/main/resources/fabric.mod.json",
+    "src/main/resources/assets/ward/lang/en_us.json"
+  ],
+  "maxSteps": 260,
+  "maxContextBytes": 120000
+}

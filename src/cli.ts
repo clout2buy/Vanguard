@@ -47,6 +47,7 @@ interface CliOptions {
   readonly allowedCommands: readonly string[];
   readonly maxSteps: number;
   readonly maxDurationMs: number;
+  readonly maxContextBytes: number;
   readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
   readonly editableRoots: readonly string[];
@@ -129,7 +130,7 @@ async function main(): Promise<void> {
     workingState,
     options: {
       maxSteps: options.maxSteps,
-      maxContextBytes: 2_000_000,
+      maxContextBytes: options.maxContextBytes,
       maxRepeatedAction: 3,
       maxFailedVerificationAttempts: options.maxFailedVerificationAttempts,
     },
@@ -210,6 +211,10 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1) {
     throw new Error("--max-duration-ms must be a positive integer.");
   }
+  const maxContextBytes = Number(single(values, "--max-context-bytes") ?? "2000000");
+  if (!Number.isSafeInteger(maxContextBytes) || maxContextBytes < 1) {
+    throw new Error("--max-context-bytes must be a positive integer.");
+  }
   const maxFailedVerificationAttempts = Number(single(values, "--max-verification-attempts") ?? "3");
   if (!Number.isSafeInteger(maxFailedVerificationAttempts) || maxFailedVerificationAttempts < 1) {
     throw new Error("--max-verification-attempts must be a positive integer.");
@@ -234,6 +239,7 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence") ?? "full"),
     maxSteps,
     maxDurationMs,
+    maxContextBytes,
     maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
   };
@@ -352,7 +358,7 @@ function progressJournal(fileJournal: FileJournal): JournalPort {
 }
 
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each verifier argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {
