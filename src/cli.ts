@@ -37,6 +37,8 @@ import {
   classifyOutcome,
   openCodingSession,
   FixedCommandTool,
+  PlanLedger,
+  PlanTool,
   PublicRunEventPresenter,
   createStreamLifecyclePresenter,
   encodePublicRunEvent,
@@ -308,7 +310,12 @@ async function buildExecutionRuntime(
     }));
   }
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
-  const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
+  const checkpoint = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
+  const plan = await PlanLedger.open(path.join(container, "plan.json"));
+  // Both durable states ride into every request as runtime-owned context.
+  const workingState = {
+    snapshot: () => ({ checkpoint: checkpoint.snapshot(), plan: plan.snapshot() }),
+  };
   const kernel = new AgentKernel({
     model: createModel(options, interactive ? createStreamPresenter(markActivity) : undefined),
     tools: [
@@ -320,13 +327,15 @@ async function buildExecutionRuntime(
       new DeleteFileTool(workspace, versions, mutationPolicy),
       new ReviewChangesTool(session.sourceRoot, session.workspaceRoot),
       new ImageInspectionTool(workspace),
-      new CheckpointTool(workingState),
+      new CheckpointTool(checkpoint),
+      new PlanTool(plan),
       ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
       ...(options.exposeRawProcess ? [processTool] : []),
     ],
     verifiers,
     journal,
     workingState,
+    plan,
     taskAddendum: taskAddendum(options, mutationPolicy),
     ...(userChannel === undefined ? {} : { userChannel }),
     options: {

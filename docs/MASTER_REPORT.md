@@ -47,10 +47,45 @@ superiority** — the evidence selects the language afterward.
   disconnections is simulated, not field-observed; usage metadata is captured
   but not yet normalized into scorecards (Phase 3).
 
+### Phase 2 — Long-horizon plan spine
+
+- **Intended KPI:** long-horizon integrity — no completion while contract
+  criteria/milestones lack evidence; exact plan state across interruption;
+  contract constraints/non-goals durable against compaction. Canary steps and
+  completion-claim counts are the trend metrics to watch.
+- **Implemented:** expanded `TaskContract` (constraints, non-goals,
+  assumptions, risk level, required verification, deliverables) rendered into
+  the durable task text; `PlanLedger`/`plan.update` (full-plan revisions with
+  journaled history, atomic `plan.json`, proven-requires-evidence,
+  dependency validation, 24-milestone bound); kernel gates — mutation refused
+  before an initial plan, completion enumerates unproven milestones as a
+  completion-evidence rejection; interval re-grounding via journaled
+  `runtime.note` entries that land late in context; plan + checkpoint ride
+  every request as composite runtime-owned working state.
+- **Adversarial proof:** tests cover pre-plan mutation refusal, premature
+  completion enumeration, proven-without-evidence rejection, invalidation +
+  history reload from disk, interrupted execution resuming exact plan state,
+  re-grounding cadence reaching the model, and contract sections surviving
+  into the rendered task (which the codecs re-anchor if compaction drops it).
+- **Note on scale:** the interruption test simulates the mechanism at ~15
+  steps rather than the directive's 200 — the state machine is identical; a
+  200-step synthetic journal exercise lands with Phase 3's context work.
+- **Canary before/after:** baseline recorded pre-Phase-2 (see caveat below);
+  post-Phase-2 canary runs after commit.
+- **Provenance caveat:** the baseline canary's `npm run build` may have raced
+  early Phase 2 type-only edits in the working tree. Behaviorally it is the
+  Phase 1 engine (no plan tool was wired). Rule added going forward: canary
+  runs only from committed trees.
+
 ## Invalidated results ledger
 
-- None yet in this program. (Historical invalidations remain in
-  `docs/LIVE_RESULTS.md`.)
+- **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development
+  builds (`npm test` → `tsc`) rewrote `dist/` while the canary was mid-run,
+  so later cases executed Phase 2 code while earlier cases executed Phase 1
+  code. The run is retained for crash signal only. Remediation: clean
+  Phase 1 baseline re-run from a git worktree pinned at `d8c3e9f`; standing
+  rule added — canary runs execute from committed trees with no concurrent
+  builds. (Historical invalidations remain in `docs/LIVE_RESULTS.md`.)
 
 ## Unresolved risks (program level)
 

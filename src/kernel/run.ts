@@ -10,6 +10,7 @@ import type {
   ToolCall,
   ToolDefinition,
   ToolObservation,
+  PlanStatusPort,
   ToolPort,
   TranscriptEntry,
   UserChannelPort,
@@ -18,7 +19,7 @@ import type {
   WorkingStatePort,
   RunEvent,
 } from "./contracts.js";
-import { CONTROL_TOOL_NAMES, normalizeDecision, renderContract } from "./contracts.js";
+import { CONTROL_TOOL_NAMES, PLAN_TOOL_NAME, normalizeDecision, renderContract } from "./contracts.js";
 import { EvidenceContextPolicy } from "./contextPolicy.js";
 
 export interface RunOptions {
@@ -29,6 +30,8 @@ export interface RunOptions {
   readonly maxContextBytes: number;
   readonly maxConversationTurnSteps: number;
   readonly maxConsecutiveNarrations: number;
+  /** Steps between runtime re-grounding notes during planned execution. */
+  readonly regroundIntervalSteps: number;
   /**
    * Whether a user is available to answer questions. When false the kernel
    * does not offer `user.ask` and rejects ask_user decisions with feedback
@@ -85,6 +88,8 @@ export interface KernelDependencies {
   readonly taskAddendum?: string;
   /** Live user-message channel enabling mid-run steering and in-process answers. */
   readonly userChannel?: UserChannelPort;
+  /** Read-only view of the runtime-owned plan; activates the plan gates. */
+  readonly plan?: PlanStatusPort;
   readonly options?: Partial<RunOptions>;
 }
 
@@ -96,6 +101,7 @@ const DEFAULT_OPTIONS: RunOptions = {
   maxContextBytes: 1_000_000,
   maxConversationTurnSteps: 10,
   maxConsecutiveNarrations: 3,
+  regroundIntervalSteps: 12,
   interactive: false,
 };
 
@@ -112,13 +118,19 @@ const ASK_CONTROL_DEFINITION: ToolDefinition = {
 
 const EXECUTE_CONTROL_DEFINITION: ToolDefinition = {
   name: CONTROL_TOOL_NAMES.execute,
-  description: "Begin contracted engineering execution for an actionable coding request. State the objective in the user's terms and concrete success criteria. Never call this for ambiguous requests, greetings, or questions; a blank workspace is not authorization to build something.",
+  description: "Begin contracted engineering execution for an actionable coding request. State the objective in the user's terms, concrete success criteria, and — for non-trivial work — constraints, non-goals, and assumptions, so long work cannot drift. Never call this for ambiguous requests, greetings, or questions; a blank workspace is not authorization to build something.",
   inputSchema: {
     type: "object",
     properties: {
       objective: { type: "string", description: "The outcome the user asked for, precise and testable." },
       successCriteria: { type: "array", items: { type: "string" }, description: "Observable checks that prove the objective is met." },
-      notes: { type: "string", description: "Optional constraints or context from the conversation the execution must honor." },
+      constraints: { type: "array", items: { type: "string" }, description: "Hard requirements that must hold throughout (compatibility, style, interfaces)." },
+      nonGoals: { type: "array", items: { type: "string" }, description: "Explicitly out of scope; work must not expand into these." },
+      assumptions: { type: "array", items: { type: "string" }, description: "What was assumed from the conversation; wrong assumptions require replanning." },
+      riskLevel: { type: "string", enum: ["low", "medium", "high"], description: "Overall regression risk of the work." },
+      requiredVerification: { type: "array", items: { type: "string" }, description: "Checks that must pass beyond the sealed verifier." },
+      deliverables: { type: "array", items: { type: "string" }, description: "Concrete artifacts the user receives." },
+      notes: { type: "string", description: "Optional context from the conversation the execution must honor." },
     },
     required: ["objective", "successCriteria"],
     additionalProperties: false,
@@ -144,8 +156,10 @@ export class AgentKernel {
   readonly #contextPolicy: ContextPolicyPort;
   readonly #workingState: WorkingStatePort | undefined;
   readonly #hasReviewTool: boolean;
+  readonly #hasPlanTool: boolean;
   readonly #taskAddendum: string | undefined;
   readonly #userChannel: UserChannelPort | undefined;
+  readonly #plan: PlanStatusPort | undefined;
   readonly #options: RunOptions;
   #sequence = 0;
 
@@ -158,6 +172,8 @@ export class AgentKernel {
     this.#workingState = dependencies.workingState;
     this.#taskAddendum = dependencies.taskAddendum;
     this.#userChannel = dependencies.userChannel;
+    this.#plan = dependencies.plan;
+    this.#hasPlanTool = dependencies.tools.some((tool) => tool.name === PLAN_TOOL_NAME) && dependencies.plan !== undefined;
     this.#hasReviewTool = dependencies.tools.some((tool) => tool.definition.effect === "review");
     this.#options = { ...DEFAULT_OPTIONS, ...dependencies.options };
 
@@ -169,6 +185,8 @@ export class AgentKernel {
       || !Number.isSafeInteger(this.#options.maxContextBytes)
       || !Number.isSafeInteger(this.#options.maxConversationTurnSteps)
       || !Number.isSafeInteger(this.#options.maxConsecutiveNarrations)
+      || !Number.isSafeInteger(this.#options.regroundIntervalSteps)
+      || this.#options.regroundIntervalSteps < 1
       || this.#options.maxSteps < 1
       || this.#options.maxRepeatedAction < 1
       || this.#options.maxFailedVerificationAttempts < 1
@@ -218,6 +236,8 @@ export class AgentKernel {
     // before an interruption must not get a fresh allowance on resume unless
     // the user actually said something new.
     let consecutiveNarrations = input.userMessage === undefined ? restored.trailingNarrations : 0;
+    let stepsSinceReground = restored.stepsSinceReground;
+    let completedMutations = restored.completedMutations;
     this.#sequence = restored.sequence;
 
     if (restored.completed) throw new Error("Cannot resume a completed Vanguard run.");
@@ -271,6 +291,22 @@ export class AgentKernel {
         transcript.push({ role: "user", content: steering });
         consecutiveNarrations = 0;
       }
+
+      // Periodic re-grounding pins the contract and the unproven plan state
+      // late in context, where long-horizon attention actually lands.
+      if (mode === "execution" && this.#hasPlanTool
+        && stepsSinceReground >= this.#options.regroundIntervalSteps) {
+        const unproven = this.#plan!.unproven();
+        const note = "[Vanguard re-grounding] Re-read the task contract. "
+          + (unproven.length === 0
+            ? "No plan milestones remain unproven; confirm every contract criterion has evidence, then review and complete."
+            : `Unproven milestones: ${unproven.join("; ")}.`)
+          + " Stay inside the contract's constraints and do not drift into its non-goals.";
+        await this.#record("runtime.note", { text: note });
+        transcript.push({ role: "user", content: note });
+        stepsSinceReground = 0;
+      }
+      stepsSinceReground += 1;
       if (mode === "conversation" && step - turnStartStep > this.#options.maxConversationTurnSteps) {
         return this.#fail("Conversation step budget exhausted before the model yielded to the user.", step - 1);
       }
@@ -376,15 +412,21 @@ export class AgentKernel {
       }
 
       if (decision.kind === "complete") {
-        if (mutationNeedsExecutionEvidence || mutationNeedsReview) {
+        const unprovenMilestones = this.#hasPlanTool ? this.#plan!.unproven() : [];
+        if (mutationNeedsExecutionEvidence || mutationNeedsReview || unprovenMilestones.length > 0) {
           const missing = [
             mutationNeedsExecutionEvidence ? "a successful executable check" : undefined,
             mutationNeedsReview ? "workspace.changes review" : undefined,
           ].filter((item) => item !== undefined).join(" and ");
+          const parts = [
+            missing.length === 0 ? undefined : `Complete ${missing} after the latest workspace mutation before completing.`,
+            unprovenMilestones.length === 0 ? undefined
+              : `These plan milestones remain unproven: ${unprovenMilestones.join("; ")}. Prove each with evidence references via plan.update, or invalidate it with a reason, before completing.`,
+          ].filter((item) => item !== undefined);
           const evidence: VerificationResult = {
             verifier: "completion evidence policy",
             passed: false,
-            evidence: `Complete ${missing} after the latest workspace mutation before completing.`,
+            evidence: parts.join(" "),
           };
           await this.#record("verification.completed", evidence as unknown as JsonValue);
           transcript.push({ role: "verification", content: evidence as unknown as JsonValue });
@@ -443,7 +485,9 @@ export class AgentKernel {
       const batchOutcome = await this.#executeBatch(decision.calls, {
         task, step, signal, transcript, actionFailures,
         mode,
+        completedMutations: () => completedMutations,
         onMutate: () => {
+          completedMutations += 1;
           actionFailures.clear();
           mutationNeedsExecutionEvidence = true;
           mutationNeedsReview = this.#hasReviewTool;
@@ -491,6 +535,7 @@ export class AgentKernel {
       transcript: TranscriptEntry[];
       actionFailures: Map<string, number>;
       mode: KernelMode;
+      completedMutations: () => number;
       onMutate: () => void;
       onExecute: () => void;
       onReview: () => void;
@@ -506,6 +551,16 @@ export class AgentKernel {
         return {
           callId: call.id, tool: call.name, ok: false,
           error: `Tool '${call.name}' is not available before a task contract exists. Use task.execute to begin contracted work.`,
+        };
+      }
+      // "Substantial" mutation requires a plan: the first narrow edit is
+      // free, but from the second mutation onward the work is multi-step
+      // engineering and must be planned before it continues.
+      if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
+        && this.#plan!.isEmpty() && context.completedMutations() >= 1) {
+        return {
+          callId: call.id, tool: call.name, ok: false,
+          error: "This work has grown beyond a single edit. Materialize an engineering plan with plan.update before mutating further.",
         };
       }
       try {
@@ -578,6 +633,8 @@ interface RestoredSession {
   readonly pendingQuestion: string | undefined;
   readonly interruptedCalls: readonly ToolCall[];
   readonly trailingNarrations: number;
+  readonly stepsSinceReground: number;
+  readonly completedMutations: number;
 }
 
 function restoreSession(
@@ -603,6 +660,8 @@ function restoreSession(
   let completed = false;
   let pendingQuestion: string | undefined;
   let trailingNarrations = 0;
+  let stepsSinceReground = 0;
+  let completedMutations = 0;
 
   const flushCompletion = () => {
     if (pendingCompletion && completionClaimFailed) failedVerificationAttempts += 1;
@@ -640,6 +699,12 @@ function restoreSession(
       trailingNarrations = 0;
       continue;
     }
+    if (event.type === "runtime.note") {
+      const data = recordValue(event.data);
+      if (typeof data?.text === "string") transcript.push({ role: "user", content: data.text });
+      stepsSinceReground = 0;
+      continue;
+    }
     if (event.type === "run.waiting_for_user") {
       const data = recordValue(event.data);
       pendingQuestion = typeof data?.question === "string" ? data.question : "";
@@ -654,6 +719,7 @@ function restoreSession(
       const decision = normalizeDecision(event.data);
       transcript.push({ role: "decision", content: event.data });
       completedSteps += 1;
+      stepsSinceReground += 1;
       pendingCalls = decision?.kind === "tools" ? [...decision.calls] : [];
       pendingCompletion = decision?.kind === "complete";
       trailingNarrations = decision?.kind === "respond" ? trailingNarrations + 1 : 0;
@@ -674,6 +740,7 @@ function restoreSession(
           actionFailures.delete(fingerprint);
           const effect = tools.get(call.name)?.definition.effect;
           if (effect === "mutate") {
+            completedMutations += 1;
             actionFailures.clear();
             mutationNeedsExecutionEvidence = true;
             mutationNeedsReview = hasReviewTool;
@@ -712,6 +779,8 @@ function restoreSession(
     pendingQuestion,
     interruptedCalls: pendingCalls,
     trailingNarrations,
+    stepsSinceReground,
+    completedMutations,
   };
 }
 

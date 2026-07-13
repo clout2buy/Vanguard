@@ -14,6 +14,10 @@ eventually certify it. It uses three strictly separated layers.
 - **Results:** `gauntlet/results/canary-<phase>-<timestamp>.json`, summarized
   in `docs/MASTER_REPORT.md` with a before/after diff against the previous
   phase.
+- **Isolation rule:** canary runs execute from a committed tree and never
+  concurrently with development builds — `dist/` is shared, and a mid-run
+  rebuild silently mixes engine versions across cases (this exact failure
+  invalidated the first baseline attempt; see the master report ledger).
 
 ## Layer 2 — Shadow regression set (sealed, run at milestones)
 

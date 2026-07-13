@@ -15,10 +15,19 @@ export interface ToolCall {
 /**
  * A task contract is the explicit boundary between conversation and execution.
  * Mutation and execution tools become available only after a contract exists.
+ * Beyond the objective and observable criteria, a durable engineering
+ * contract records what must NOT change, what is out of scope, and what the
+ * model assumed — so long-horizon work cannot silently drift.
  */
 export interface TaskContract {
   readonly objective: string;
   readonly successCriteria: readonly string[];
+  readonly constraints?: readonly string[];
+  readonly nonGoals?: readonly string[];
+  readonly assumptions?: readonly string[];
+  readonly riskLevel?: "low" | "medium" | "high";
+  readonly requiredVerification?: readonly string[];
+  readonly deliverables?: readonly string[];
   readonly notes?: string;
 }
 
@@ -34,6 +43,17 @@ export const CONTROL_TOOL_NAMES = {
   execute: "task.execute",
   complete: "task.complete",
 } as const;
+
+/** The runtime-owned plan tool; its presence activates the plan gates. */
+export const PLAN_TOOL_NAME = "plan.update";
+
+/** The kernel's read-only view of the runtime-owned plan. */
+export interface PlanStatusPort {
+  /** True until an initial plan has been materialized. */
+  isEmpty(): boolean;
+  /** Milestones not yet proven or invalidated, as "id — title" labels. */
+  unproven(): readonly string[];
+}
 
 export type ModelDecision =
   | { readonly kind: "respond"; readonly message: string; readonly continuation?: JsonValue }
@@ -82,12 +102,29 @@ export function normalizeDecision(value: JsonValue): ModelDecision | undefined {
 export function normalizeContract(value: JsonValue | undefined): TaskContract | undefined {
   if (value === null || value === undefined || Array.isArray(value) || typeof value !== "object") return undefined;
   if (typeof value.objective !== "string" || value.objective.trim().length === 0) return undefined;
-  const successCriteria = Array.isArray(value.successCriteria)
-    ? value.successCriteria.filter((item): item is string => typeof item === "string")
-    : [];
+  const list = (field: JsonValue | undefined): string[] =>
+    Array.isArray(field) ? field.filter((item): item is string => typeof item === "string" && item.length > 0) : [];
+  const optionalList = (field: JsonValue | undefined): { present: boolean; items: string[] } => {
+    const items = list(field);
+    return { present: items.length > 0, items };
+  };
+  const constraints = optionalList(value.constraints);
+  const nonGoals = optionalList(value.nonGoals);
+  const assumptions = optionalList(value.assumptions);
+  const requiredVerification = optionalList(value.requiredVerification);
+  const deliverables = optionalList(value.deliverables);
+  const riskLevel = value.riskLevel === "low" || value.riskLevel === "medium" || value.riskLevel === "high"
+    ? value.riskLevel
+    : undefined;
   return {
     objective: value.objective.trim(),
-    successCriteria,
+    successCriteria: list(value.successCriteria),
+    ...(constraints.present ? { constraints: constraints.items } : {}),
+    ...(nonGoals.present ? { nonGoals: nonGoals.items } : {}),
+    ...(assumptions.present ? { assumptions: assumptions.items } : {}),
+    ...(riskLevel === undefined ? {} : { riskLevel }),
+    ...(requiredVerification.present ? { requiredVerification: requiredVerification.items } : {}),
+    ...(deliverables.present ? { deliverables: deliverables.items } : {}),
     ...(typeof value.notes === "string" && value.notes.length > 0 ? { notes: value.notes } : {}),
   };
 }
@@ -99,11 +136,21 @@ function normalizeCall(value: JsonValue | undefined): ToolCall | undefined {
 }
 
 export function renderContract(contract: TaskContract): string {
-  const criteria = contract.successCriteria.length === 0
-    ? ""
-    : `\n\nSuccess criteria:\n${contract.successCriteria.map((item) => `- ${item}`).join("\n")}`;
+  const section = (title: string, items: readonly string[] | undefined): string =>
+    items === undefined || items.length === 0
+      ? ""
+      : `\n\n${title}:\n${items.map((item) => `- ${item}`).join("\n")}`;
+  const risk = contract.riskLevel === undefined ? "" : `\n\nRisk level: ${contract.riskLevel}`;
   const notes = contract.notes === undefined ? "" : `\n\nNotes: ${contract.notes}`;
-  return `${contract.objective}${criteria}${notes}`;
+  return `${contract.objective}`
+    + section("Success criteria", contract.successCriteria)
+    + section("Constraints", contract.constraints)
+    + section("Non-goals (do not do these)", contract.nonGoals)
+    + section("Assumptions", contract.assumptions)
+    + section("Required verification", contract.requiredVerification)
+    + section("Deliverables", contract.deliverables)
+    + risk
+    + notes;
 }
 
 export interface TranscriptEntry {
@@ -202,6 +249,7 @@ export type RunEventType =
   | "run.contracted"
   | "run.waiting_for_user"
   | "user.message"
+  | "runtime.note"
   | "context.compacted"
   | "model.decided"
   | "tool.completed"

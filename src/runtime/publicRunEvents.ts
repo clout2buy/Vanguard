@@ -284,6 +284,7 @@ function toolDetail(name: string, input: JsonValue | undefined): string | undefi
   }
   if (name === "project.check") return "trusted project verification";
   if (name === "run.checkpoint") return "durable working state";
+  if (name === "plan.update") return "engineering plan revision";
   return undefined;
 }
 
