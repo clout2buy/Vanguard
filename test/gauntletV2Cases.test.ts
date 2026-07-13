@@ -97,11 +97,14 @@ for (const reference of references) {
     const caseRoot = path.resolve("gauntlet", "cases", reference.id);
     const grader = path.join(caseRoot, "grader.mjs");
     await assert.rejects(() => executeFile(process.execPath, [grader, path.join(caseRoot, "workspace")]));
+    await assert.rejects(() => executeFile(process.execPath, [path.join(caseRoot, "workspace", "tools", "check.mjs")]));
     const container = await mkdtemp(path.join(os.tmpdir(), `vanguard-v2-${reference.id}-`));
     const workspace = path.join(container, "workspace");
     try {
       await cp(path.join(caseRoot, "workspace"), workspace, { recursive: true });
       await writeFile(path.join(workspace, reference.file), reference.source);
+      const publicResult = await executeFile(process.execPath, [path.join(workspace, "tools", "check.mjs")]);
+      assert.match(publicResult.stdout, /public checks passed/);
       const { stdout } = await executeFile(process.execPath, [grader, workspace]);
       assert.match(stdout, /sealed grader passed/);
     } finally {

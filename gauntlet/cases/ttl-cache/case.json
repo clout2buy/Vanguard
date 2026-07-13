@@ -1,10 +1,12 @@
 {
   "id": "ttl-cache",
+  "version": 2,
   "track": "evolution",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
-  "protected": ["package.json"],
+  "publicCheck": { "command": "node", "args": ["tools/check.mjs"] },
+  "protected": ["package.json", "tools/check.mjs"],
   "editableRoots": ["src/ttlCache.mjs"],
   "maxSteps": 80
 }
