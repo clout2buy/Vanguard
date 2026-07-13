@@ -166,6 +166,21 @@ export interface ContextPolicyPort {
   select(task: string, transcript: readonly TranscriptEntry[], maxBytes: number): readonly TranscriptEntry[];
 }
 
+/**
+ * A live channel of user messages arriving while the kernel runs. Drained
+ * messages are journaled and injected at the next decision boundary, so
+ * steering is durable and never interrupts an in-flight tool call.
+ */
+export interface UserChannelPort {
+  /** Returns and removes every message queued since the last drain. */
+  drain(): readonly string[];
+  /**
+   * Waits for the next user message. Resolves undefined when the channel
+   * closes or the signal aborts, in which case the kernel pauses durably.
+   */
+  wait(signal: AbortSignal): Promise<string | undefined>;
+}
+
 export interface WorkingStatePort {
   snapshot(): JsonValue;
 }

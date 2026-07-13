@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { JournalPort, RunEvent, VerifierPort } from "./kernel/contracts.js";
+import { createInterface } from "node:readline";
+import type { JournalPort, RunEvent, UserChannelPort, VerifierPort } from "./kernel/contracts.js";
 import type { AgentKernel as AgentKernelType, RunOutcome } from "./kernel/run.js";
 import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
 import {
@@ -111,7 +112,7 @@ async function runCommand(resuming: boolean, args: readonly string[]): Promise<v
   const runtime = await buildExecutionRuntime(session, options, fileJournal, false);
   const startedAt = Date.now();
   const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${runtime.mutationPolicyDescription}`;
-  const outcome = await runWithBudgets(options, runtime.journalActivity, (signal) =>
+  const outcome = await runWithBudgets(options, runtime.journalActivity, new AbortController(), (signal) =>
     runtime.kernel.run(runtimeTask, signal, priorEvents));
   await writeScorecard({
     session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
@@ -158,51 +159,61 @@ async function advanceSession(
   const startedAt = Date.now();
   let contracted = priorEvents.some((event) => event.type === "run.contracted" || event.type === "run.started");
   let pendingMessage = message;
+  const controller = new AbortController();
+  const userChannel = process.env.VANGUARD_CONTROL_STREAM === "1"
+    ? new StdinUserChannel(() => controller.abort())
+    : undefined;
 
-  if (!contracted) {
-    const conversation = buildConversationRuntime(session, options, fileJournal);
-    const outcome = await runWithBudgets(options, conversation.journalActivity, (signal) =>
-      conversation.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
-    pendingMessage = undefined;
-    if (outcome.status !== "contracted") {
-      printAdvanceOutcome(outcome, session, container, journalFile);
-      if (outcome.status === "failed") process.exitCode = 1;
-      return;
+  try {
+    if (!contracted) {
+      const conversation = buildConversationRuntime(session, options, fileJournal, userChannel);
+      const outcome = await runWithBudgets(options, conversation.journalActivity, controller, (signal) =>
+        conversation.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
+      pendingMessage = undefined;
+      if (outcome.status !== "contracted") {
+        printAdvanceOutcome(outcome, session, container, journalFile);
+        if (outcome.status === "failed") process.exitCode = 1;
+        return;
+      }
+      priorEvents = await fileJournal.readValidated();
+      contracted = true;
     }
-    priorEvents = await fileJournal.readValidated();
-    contracted = true;
-  }
 
-  // Materialize unconditionally whenever a contract exists but the copy does
-  // not: an interruption between journaling run.contracted and copying the
-  // workspace must not strand the session on resume.
-  if (!session.materialized) {
-    session = await materializeSessionWorkspace(session);
-    emitSessionReady(session, container, journalFile, scorecardFile, true);
-    if (session.sourceChangedDuringConversation === true) {
-      process.stderr.write("[Vanguard] The original project changed during the conversation; the workspace copy uses the current state. Stale-content preconditions will force fresh reads before any edit.\n");
-      streamPublicEvent({
-        type: "source.changed",
-        agentId: "main",
-        status: "info",
-        title: "Original project changed during conversation",
-        detail: "The workspace copy uses the current state",
+    // Materialize unconditionally whenever a contract exists but the copy does
+    // not: an interruption between journaling run.contracted and copying the
+    // workspace must not strand the session on resume.
+    if (!session.materialized) {
+      session = await materializeSessionWorkspace(session);
+      emitSessionReady(session, container, journalFile, scorecardFile, true);
+      if (session.sourceChangedDuringConversation === true) {
+        process.stderr.write("[Vanguard] The original project changed during the conversation; the workspace copy uses the current state. Stale-content preconditions will force fresh reads before any edit.\n");
+        streamPublicEvent({
+          type: "source.changed",
+          agentId: "main",
+          status: "info",
+          title: "Original project changed during conversation",
+          detail: "The workspace copy uses the current state",
+        });
+      }
+    }
+
+    const runtime = await buildExecutionRuntime(session, options, fileJournal, true, userChannel);
+    const outcome = await runWithBudgets(options, runtime.journalActivity, controller, (signal) =>
+      runtime.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
+    if (outcome.status === "completed" || outcome.status === "failed") {
+      await writeScorecard({
+        session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
+        startedAt, resumed: true,
       });
+    } else {
+      printAdvanceOutcome(outcome, session, container, journalFile);
     }
+    if (outcome.status === "failed") process.exitCode = 1;
+  } finally {
+    // Release stdin so the process exits; a referenced reader would keep the
+    // event loop alive after the advance finishes.
+    userChannel?.close();
   }
-
-  const runtime = await buildExecutionRuntime(session, options, fileJournal, true);
-  const outcome = await runWithBudgets(options, runtime.journalActivity, (signal) =>
-    runtime.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
-  if (outcome.status === "completed" || outcome.status === "failed") {
-    await writeScorecard({
-      session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,
-      startedAt, resumed: true,
-    });
-  } else {
-    printAdvanceOutcome(outcome, session, container, journalFile);
-  }
-  if (outcome.status === "failed") process.exitCode = 1;
 }
 
 interface ExecutionRuntime {
@@ -215,13 +226,14 @@ function buildConversationRuntime(
   session: CodingSession,
   options: CliOptions,
   fileJournal: FileJournal,
+  userChannel: UserChannelPort | undefined,
 ): ExecutionRuntime {
   const source = new WorkspaceBoundary(session.sourceRoot);
   const versions = new WorkspaceVersionLedger();
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
-  const { journal, journalActivity } = instrumentJournal(fileJournal);
+  const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const kernel = new AgentKernel({
-    model: createModel(options),
+    model: createModel(options, createDeltaEmitter(markActivity)),
     tools: [
       new ListFilesTool(source),
       new SearchTextTool(source),
@@ -231,6 +243,7 @@ function buildConversationRuntime(
     verifiers: [],
     journal,
     taskAddendum: taskAddendum(options, mutationPolicy),
+    ...(userChannel === undefined ? {} : { userChannel }),
     options: {
       maxSteps: options.maxSteps,
       maxContextBytes: options.maxContextBytes,
@@ -246,6 +259,7 @@ async function buildExecutionRuntime(
   options: CliOptions,
   fileJournal: FileJournal,
   interactive: boolean,
+  userChannel?: UserChannelPort,
 ): Promise<ExecutionRuntime> {
   const container = path.dirname(session.workspaceRoot);
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
@@ -291,10 +305,10 @@ async function buildExecutionRuntime(
       editableRoots: options.editableRoots,
     }));
   }
-  const { journal, journalActivity } = instrumentJournal(fileJournal);
+  const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const kernel = new AgentKernel({
-    model: createModel(options),
+    model: createModel(options, interactive ? createDeltaEmitter(markActivity) : undefined),
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
@@ -312,6 +326,7 @@ async function buildExecutionRuntime(
     journal,
     workingState,
     taskAddendum: taskAddendum(options, mutationPolicy),
+    ...(userChannel === undefined ? {} : { userChannel }),
     options: {
       maxSteps: options.maxSteps,
       maxContextBytes: options.maxContextBytes,
@@ -333,9 +348,9 @@ function taskAddendum(options: CliOptions, mutationPolicy: WorkspaceMutationPoli
 async function runWithBudgets(
   options: CliOptions,
   journalActivity: () => number,
+  controller: AbortController,
   run: (signal: AbortSignal) => Promise<RunOutcome>,
 ): Promise<RunOutcome> {
-  const controller = new AbortController();
   const durationTimer = setTimeout(() => controller.abort(), options.maxDurationMs);
   const heartbeatTimer = setInterval(() => {
     const quietMs = Date.now() - journalActivity();
@@ -455,13 +470,112 @@ function emitSessionReady(
   });
 }
 
-function createModel(options: CliOptions) {
-  const common = { model: options.model, timeoutMs: 600_000, maxAttempts: 4 };
+function createModel(options: CliOptions, onTextDelta?: (text: string) => void) {
+  const common = {
+    model: options.model,
+    timeoutMs: 600_000,
+    maxAttempts: 4,
+    ...(onTextDelta === undefined ? {} : { onTextDelta }),
+  };
   if (options.provider === "openai") return createOpenAIModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "anthropic") return createAnthropicModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "deepseek") return createDeepSeekModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.endpoint === undefined) throw new Error("--endpoint is required for the http provider.");
   return new HttpModelAdapter({ endpoint: options.endpoint, timeoutMs: common.timeoutMs, maxAttempts: common.maxAttempts });
+}
+
+/**
+ * A live NDJSON control channel over stdin: {"type":"user_message","text":…}
+ * queues steering (or answers a pending question); {"type":"cancel"} aborts.
+ */
+class StdinUserChannel implements UserChannelPort {
+  readonly #queue: string[] = [];
+  readonly #waiters: ((message: string | undefined) => void)[] = [];
+  readonly #reader: ReturnType<typeof createInterface>;
+  #closed = false;
+
+  constructor(onCancel: () => void) {
+    const reader = createInterface({ input: process.stdin });
+    this.#reader = reader;
+    reader.on("line", (line) => {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) return;
+      try {
+        const parsed = JSON.parse(trimmed) as { type?: string; text?: string };
+        if (parsed.type === "user_message" && typeof parsed.text === "string" && parsed.text.length > 0) {
+          const waiter = this.#waiters.shift();
+          if (waiter !== undefined) waiter(parsed.text);
+          else this.#queue.push(parsed.text);
+        } else if (parsed.type === "cancel") {
+          onCancel();
+        }
+      } catch {
+        // Malformed control lines are ignored; the journal is unaffected.
+      }
+    });
+    reader.on("close", () => {
+      this.#closed = true;
+      for (const waiter of this.#waiters.splice(0)) waiter(undefined);
+    });
+  }
+
+  /** Releases stdin so the process can exit once the advance finishes. */
+  close(): void {
+    this.#closed = true;
+    this.#reader.close();
+    process.stdin.pause();
+    process.stdin.unref?.();
+    for (const waiter of this.#waiters.splice(0)) waiter(undefined);
+  }
+
+  drain(): readonly string[] {
+    return this.#queue.splice(0);
+  }
+
+  wait(signal: AbortSignal): Promise<string | undefined> {
+    const queued = this.#queue.shift();
+    if (queued !== undefined) return Promise.resolve(queued);
+    if (this.#closed || signal.aborted) return Promise.resolve(undefined);
+    return new Promise((resolve) => {
+      const waiter = (message: string | undefined): void => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(message);
+      };
+      const onAbort = (): void => {
+        const index = this.#waiters.indexOf(waiter);
+        if (index >= 0) this.#waiters.splice(index, 1);
+        resolve(undefined);
+      };
+      this.#waiters.push(waiter);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+}
+
+/** Coalesces streamed text into bounded agent.delta public events. */
+function createDeltaEmitter(markActivity: () => void): (text: string) => void {
+  let buffer = "";
+  let timer: NodeJS.Timeout | undefined;
+  const flush = (): void => {
+    timer = undefined;
+    if (buffer.length === 0) return;
+    const text = buffer;
+    buffer = "";
+    streamPublicEvent({ type: "agent.delta", agentId: "main", status: "info", title: "Agent", message: text });
+  };
+  return (text: string): void => {
+    markActivity();
+    buffer += text;
+    if (buffer.length >= 400) {
+      if (timer !== undefined) clearTimeout(timer);
+      flush();
+      return;
+    }
+    if (timer === undefined) {
+      timer = setTimeout(flush, 150);
+      timer.unref();
+    }
+  };
 }
 
 function parseArgumentMap(args: readonly string[]): Map<string, string[]> {
@@ -617,14 +731,19 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
   return all?.[0];
 }
 
-function instrumentJournal(fileJournal: FileJournal): { journal: JournalPort; journalActivity: () => number } {
+function instrumentJournal(fileJournal: FileJournal): {
+  journal: JournalPort;
+  journalActivity: () => number;
+  markActivity: () => void;
+} {
   let lastProgressAt = Date.now();
   let modelTurns = 0;
   const presenter = new PublicRunEventPresenter();
+  const markActivity = (): void => { lastProgressAt = Date.now(); };
   const journal: JournalPort = {
     async append(event: RunEvent): Promise<void> {
       await fileJournal.append(event);
-      lastProgressAt = Date.now();
+      markActivity();
       for (const publicEvent of presenter.present(event)) streamPublicEvent(publicEvent);
       if (event.type === "model.decided") {
         modelTurns += 1;
@@ -646,7 +765,7 @@ function instrumentJournal(fileJournal: FileJournal): { journal: JournalPort; jo
       }
     },
   };
-  return { journal, journalActivity: () => lastProgressAt };
+  return { journal, journalActivity: () => lastProgressAt, markActivity };
 }
 
 function streamPublicEvent(event: Parameters<typeof encodePublicRunEvent>[0]): void {

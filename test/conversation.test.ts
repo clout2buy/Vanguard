@@ -262,6 +262,58 @@ test("narration strikes persist across an interruption and resume", async () => 
   assert.equal(steeredOutcome.status, "completed", "a new user message resets the narration allowance");
 });
 
+test("steering messages arriving mid-run land at the next decision boundary", async () => {
+  const queue = ["Prioritize the parser fix over refactoring."];
+  const channel = {
+    drain: () => queue.splice(0),
+    wait: async () => undefined,
+  };
+  const journal = new MemoryJournal();
+  const model = new CapturingModel([{ kind: "complete", answer: "done" }]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [],
+    verifiers: [{ name: "tests", async verify() { return { verifier: "tests", passed: true, evidence: "ok" }; } }],
+    journal,
+    userChannel: channel,
+    options: { interactive: true },
+  });
+  const outcome = await kernel.run("fix the project");
+  assert.equal(outcome.status, "completed");
+  assert.equal(journal.events.some((event) => event.type === "user.message"
+    && JSON.stringify(event.data).includes("Prioritize the parser fix")), true, "steering must be journaled");
+  assert.equal(model.requests[0]?.transcript.some((entry) => entry.role === "user"
+    && JSON.stringify(entry.content).includes("Prioritize the parser fix")), true, "steering must reach the model");
+});
+
+test("an execution question with a live channel is answered in-process without pausing", async () => {
+  const answers = ["Use JSON output."];
+  const channel = {
+    drain: () => [],
+    wait: async () => answers.shift(),
+  };
+  const journal = new MemoryJournal();
+  const model = new CapturingModel([
+    { kind: "ask_user", question: "JSON or plain text output?" },
+    { kind: "complete", answer: "built with JSON output" },
+  ]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [],
+    verifiers: [{ name: "tests", async verify() { return { verifier: "tests", passed: true, evidence: "ok" }; } }],
+    journal,
+    userChannel: channel,
+    options: { interactive: true },
+  });
+  const outcome = await kernel.run("build the CLI");
+  assert.equal(outcome.status, "completed", "the run must survive its own question");
+  assert.equal(journal.events.some((event) => event.type === "run.waiting_for_user"), true);
+  assert.equal(journal.events.some((event) => event.type === "user.message"
+    && JSON.stringify(event.data).includes("Use JSON output.")), true);
+  assert.equal(model.requests[1]?.transcript.some((entry) => entry.role === "user"
+    && JSON.stringify(entry.content).includes("Use JSON output.")), true);
+});
+
 test("a conversation turn that never yields to the user fails its step budget honestly", async () => {
   const decisions: ModelDecision[] = Array.from({ length: 20 }, (_value, index) => ({
     kind: "tools" as const,

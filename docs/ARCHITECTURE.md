@@ -40,6 +40,8 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Completion claimed only through the explicit task.complete control tool; task.execute contracts gate all mutation/execution tools; a blank workspace is never scaffolded without an actionable contract
 - Durable ask/answer pauses (run.waiting_for_user + journaled user messages) that survive interruption and resume
 - Batched tool decisions: independent read-only calls execute concurrently, mutating calls stay strictly serialized, observations journal in call order with call attribution
+- Live mid-run steering: an NDJSON stdin control channel queues journaled user messages that land at decision boundaries, and an execution-mode question waits for its answer in-process instead of tearing the run down
+- Provider SSE streaming that rebuilds each canonical response from deltas — user-visible text streams to the terminal while reasoning and thinking stay private and are preserved only for continuation replay
 - Conversation runs read-only against the original project; the disposable workspace copy materializes only when a contract is accepted
 - Deterministic agent kernel with bounded steps and repeated-failure circuit breaking
 - Explicit model/tool/verifier contracts and evidence-focused context budgeting

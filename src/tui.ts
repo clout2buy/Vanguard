@@ -64,6 +64,10 @@ interface UiState {
   contracted: boolean;
   screenActive: boolean;
   conversationMessages: string[];
+  /** The live steering composer shown while execution runs. */
+  composer: string;
+  /** Model text streaming in before the decision lands. */
+  liveDelta: string;
 }
 
 interface TurnOutcome {
@@ -165,17 +169,46 @@ async function runTurn(
     contracted: alreadyContracted,
     screenActive: false,
     conversationMessages: [],
+    composer: "",
+    liveDelta: "",
   };
 
   const child = startAgent(message, config, credentialName, credential, sessionRoot);
   let cancelled = false;
-  const onKeypress = (_text: string, key: { name?: string; ctrl?: boolean }): void => {
+  const sendSteering = (): void => {
+    const text = state.composer.trim();
+    state.composer = "";
+    if (text.length === 0) return;
+    child.stdin.write(`${JSON.stringify({ type: "user_message", text })}\n`);
+    state.chat.push({ agentId: "you", message: text });
+    trimTo(state.chat, 30);
+    state.quietDetail = "Steering delivered; it lands at the next decision boundary";
+  };
+  const onKeypress = (text: string | undefined, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
     if (key.ctrl === true && key.name === "c") {
       if (state.phase === "completed" || state.phase === "failed" || state.phase === "cancelled") return;
       cancelled = true;
       state.phase = "cancelling";
       state.quietDetail = "Stopping after the current process boundary";
+      child.stdin.write(`${JSON.stringify({ type: "cancel" })}\n`);
       child.kill("SIGTERM");
+      return;
+    }
+    if (key.ctrl === true || key.meta === true) return;
+    if (key.name === "return" || key.name === "enter") {
+      sendSteering();
+      return;
+    }
+    if (key.name === "backspace") {
+      state.composer = state.composer.slice(0, -1);
+      return;
+    }
+    if (key.name === "escape") {
+      state.composer = "";
+      return;
+    }
+    if (typeof text === "string" && text.length === 1 && text.charCodeAt(0) >= 32) {
+      if (state.composer.length < 500) state.composer += text;
     }
   };
   const onSigint = (): void => {
@@ -309,7 +342,7 @@ function startAgent(
   return spawn(process.execPath, args, {
     cwd: repositoryRoot(),
     windowsHide: true,
-    env: { ...process.env, [credentialName]: credential, VANGUARD_EVENT_STREAM: "1", FORCE_COLOR: "0" },
+    env: { ...process.env, [credentialName]: credential, VANGUARD_EVENT_STREAM: "1", VANGUARD_CONTROL_STREAM: "1", FORCE_COLOR: "0" },
     stdio: ["pipe", "pipe", "pipe"],
   });
 }
@@ -388,7 +421,12 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     enterExecutionScreen();
     state.quietDetail = "Task contract accepted; isolated workspace prepared";
   }
+  if (event.type === "agent.delta" && event.message !== undefined) {
+    state.liveDelta = `${state.liveDelta}${event.message}`.slice(-600);
+    return;
+  }
   if (event.type === "agent.message" && event.message !== undefined) {
+    state.liveDelta = "";
     state.chat.push({ agentId: event.agentId, message: event.message, ...(event.turn === undefined ? {} : { turn: event.turn }) });
     trimTo(state.chat, 30);
     if (!state.screenActive && !state.contracted) {
@@ -398,6 +436,7 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     }
   }
   if (event.type === "tool.started") {
+    state.liveDelta = "";
     agent.action = event.title;
     agent.status = "active";
     state.quietDetail = event.detail === undefined ? `Running ${event.title}` : `${event.title} · ${event.detail}`;
@@ -417,7 +456,11 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     agent.status = "failed";
   } else if (event.type === "run.waiting_for_user") {
     agent.status = "idle";
-    state.quietDetail = "Vanguard asked you a question";
+    state.quietDetail = "Vanguard asked you a question — type your answer and press Enter";
+    if (event.message !== undefined) {
+      state.chat.push({ agentId: event.agentId, message: event.message });
+      trimTo(state.chat, 30);
+    }
   }
   if (event.type !== "agent.message" && event.type !== "session.ready" && event.type !== "context.compacted"
     && event.type !== "run.contracted" && event.type !== "run.waiting_for_user") {
@@ -474,7 +517,10 @@ function renderFrame(state: UiState, config: TuiConfig, width: number, height: n
   const available = Math.max(8, height - fixedLines);
   const chatRows = Math.max(3, Math.floor(available * 0.5));
   const activityRows = Math.max(3, available - chatRows);
-  const chatLines = recentChatLines(state.chat, inner, chatRows);
+  const chatItems = state.liveDelta.length === 0
+    ? state.chat
+    : [...state.chat, { agentId: "main", message: `${state.liveDelta} ▍` }];
+  const chatLines = recentChatLines(chatItems, inner, chatRows);
   if (chatLines.length === 0) lines.push(padAnsi(` ${ansi.dim}Vanguard is reading the project…${ansi.reset}`, width));
   else for (const line of chatLines) lines.push(padAnsi(` ${line}`, width));
   while (lines.length < 4 + agents.length + chatRows) lines.push(" ".repeat(width));
@@ -490,11 +536,15 @@ function renderFrame(state: UiState, config: TuiConfig, width: number, height: n
     lines.push(padAnsi(` ${ansi.slate}${branch}${ansi.reset} ${icon} ${item.title}${detail}`, width));
   }
 
-  while (lines.length < height - 3) lines.push(" ".repeat(width));
+  while (lines.length < height - 4) lines.push(" ".repeat(width));
   lines.push(`${ansi.slate}${"─".repeat(width)}${ansi.reset}`);
   const verifierSummary = state.verifiers.size === 0 ? "verification waiting" : [...state.verifiers.entries()].map(([name, pass]) => `${pass ? "✓" : "×"} ${name}`).join(" · ");
   lines.push(padAnsi(` ${ansi.dim}${bounded(state.quietDetail, Math.max(16, inner - verifierSummary.length - 3))}${ansi.reset}  ${verifierSummary}`, width));
-  lines.push(padAnsi(` ${ansi.dim}Ctrl+C to stop  ·  isolated copy  ·  durable recovery${ansi.reset}`, width));
+  const composerBody = state.composer.length === 0
+    ? `${ansi.dim}steer or answer, then press Enter${ansi.reset}`
+    : `${bounded(state.composer, Math.max(16, inner - 4)).slice(-Math.max(16, inner - 4))}${ansi.cyan}▌${ansi.reset}`;
+  lines.push(padAnsi(` ${ansi.violet}❯${ansi.reset} ${composerBody}`, width));
+  lines.push(padAnsi(` ${ansi.dim}Enter to steer  ·  Ctrl+C to stop  ·  isolated copy  ·  durable recovery${ansi.reset}`, width));
   return lines.slice(0, height).join("\n");
 }
 
@@ -521,6 +571,8 @@ export function renderTuiPreviewForTest(width = 100, height = 34): string {
     contracted: true,
     screenActive: true,
     conversationMessages: [],
+    composer: "",
+    liveDelta: "",
   };
   const config: TuiConfig = {
     workspace: "C:\\projects\\preview",

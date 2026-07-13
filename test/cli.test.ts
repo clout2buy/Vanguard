@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -201,6 +201,83 @@ test("compiled CLI advance flows from conversation to contracted execution", asy
     const journal = await readFile(scorecard.journalFile, "utf8");
     assert.match(journal, /"type":"run.contracted"/);
     assert.match(journal, /Make answer\(\) return 42/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(source, { recursive: true, force: true });
+    if (sessionRoot !== undefined) await rm(sessionRoot, { recursive: true, force: true });
+  }
+});
+
+test("compiled CLI answers a mid-execution question over the stdin control channel", async () => {
+  const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-steer-source-"));
+  await writeFile(path.join(source, "check.mjs"), "console.log('ok');\n");
+
+  const ANSWER = "Proceed with the defaults.";
+  const server = createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk: string) => { body += chunk; });
+    request.on("end", () => {
+      const payload = JSON.parse(body) as { mode: string; transcript: Array<{ role: string; content: unknown }> };
+      const answered = JSON.stringify(payload.transcript).includes(ANSWER);
+      const decision = payload.mode === "conversation"
+        ? {
+            kind: "execute",
+            contract: { objective: "Run the project checks after confirming settings.", successCriteria: ["check.mjs exits 0"] },
+          }
+        : answered
+          ? { kind: "complete", answer: `Confirmed (“${ANSWER}”) and checks pass.` }
+          : { kind: "ask_user", question: "Any special settings before I run the checks?" };
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify(decision));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+  let sessionRoot: string | undefined;
+  try {
+    const address = server.address();
+    if (address === null || typeof address === "string") throw new Error("Mock server failed to bind.");
+    const cli = path.resolve("dist", "src", "cli.js");
+    const child = spawn(process.execPath, [
+      cli, "advance",
+      "--workspace", source,
+      "--message", "Run the checks for me.",
+      "--provider", "http",
+      "--model", "mock",
+      "--endpoint", `http://127.0.0.1:${address.port}`,
+      "--verify-command", "node",
+      "--verify-arg", "check.mjs",
+      "--max-steps", "20",
+    ], {
+      env: { ...process.env, VANGUARD_EVENT_STREAM: "1", VANGUARD_CONTROL_STREAM: "1" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let answeredOnce = false;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+      if (!answeredOnce && stderr.includes('"type":"run.waiting_for_user"')) {
+        answeredOnce = true;
+        child.stdin.write(`${JSON.stringify({ type: "user_message", text: ANSWER })}\n`);
+      }
+    });
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", resolve);
+    });
+    assert.equal(answeredOnce, true, "the run must have asked over the event stream");
+    assert.equal(exitCode, 0, `advance exited ${exitCode}: ${stderr.slice(-500)}`);
+    const scorecard = JSON.parse(stdout) as { outcome: { status: string }; workspaceRoot: string; journalFile: string };
+    sessionRoot = path.dirname(scorecard.workspaceRoot);
+    assert.equal(scorecard.outcome.status, "completed");
+    const journal = await readFile(scorecard.journalFile, "utf8");
+    assert.match(journal, /"type":"run.waiting_for_user"/);
+    assert.match(journal, new RegExp(`"type":"user.message".*${ANSWER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(source, { recursive: true, force: true });

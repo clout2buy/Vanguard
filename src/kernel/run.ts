@@ -12,6 +12,7 @@ import type {
   ToolObservation,
   ToolPort,
   TranscriptEntry,
+  UserChannelPort,
   VerifierPort,
   VerificationResult,
   WorkingStatePort,
@@ -82,6 +83,8 @@ export interface KernelDependencies {
   readonly workingState?: WorkingStatePort;
   /** Runtime-owned policy text appended to the task when a contract is accepted. */
   readonly taskAddendum?: string;
+  /** Live user-message channel enabling mid-run steering and in-process answers. */
+  readonly userChannel?: UserChannelPort;
   readonly options?: Partial<RunOptions>;
 }
 
@@ -142,6 +145,7 @@ export class AgentKernel {
   readonly #workingState: WorkingStatePort | undefined;
   readonly #hasReviewTool: boolean;
   readonly #taskAddendum: string | undefined;
+  readonly #userChannel: UserChannelPort | undefined;
   readonly #options: RunOptions;
   #sequence = 0;
 
@@ -153,6 +157,7 @@ export class AgentKernel {
     this.#contextPolicy = dependencies.contextPolicy ?? new EvidenceContextPolicy();
     this.#workingState = dependencies.workingState;
     this.#taskAddendum = dependencies.taskAddendum;
+    this.#userChannel = dependencies.userChannel;
     this.#hasReviewTool = dependencies.tools.some((tool) => tool.definition.effect === "review");
     this.#options = { ...DEFAULT_OPTIONS, ...dependencies.options };
 
@@ -258,6 +263,14 @@ export class AgentKernel {
       if (signal.aborted) {
         return this.#fail("Run aborted.", step - 1);
       }
+
+      // Steering messages land at decision boundaries: journaled first, so
+      // they survive interruption, and never spliced into a tool call.
+      for (const steering of this.#userChannel?.drain() ?? []) {
+        await this.#record("user.message", { text: steering });
+        transcript.push({ role: "user", content: steering });
+        consecutiveNarrations = 0;
+      }
       if (mode === "conversation" && step - turnStartStep > this.#options.maxConversationTurnSteps) {
         return this.#fail("Conversation step budget exhausted before the model yielded to the user.", step - 1);
       }
@@ -327,6 +340,17 @@ export class AgentKernel {
           continue;
         }
         await this.#record("run.waiting_for_user", { question: decision.question, mode });
+        if (mode === "execution" && this.#userChannel !== undefined) {
+          // A live channel lets the run survive its own question: wait for
+          // the answer in-process instead of tearing down and respawning.
+          const answer = await this.#userChannel.wait(signal);
+          if (answer !== undefined) {
+            await this.#record("user.message", { text: answer });
+            transcript.push({ role: "user", content: answer });
+            continue;
+          }
+          if (signal.aborted) return this.#fail("Run aborted.", step);
+        }
         return { status: "waiting_for_user", question: decision.question, steps: step };
       }
 

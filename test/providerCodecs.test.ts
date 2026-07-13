@@ -4,6 +4,7 @@ import type { SerializableModelRequest, TranscriptEntry } from "../src/index.js"
 import {
   AnthropicMessagesCodec,
   EvidenceContextPolicy,
+  HttpModelAdapter,
   OpenAIChatCompletionsCodec,
   OpenAIResponsesCodec,
 } from "../src/index.js";
@@ -241,6 +242,108 @@ test("DeepSeek-compatible chat codec preserves reasoning content and parallel to
   assert.match(serialized, /deep-call/);
   assert.match(serialized, /second-parallel-call/);
   assert.equal((serialized.match(/"role":"tool"/g) ?? []).length, 2, "each parallel call needs its own result");
+});
+
+test("chat completions stream accumulator rebuilds parallel calls and streams only visible text", () => {
+  const codec = new OpenAIChatCompletionsCodec("deepseek-v4-pro");
+  const deltas: string[] = [];
+  const accumulator = codec.createStreamAccumulator((text) => deltas.push(text));
+  accumulator.feed('{"choices":[{"delta":{"role":"assistant","reasoning_content":"PRIVATE_REASONING"}}]}');
+  accumulator.feed('{"choices":[{"delta":{"content":"Check"}}]}');
+  accumulator.feed('{"choices":[{"delta":{"content":"ing the parser."}}]}');
+  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"workspace_read","arguments":"{\\"pa"}}]}}]}');
+  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\\":\\"a.ts\\"}"}}]}}]}');
+  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"workspace_read","arguments":"{\\"path\\":\\"b.ts\\"}"}}]}}]}');
+  accumulator.feed('{"choices":[{"finish_reason":"tool_calls","delta":{}}]}');
+  assert.equal(deltas.join(""), "Checking the parser.");
+  assert.doesNotMatch(JSON.stringify(deltas), /PRIVATE_REASONING/, "reasoning must never stream");
+  const rebuilt = accumulator.finish();
+  assert.match(JSON.stringify(rebuilt), /PRIVATE_REASONING/, "reasoning must be preserved for replay");
+  const decision = codec.decode(rebuilt);
+  assert.equal(decision.kind, "tools");
+  assert.deepEqual(decision.kind === "tools" ? decision.calls.map((call) => call.input) : [], [
+    { path: "a.ts" },
+    { path: "b.ts" },
+  ]);
+});
+
+test("anthropic stream accumulator rebuilds tool input and keeps thinking private", () => {
+  const codec = new AnthropicMessagesCodec("test-model");
+  const deltas: string[] = [];
+  const accumulator = codec.createStreamAccumulator((text) => deltas.push(text));
+  accumulator.feed('{"type":"message_start","message":{"role":"assistant"}}');
+  accumulator.feed('{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}');
+  accumulator.feed('{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"PRIVATE_THOUGHT"}}');
+  accumulator.feed('{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig123"}}');
+  accumulator.feed('{"type":"content_block_stop","index":0}');
+  accumulator.feed('{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}');
+  accumulator.feed('{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Reading "}}');
+  accumulator.feed('{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"the file."}}');
+  accumulator.feed('{"type":"content_block_stop","index":1}');
+  accumulator.feed('{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"workspace.read","input":{}}}');
+  accumulator.feed('{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}');
+  accumulator.feed('{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\\"a.ts\\"}"}}');
+  accumulator.feed('{"type":"content_block_stop","index":2}');
+  accumulator.feed('{"type":"message_delta","delta":{"stop_reason":"tool_use"}}');
+  accumulator.feed('{"type":"message_stop"}');
+  assert.equal(deltas.join(""), "Reading the file.");
+  assert.doesNotMatch(JSON.stringify(deltas), /PRIVATE_THOUGHT/);
+  const rebuilt = accumulator.finish();
+  assert.match(JSON.stringify(rebuilt), /PRIVATE_THOUGHT/, "thinking must be preserved for replay");
+  assert.match(JSON.stringify(rebuilt), /sig123/);
+  const decision = codec.decode(rebuilt);
+  assert.equal(decision.kind, "tools");
+  assert.deepEqual(decision.kind === "tools" ? decision.calls[0]?.input : undefined, { path: "a.ts" });
+});
+
+test("responses stream accumulator surfaces deltas and decodes the terminal response", () => {
+  const codec = new OpenAIResponsesCodec("test-model");
+  const deltas: string[] = [];
+  const accumulator = codec.createStreamAccumulator((text) => deltas.push(text));
+  accumulator.feed('{"type":"response.output_text.delta","delta":"Hel"}');
+  accumulator.feed('{"type":"response.output_text.delta","delta":"lo."}');
+  accumulator.feed('{"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Hello."}]}]}}');
+  assert.equal(deltas.join(""), "Hello.");
+  const decision = codec.decode(accumulator.finish());
+  assert.equal(decision.kind, "respond");
+  assert.equal(decision.kind === "respond" ? decision.message : "", "Hello.");
+});
+
+test("the http adapter consumes SSE end to end when the codec streams", async () => {
+  const sse = [
+    'data: {"choices":[{"delta":{"role":"assistant","content":"Wor"}}]}',
+    "",
+    'data: {"choices":[{"delta":{"content":"king."}}]}',
+    "",
+    'data: {"choices":[{"finish_reason":"stop","delta":{}}]}',
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+  const deltas: string[] = [];
+  let requestedBody = "";
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/stream",
+    codec: new OpenAIChatCompletionsCodec("deepseek-v4-pro"),
+    onTextDelta: (text) => deltas.push(text),
+    fetchImplementation: (async (_url: unknown, init?: { body?: unknown }) => {
+      requestedBody = String(init?.body ?? "");
+      return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
+    }) as typeof fetch,
+  });
+  const decision = await adapter.decide({
+    task: "t",
+    mode: "execution",
+    transcript: [],
+    tools: [],
+    remainingSteps: 1,
+    signal: new AbortController().signal,
+    workingState: null,
+  });
+  assert.match(requestedBody, /"stream":true/);
+  assert.equal(deltas.join(""), "Working.");
+  assert.equal(decision.kind, "respond");
+  assert.equal(decision.kind === "respond" ? decision.message : "", "Working.");
 });
 
 test("DeepSeek reasoning survives historical tool-payload compaction", () => {

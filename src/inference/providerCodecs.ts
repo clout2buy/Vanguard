@@ -13,6 +13,7 @@ import {
   type HeaderProvider,
   type ModelWireCodec,
   type SerializableModelRequest,
+  type StreamAccumulator,
 } from "./httpModel.js";
 
 const EXECUTION_PROMPT = `You are Vanguard, an expert autonomous coding agent. Own the requested outcome end to end and work from observable repository evidence.
@@ -46,6 +47,8 @@ export interface ProviderModelOptions {
   readonly endpoint?: string;
   readonly timeoutMs?: number;
   readonly maxAttempts?: number;
+  /** Receives user-visible response text as it streams. */
+  readonly onTextDelta?: (text: string) => void;
 }
 
 export function createOpenAIModel(options: ProviderModelOptions): HttpModelAdapter {
@@ -55,6 +58,7 @@ export function createOpenAIModel(options: ProviderModelOptions): HttpModelAdapt
     headerProvider: new EnvironmentBearerHeaders("OPENAI_API_KEY"),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
+    ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
   });
 }
 
@@ -65,6 +69,7 @@ export function createAnthropicModel(options: ProviderModelOptions): HttpModelAd
     headerProvider: new AnthropicHeaders(),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
+    ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
   });
 }
 
@@ -75,6 +80,7 @@ export function createDeepSeekModel(options: ProviderModelOptions): HttpModelAda
     headerProvider: new EnvironmentBearerHeaders("DEEPSEEK_API_KEY"),
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxAttempts === undefined ? {} : { maxAttempts: options.maxAttempts }),
+    ...(options.onTextDelta === undefined ? {} : { onTextDelta: options.onTextDelta }),
   });
 }
 
@@ -347,6 +353,14 @@ export class OpenAIResponsesCodec implements ModelWireCodec {
     };
   }
 
+  encodeStreaming(request: SerializableModelRequest): JsonValue {
+    return { ...object(this.encode(request), "OpenAI request"), stream: true };
+  }
+
+  createStreamAccumulator(onTextDelta?: (text: string) => void): StreamAccumulator {
+    return new OpenAIResponsesStreamAccumulator(onTextDelta);
+  }
+
   decode(response: JsonValue): ModelDecision {
     const record = object(response, "OpenAI response");
     const output = array(record.output, "OpenAI response.output");
@@ -443,6 +457,14 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
     };
   }
 
+  encodeStreaming(request: SerializableModelRequest): JsonValue {
+    return { ...object(this.encode(request), "Anthropic request"), stream: true };
+  }
+
+  createStreamAccumulator(onTextDelta?: (text: string) => void): StreamAccumulator {
+    return new AnthropicStreamAccumulator(onTextDelta);
+  }
+
   decode(response: JsonValue): ModelDecision {
     const record = object(response, "Anthropic response");
     const content = array(record.content, "Anthropic response.content");
@@ -521,6 +543,14 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
     };
   }
 
+  encodeStreaming(request: SerializableModelRequest): JsonValue {
+    return { ...object(this.encode(request), "Chat Completions request"), stream: true };
+  }
+
+  createStreamAccumulator(onTextDelta?: (text: string) => void): StreamAccumulator {
+    return new ChatCompletionsStreamAccumulator(onTextDelta);
+  }
+
   decode(response: JsonValue): ModelDecision {
     const record = object(response, "Chat Completions response");
     const choice = optionalObject(array(record.choices, "Chat Completions response.choices")[0]);
@@ -551,6 +581,154 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
       return { kind: "respond", message: message.content, continuation: message };
     }
     throw new Error(`Chat Completions response stopped without actionable content (${String(choice?.finish_reason)}).`);
+  }
+}
+
+/**
+ * Rebuilds a Chat Completions response from streamed deltas. Visible
+ * `content` reaches onTextDelta; `reasoning_content` is preserved for
+ * continuation replay but never streamed to the caller.
+ */
+class ChatCompletionsStreamAccumulator implements StreamAccumulator {
+  #role = "assistant";
+  #content: string | null = null;
+  #reasoningContent: string | undefined;
+  #finishReason: string | null = null;
+  readonly #toolCalls = new Map<number, { id: string; type: string; name: string; arguments: string }>();
+
+  constructor(private readonly onTextDelta?: (text: string) => void) {}
+
+  feed(data: string): void {
+    const parsed = JSON.parse(data) as Record<string, JsonValue>;
+    const choice = optionalObject(Array.isArray(parsed.choices) ? parsed.choices[0] : undefined);
+    if (choice === undefined) return;
+    if (typeof choice.finish_reason === "string") this.#finishReason = choice.finish_reason;
+    const delta = optionalObject(choice.delta);
+    if (delta === undefined) return;
+    if (typeof delta.role === "string") this.#role = delta.role;
+    if (typeof delta.content === "string" && delta.content.length > 0) {
+      this.#content = (this.#content ?? "") + delta.content;
+      this.onTextDelta?.(delta.content);
+    }
+    if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
+      this.#reasoningContent = (this.#reasoningContent ?? "") + delta.reasoning_content;
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const value of delta.tool_calls) {
+        const item = optionalObject(value);
+        if (item === undefined || typeof item.index !== "number") continue;
+        const existing = this.#toolCalls.get(item.index) ?? { id: "", type: "function", name: "", arguments: "" };
+        if (typeof item.id === "string" && item.id.length > 0) existing.id = item.id;
+        if (typeof item.type === "string") existing.type = item.type;
+        const fn = optionalObject(item.function);
+        if (typeof fn?.name === "string" && fn.name.length > 0) existing.name = fn.name;
+        if (typeof fn?.arguments === "string") existing.arguments += fn.arguments;
+        this.#toolCalls.set(item.index, existing);
+      }
+    }
+  }
+
+  finish(): JsonValue {
+    const toolCalls = [...this.#toolCalls.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, call]) => ({ id: call.id, type: call.type, function: { name: call.name, arguments: call.arguments } }));
+    return {
+      choices: [{
+        finish_reason: this.#finishReason,
+        message: {
+          role: this.#role,
+          content: this.#content,
+          ...(this.#reasoningContent === undefined ? {} : { reasoning_content: this.#reasoningContent }),
+          ...(toolCalls.length === 0 ? {} : { tool_calls: toolCalls }),
+        },
+      }],
+    };
+  }
+}
+
+/**
+ * Rebuilds an Anthropic Messages response from streamed events. Text deltas
+ * reach onTextDelta; thinking and signature deltas are preserved verbatim
+ * for continuation replay and never streamed to the caller.
+ */
+class AnthropicStreamAccumulator implements StreamAccumulator {
+  readonly #blocks = new Map<number, Record<string, JsonValue>>();
+  readonly #partialJson = new Map<number, string>();
+  #stopReason: JsonValue = null;
+
+  constructor(private readonly onTextDelta?: (text: string) => void) {}
+
+  feed(data: string): void {
+    const parsed = JSON.parse(data) as Record<string, JsonValue>;
+    if (parsed.type === "content_block_start" && typeof parsed.index === "number") {
+      const block = optionalObject(parsed.content_block);
+      if (block !== undefined) this.#blocks.set(parsed.index, { ...block });
+      return;
+    }
+    if (parsed.type === "content_block_delta" && typeof parsed.index === "number") {
+      const block = this.#blocks.get(parsed.index);
+      const delta = optionalObject(parsed.delta);
+      if (block === undefined || delta === undefined) return;
+      if (delta.type === "text_delta" && typeof delta.text === "string") {
+        block.text = `${typeof block.text === "string" ? block.text : ""}${delta.text}`;
+        this.onTextDelta?.(delta.text);
+      } else if (delta.type === "input_json_delta" && typeof delta.partial_json === "string") {
+        this.#partialJson.set(parsed.index, (this.#partialJson.get(parsed.index) ?? "") + delta.partial_json);
+      } else if (delta.type === "thinking_delta" && typeof delta.thinking === "string") {
+        block.thinking = `${typeof block.thinking === "string" ? block.thinking : ""}${delta.thinking}`;
+      } else if (delta.type === "signature_delta" && typeof delta.signature === "string") {
+        block.signature = `${typeof block.signature === "string" ? block.signature : ""}${delta.signature}`;
+      }
+      return;
+    }
+    if (parsed.type === "content_block_stop" && typeof parsed.index === "number") {
+      const block = this.#blocks.get(parsed.index);
+      const partial = this.#partialJson.get(parsed.index);
+      if (block !== undefined && partial !== undefined) {
+        block.input = parseJsonValue(partial.length === 0 ? "{}" : partial, "Anthropic streamed tool input");
+      }
+      return;
+    }
+    if (parsed.type === "message_delta") {
+      const delta = optionalObject(parsed.delta);
+      if (delta?.stop_reason !== undefined) this.#stopReason = delta.stop_reason;
+    }
+  }
+
+  finish(): JsonValue {
+    const content = [...this.#blocks.entries()]
+      .sort(([left], [right]) => left - right)
+      .map(([, block]) => block);
+    return { content, stop_reason: this.#stopReason };
+  }
+}
+
+/**
+ * The Responses API streams a complete response object in its terminal
+ * event; deltas are surfaced along the way.
+ */
+class OpenAIResponsesStreamAccumulator implements StreamAccumulator {
+  #completed: JsonValue | undefined;
+
+  constructor(private readonly onTextDelta?: (text: string) => void) {}
+
+  feed(data: string): void {
+    const parsed = JSON.parse(data) as Record<string, JsonValue>;
+    if (parsed.type === "response.output_text.delta" && typeof parsed.delta === "string") {
+      this.onTextDelta?.(parsed.delta);
+      return;
+    }
+    if ((parsed.type === "response.completed" || parsed.type === "response.incomplete" || parsed.type === "response.failed")
+      && parsed.response !== undefined) {
+      this.#completed = parsed.response;
+    }
+  }
+
+  finish(): JsonValue {
+    if (this.#completed === undefined) {
+      throw new Error("OpenAI response stream ended without a terminal response event.");
+    }
+    return this.#completed;
   }
 }
 
