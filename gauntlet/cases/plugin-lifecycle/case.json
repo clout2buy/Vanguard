@@ -1,11 +1,11 @@
 {
   "id": "plugin-lifecycle",
-  "version": 3,
+  "version": 4,
   "track": "multi-file",
   "workspace": "workspace",
   "task": "TASK.md",
   "grader": "grader.mjs",
   "protected": ["package.json"],
-  "editableRoots": ["src"],
+  "editableRoots": ["src/registry.mjs"],
   "maxSteps": 140
 }

@@ -34,6 +34,7 @@ export function scoreExecutionQuality(
   if (patch.beforeLines >= 10 && patchExpansionRatio !== null && patchExpansionRatio > 4) {
     reviewFlags.push("large-patch-expansion");
   }
+  if (patch.beforeLines === 0 && patch.afterLines > 300) reviewFlags.push("large-new-code-surface");
   if (changedFiles > 0 && writes > changedFiles * 4) reviewFlags.push("high-edit-churn");
   if ((trajectory.toolCallsByName["process.run"] ?? 0) > 12) reviewFlags.push("high-test-fragmentation");
   return {

@@ -121,6 +121,44 @@ test("opens the circuit breaker on an identical repeated failure", async () => {
   });
 });
 
+test("a successful mutation resets repeated execution failure history", async () => {
+  let attempts = 0;
+  const execution: ToolPort = {
+    name: "test",
+    definition: { ...toolDefinition("test"), effect: "execute" },
+    async execute() {
+      attempts += 1;
+      return attempts === 1
+        ? { ok: false, output: "tests still fail" }
+        : { ok: true, output: "tests pass after mutation" };
+    },
+  };
+  const mutation: ToolPort = {
+    name: "write",
+    definition: { ...toolDefinition("write"), effect: "mutate" },
+    async execute() { return { ok: true, output: "workspace changed" }; },
+  };
+  const repeatedTest: ModelDecision = {
+    kind: "tool",
+    call: { id: "test", name: "test", input: { command: "npm test" } },
+  };
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      repeatedTest,
+      { kind: "tool", call: { id: "write", name: "write", input: {} } },
+      repeatedTest,
+      { kind: "complete", answer: "stop after proving the retry was accepted" },
+    ]),
+    tools: [execution, mutation],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { maxRepeatedAction: 2 },
+  });
+
+  const outcome = await kernel.run("repair between identical test commands");
+  assert.equal(outcome.status, "completed");
+});
+
 test("executes a successful tool action and completes", async () => {
   const tool: ToolPort = {
     name: "read",

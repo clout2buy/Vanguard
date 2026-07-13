@@ -22,6 +22,9 @@ export class ReviewChangesTool implements ToolPort {
     if (patch.beforeLines >= 10 && expansionRatio !== null && expansionRatio > 4) {
       reviewFlags.push("large-patch-expansion: re-read changed files and simplify duplication where possible");
     }
+    if (patch.beforeLines === 0 && patch.afterLines > 300) {
+      reviewFlags.push("large-new-code-surface: inspect added files for temporary harnesses and unnecessary code");
+    }
     if (patch.changedFiles.length === 0) reviewFlags.push("no-workspace-changes");
     return {
       ok: true,

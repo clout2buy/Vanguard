@@ -39,6 +39,13 @@ let invoked = false;
 await assert.rejects(() => mapConcurrent([1], 1, async () => { invoked = true; }, { signal: already.signal }), (error) => error?.name === "AbortError");
 assert.equal(invoked, false);
 
+const customReason = new AbortController(); customReason.abort("operator cancelled");
+await assert.rejects(
+  () => mapConcurrent([1], 1, async () => 1, { signal: customReason.signal }),
+  (error) => error?.name === "AbortError",
+  "custom abort reasons must still surface as an AbortError",
+);
+
 const controller = new AbortController();
 let abortSettled = 0;
 const pending = mapConcurrent([1, 2, 3], 2, async (_value, _index, signal) => {

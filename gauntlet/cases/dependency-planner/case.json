@@ -5,6 +5,6 @@
   "task": "TASK.md",
   "grader": "grader.mjs",
   "protected": ["package.json"],
-  "editableRoots": ["src"],
+  "editableRoots": ["src/planner.mjs"],
   "maxSteps": 90
 }

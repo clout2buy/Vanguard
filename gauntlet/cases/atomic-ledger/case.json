@@ -6,6 +6,6 @@
   "task": "TASK.md",
   "grader": "grader.mjs",
   "protected": ["package.json"],
-  "editableRoots": ["src"],
+  "editableRoots": ["src/ledger.mjs"],
   "maxSteps": 80
 }

@@ -189,6 +189,10 @@ export class AgentKernel {
         } else {
           actionFailures.delete(fingerprint);
           if (tool.definition.effect === "mutate") {
+            // A successful mutation changes the meaning of subsequent execution.
+            // The same test command after a code edit is a new diagnostic attempt,
+            // not a repeated invalid action from the prior workspace state.
+            actionFailures.clear();
             mutationNeedsExecutionEvidence = true;
             mutationNeedsReview = this.#hasReviewTool;
           }
