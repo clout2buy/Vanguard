@@ -350,6 +350,28 @@ superiority** — the evidence selects the language afterward.
   native installer or single-file executable is claimed. This phase does not
   certify parity or superiority against Claude Code, Codex, or OpenCode.
 
+### Phase 12 — Threat model + destructive security boundary
+
+- **Named posture:** `workspace` preserves normal coding compatibility;
+  `guarded` is fail-closed and forces restricted process mode, removes the raw
+  process tool, and exposes summary-only verifier evidence. Contradictory flags
+  are rejected rather than silently weakening the selected posture.
+- **Credential boundary:** every `ProcessTool` child now receives a sanitized
+  environment by default. Provider/API/token/password variables plus
+  interpreter preload controls such as `NODE_OPTIONS`, `PYTHONSTARTUP`, and
+  `RUBYOPT` are removed; explicitly non-secret build context remains available.
+  Public events retain an independent allowlist and redaction pass.
+- **Destructive proof:** tests exercise guarded-profile downgrade attempts,
+  real child-process credential/preload inspection, hostile credential-shaped
+  diagnostics, path/symlink boundaries, restricted Node permission widening,
+  extension/MCP malformed frames, durable-state tampering, and transactional
+  apply/restore failures across the inherited adversarial suites.
+- **Threat-model honesty:** `docs/THREAT_MODEL.md` distinguishes workspace tool
+  confinement from OS isolation. Fixed checks may execute candidate code as
+  the host user; unknown repositories and certification runs require an
+  external container/VM attestation. No cross-language sandbox or penetration
+  certificate is claimed from local tests.
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development

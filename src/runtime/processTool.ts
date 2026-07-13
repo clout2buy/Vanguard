@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, optionalStringField, stringArrayField, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
+import { sanitizedChildEnvironment } from "../engine/security.js";
 
 export interface ProcessToolOptions {
   readonly allowedCommands: readonly string[];
@@ -10,6 +11,8 @@ export interface ProcessToolOptions {
   readonly deniedArgumentSubstrings?: readonly string[];
   readonly timeoutMs?: number;
   readonly maxOutputBytes?: number;
+  /** Explicit child environment. Defaults to a credential/preload-sanitized copy. */
+  readonly environment?: NodeJS.ProcessEnv;
 }
 
 export class ProcessTool implements ToolPort {
@@ -35,6 +38,7 @@ export class ProcessTool implements ToolPort {
   readonly #commandAliases: ReadonlyMap<string, { readonly executable: string; readonly argsPrefix: readonly string[] }>;
   readonly #deniedArgumentPrefixes: readonly string[];
   readonly #deniedArgumentSubstrings: readonly string[];
+  readonly #environment: NodeJS.ProcessEnv;
 
   constructor(
     private readonly workspace: WorkspaceBoundary,
@@ -48,6 +52,7 @@ export class ProcessTool implements ToolPort {
     this.#deniedArgumentSubstrings = options.deniedArgumentSubstrings ?? [];
     this.#timeoutMs = options.timeoutMs ?? 120_000;
     this.#maxOutputBytes = options.maxOutputBytes ?? 1_000_000;
+    this.#environment = options.environment ?? sanitizedChildEnvironment();
   }
 
   async execute(input: JsonValue, context: ToolContext): Promise<ToolResult> {
@@ -86,6 +91,7 @@ export class ProcessTool implements ToolPort {
       this.#timeoutMs,
       this.#maxOutputBytes,
       context.signal,
+      this.#environment,
     );
   }
 }
@@ -97,9 +103,10 @@ async function runProcess(
   timeoutMs: number,
   maxOutputBytes: number,
   signal: AbortSignal,
+  environment: NodeJS.ProcessEnv,
 ): Promise<ToolResult> {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, shell: false, windowsHide: true });
+    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: environment });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let settled = false;

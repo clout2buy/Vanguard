@@ -68,6 +68,7 @@ try {
       "--verify-command", "node",
       "--verify-arg", $Grader,
       "--verify-arg", ".",
+      "--security-profile", "guarded",
       "--restrict-process", "true",
       "--verifier-evidence", "summary",
       "--max-duration-ms", $(if ($null -eq $Case.maxDurationMs) { "600000" } else { [string]$Case.maxDurationMs }),

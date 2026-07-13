@@ -2,6 +2,16 @@ import type { PublicRunEvent } from "../runtime/publicRunEvents.js";
 
 const SECRET_NAME = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|password|secret)/i;
 const SECRET_ASSIGNMENT = /(api[_-]?key|access[_-]?token|refresh[_-]?token|token|authorization|password|secret)(\s*[=:]\s*)([^\s,;]+)/gi;
+const DANGEROUS_CHILD_ENVIRONMENT = new Set([
+  "NODE_OPTIONS",
+  "NODE_PATH",
+  "BASH_ENV",
+  "ENV",
+  "PROMPT_COMMAND",
+  "PYTHONSTARTUP",
+  "RUBYOPT",
+  "PERL5OPT",
+]);
 
 /**
  * The protocol only accepts the deliberately small PublicRunEvent surface.
@@ -46,6 +56,24 @@ export function createSecretRedactor(environment: NodeJS.ProcessEnv = process.en
     for (const secret of secrets) redacted = redacted.replaceAll(secret, "[REDACTED]");
     return redacted;
   };
+}
+
+/**
+ * Produces the default environment for model-invoked and verifier child
+ * processes. Build-relevant non-secret values remain available, while common
+ * credential variables and interpreter preload/option injection are removed.
+ * A host that needs another value must pass it deliberately to ProcessTool.
+ */
+export function sanitizedChildEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const output: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(environment)) {
+    if (value === undefined) continue;
+    const normalized = name.toLocaleUpperCase();
+    if (SECRET_NAME.test(name) || DANGEROUS_CHILD_ENVIRONMENT.has(normalized)) continue;
+    output[name] = value;
+  }
+  output.VANGUARD_CHILD_PROCESS = "1";
+  return output;
 }
 
 function stripProviderDetail(text: string): string {

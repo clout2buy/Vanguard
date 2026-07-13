@@ -12,6 +12,7 @@ import { CliVanguardRunner } from "./cliRunner.js";
 import { sanitizePublicEvent } from "./security.js";
 import { extensionRuntimeState, resolveExtensions } from "../extensions/config.js";
 import type { JsonValue } from "../kernel/contracts.js";
+import { resolveSecurityPolicy, type SecurityProfile } from "../security/policy.js";
 import {
   VanguardEngineError,
   type VanguardEngineEvent,
@@ -54,6 +55,7 @@ interface StoredCliOptions {
   readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
   readonly editableRoots: readonly string[];
+  readonly securityProfile: SecurityProfile;
   readonly restrictProcess: boolean;
   readonly verifierEvidence: "full" | "summary";
   readonly publicCheck?: CommandSpec;
@@ -389,6 +391,12 @@ function storedOptions(
   verificationWasDetected: boolean,
   extensions: Awaited<ReturnType<typeof resolveExtensions>>,
 ): StoredCliOptions {
+  const security = resolveSecurityPolicy({
+    ...(config.securityProfile === undefined ? {} : { profile: config.securityProfile }),
+    ...(config.restrictProcess === undefined ? {} : { restrictProcess: config.restrictProcess }),
+    ...(config.exposeRawProcess === undefined ? {} : { exposeRawProcess: config.exposeRawProcess }),
+    ...(config.verifierEvidence === undefined ? {} : { verifierEvidence: config.verifierEvidence }),
+  });
   return {
     workspace: config.workspace,
     task: "",
@@ -400,9 +408,10 @@ function storedOptions(
     allowedCommands: [...(config.allowedCommands ?? [])],
     protectedPaths: [...(config.protectedPaths ?? [])],
     editableRoots: [...(config.editableRoots ?? [])],
-    restrictProcess: config.restrictProcess ?? false,
-    exposeRawProcess: config.exposeRawProcess ?? true,
-    verifierEvidence: config.verifierEvidence ?? "full",
+    securityProfile: security.profile,
+    restrictProcess: security.restrictProcess,
+    exposeRawProcess: security.exposeRawProcess,
+    verifierEvidence: security.verifierEvidence,
     ...(config.publicCheck !== undefined
       ? { publicCheck: config.publicCheck }
       : verificationWasDetected ? { publicCheck: verification } : {}),
@@ -437,6 +446,9 @@ function validateConfig(config: VanguardSessionConfig): void {
   if (config.endpoint !== undefined && typeof config.endpoint !== "string") {
     throw new VanguardEngineError("invalid_config", "endpoint must be a string.");
   }
+  if (config.securityProfile !== undefined && config.securityProfile !== "workspace" && config.securityProfile !== "guarded") {
+    throw new VanguardEngineError("invalid_config", "securityProfile must be 'workspace' or 'guarded'.");
+  }
   if (config.verification !== undefined) validateCommand(config.verification, "verification");
   if (config.publicCheck !== undefined) validateCommand(config.publicCheck, "publicCheck");
   for (const [field, value] of [
@@ -459,6 +471,16 @@ function validateConfig(config: VanguardSessionConfig): void {
   }
   if (config.verifierEvidence !== undefined && config.verifierEvidence !== "full" && config.verifierEvidence !== "summary") {
     throw new VanguardEngineError("invalid_config", "verifierEvidence must be 'full' or 'summary'.");
+  }
+  try {
+    resolveSecurityPolicy({
+      ...(config.securityProfile === undefined ? {} : { profile: config.securityProfile }),
+      ...(config.restrictProcess === undefined ? {} : { restrictProcess: config.restrictProcess }),
+      ...(config.exposeRawProcess === undefined ? {} : { exposeRawProcess: config.exposeRawProcess }),
+      ...(config.verifierEvidence === undefined ? {} : { verifierEvidence: config.verifierEvidence }),
+    });
+  } catch (error) {
+    throw new VanguardEngineError("invalid_config", error instanceof Error ? error.message : String(error));
   }
 }
 

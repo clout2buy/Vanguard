@@ -61,7 +61,9 @@ import {
   restoreSessionCheckpoint,
   forkSessionCheckpoint,
   encodePublicRunEvent,
+  resolveSecurityPolicy,
   type CodingSession,
+  type SecurityProfile,
   type StreamObserver,
 } from "./index.js";
 
@@ -81,6 +83,7 @@ interface CliOptions {
   readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
   readonly editableRoots: readonly string[];
+  readonly securityProfile?: SecurityProfile;
   readonly restrictProcess: boolean;
   readonly verifierEvidence: "full" | "summary";
   readonly publicCheck?: CommandSpec;
@@ -793,6 +796,18 @@ async function parseOptions(
     ? explicitCommand === undefined ? verification : undefined
     : { command: publicCheckCommand, args: values.get("--check-arg") ?? [] };
   const adaptiveVerification = single(values, "--adaptive-verification");
+  const security = resolveSecurityPolicy({
+    profile: parseSecurityProfile(single(values, "--security-profile") ?? "workspace"),
+    ...(single(values, "--restrict-process") === undefined
+      ? {}
+      : { restrictProcess: parseBoolean(single(values, "--restrict-process")!, "--restrict-process") }),
+    ...(single(values, "--expose-raw-process") === undefined
+      ? {}
+      : { exposeRawProcess: parseBoolean(single(values, "--expose-raw-process")!, "--expose-raw-process") }),
+    ...(single(values, "--verifier-evidence") === undefined
+      ? {}
+      : { verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence")!) }),
+  });
   return {
     workspace,
     task,
@@ -803,9 +818,10 @@ async function parseOptions(
     allowedCommands: values.get("--allow-command") ?? [],
     protectedPaths: values.get("--protect") ?? [],
     editableRoots: values.get("--editable-root") ?? [],
-    restrictProcess: parseBoolean(single(values, "--restrict-process") ?? "false", "--restrict-process"),
-    exposeRawProcess: parseBoolean(single(values, "--expose-raw-process") ?? "true", "--expose-raw-process"),
-    verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence") ?? "full"),
+    securityProfile: security.profile,
+    restrictProcess: security.restrictProcess,
+    exposeRawProcess: security.exposeRawProcess,
+    verifierEvidence: security.verifierEvidence,
     ...(publicCheck === undefined ? {} : { publicCheck }),
     maxSteps,
     maxDurationMs,
@@ -825,6 +841,7 @@ async function readRunConfiguration(file: string): Promise<CliOptions> {
   }
   return {
     ...parsed.options,
+    securityProfile: parsed.options.securityProfile ?? "workspace",
     commandTimeoutMs: parsed.options.commandTimeoutMs ?? 1_800_000,
   };
 }
@@ -867,6 +884,11 @@ function parseBoolean(value: string, name: string): boolean {
   if (value === "true") return true;
   if (value === "false") return false;
   throw new Error(`${name} must be true or false.`);
+}
+
+function parseSecurityProfile(value: string): SecurityProfile {
+  if (value === "workspace" || value === "guarded") return value;
+  throw new Error("--security-profile must be workspace or guarded.");
 }
 
 function parseEvidenceMode(value: string): "full" | "summary" {

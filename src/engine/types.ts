@@ -1,5 +1,6 @@
 import type { PublicRunEvent } from "../runtime/publicRunEvents.js";
 import type { CommandSpec } from "../runtime/projectVerification.js";
+import type { SecurityProfile } from "../security/policy.js";
 
 export const VANGUARD_PROTOCOL_VERSION = 1 as const;
 
@@ -27,6 +28,8 @@ export interface VanguardSessionConfig {
   readonly allowedCommands?: readonly string[];
   readonly protectedPaths?: readonly string[];
   readonly editableRoots?: readonly string[];
+  /** Named, auditable runtime posture. Defaults to `workspace`. */
+  readonly securityProfile?: SecurityProfile;
   readonly restrictProcess?: boolean;
   readonly exposeRawProcess?: boolean;
   readonly verifierEvidence?: "full" | "summary";

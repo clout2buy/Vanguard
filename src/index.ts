@@ -38,6 +38,7 @@ export * from "./evaluation/certification.js";
 export * from "./runtime/versionLedger.js";
 export * from "./engine/types.js";
 export * from "./engine/security.js";
+export * from "./security/policy.js";
 export * from "./engine/ndjson.js";
 export * from "./engine/cliRunner.js";
 export * from "./engine/vanguardEngine.js";
