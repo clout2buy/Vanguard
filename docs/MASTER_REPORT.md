@@ -267,6 +267,42 @@ superiority** — the evidence selects the language afterward.
   failover is intentionally not implemented here, and live provider chaos
   testing remains part of Phase 11/12 hardening.
 
+### Phase 9 — Secure extensibility
+
+- **Intended KPI:** one provider-neutral extension contract with deterministic
+  reload, explicit authority, bounded I/O, and no code execution caused merely
+  by discovering project files.
+- **Implemented:** deterministic user → workspace → nested-directory
+  discovery for `AGENTS.md` and strict version-1 `.vanguard/config.json`;
+  SHA-256 source provenance; monotonic workspace permission narrowing; a
+  bounded data-only `SKILL.md` loader; namespaced custom-tool registration
+  with JSON Schema input validation, independently matched effect metadata,
+  timeouts and output caps; a no-shell MCP stdio client with protocol/
+  capability handshake, bounded framing/backpressure, server/command/tool
+  allowlists, contained cwd, secret redaction, and cleanup; literal-argv hooks
+  with declared fail-open/fail-closed behavior and a hash-chained audit port;
+  and explicit interfaces for provider adapters, repository detectors,
+  verifiers, and reviewers. CLI and engine-created sessions now persist the
+  sanitized extension manifest and file provenance into runtime state and
+  scorecards, while resolved instructions enter the model context.
+- **Adversarial proof:** unknown/malicious config; user/workspace precedence
+  and deterministic reload; permission widening; traversal and out-of-root
+  symlinks; oversized skills and inert script resources; custom-tool effect
+  lying, malformed inputs, timeout, and oversized output; hook argv injection,
+  timeout and durable audit; MCP malformed/oversized frames, unannounced tools,
+  invalid inputs, secret-bearing results, abrupt disconnect, and cwd escape.
+- **Security boundary:** config never dynamically imports extensions, skills
+  never run scripts, and project config cannot grant capabilities absent from
+  the user ceiling. In-process JavaScript registered by an embedding host is
+  trusted code; genuinely untrusted extensions belong behind the MCP process
+  boundary and OS isolation. Hooks/MCP/custom tools are opt-in host
+  capabilities, not auto-started by discovery.
+- **Honest status:** this is the extensibility substrate and CLI provenance
+  integration, not a bundled extension marketplace. Provider conformance and
+  cross-platform packaging remain Phase 11; destructive security campaigns
+  remain Phase 12; no competitive parity claim follows from this phase alone.
+- **Tests:** 170/170 (161 inherited + 9 Phase-9 adversarial cases).
+
 ## Invalidated results ledger
 
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development

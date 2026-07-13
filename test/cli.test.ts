@@ -85,6 +85,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
       patch: { changedFiles: string[]; filesModified: number };
       workspaceRoot: string;
       scorecardFile: string;
+      extensions: { config: { version: number }; provenance: unknown[] };
     };
     isolatedRoot = path.dirname(scorecard.workspaceRoot);
     assert.equal(scorecard.outcome.status, "completed");
@@ -93,6 +94,8 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     assert.equal(scorecard.patch.filesModified, 1);
     assert.equal(scorecard.grade.executionQuality.cleanFirstPass, true);
     assert.equal(scorecard.grade.executionQuality.score, 1);
+    assert.equal(scorecard.extensions.config.version, 1);
+    assert.ok(Array.isArray(scorecard.extensions.provenance));
     assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
     assert.equal(JSON.parse(await readFile(scorecard.scorecardFile, "utf8")).outcome.status, "completed");

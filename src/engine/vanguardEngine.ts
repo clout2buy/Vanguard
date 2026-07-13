@@ -10,6 +10,8 @@ import {
 } from "../runtime/session.js";
 import { CliVanguardRunner } from "./cliRunner.js";
 import { sanitizePublicEvent } from "./security.js";
+import { extensionRuntimeState, resolveExtensions } from "../extensions/config.js";
+import type { JsonValue } from "../kernel/contracts.js";
 import {
   VanguardEngineError,
   type VanguardEngineEvent,
@@ -56,6 +58,8 @@ interface StoredCliOptions {
   readonly verifierEvidence: "full" | "summary";
   readonly publicCheck?: CommandSpec;
   readonly exposeRawProcess: boolean;
+  readonly extensions?: JsonValue;
+  readonly extensionInstructions?: string;
 }
 
 /**
@@ -99,7 +103,8 @@ export class VanguardEngine {
         "Could not detect project verification; provide a sealed verification command.",
       );
     }
-    const options = storedOptions(config, verification, verificationWasDetected);
+    const resolvedExtensions = await resolveExtensions({ workspaceRoot: config.workspace });
+    const options = storedOptions(config, verification, verificationWasDetected, resolvedExtensions);
     const session = await createSessionShell(config.workspace);
     const root = path.dirname(session.workspaceRoot);
     await writeFile(path.join(root, "run-config.json"), JSON.stringify({ version: 1, options }, null, 2), "utf8");
@@ -382,6 +387,7 @@ function storedOptions(
   config: VanguardSessionConfig,
   verification: CommandSpec,
   verificationWasDetected: boolean,
+  extensions: Awaited<ReturnType<typeof resolveExtensions>>,
 ): StoredCliOptions {
   return {
     workspace: config.workspace,
@@ -409,6 +415,8 @@ function storedOptions(
       "maxFailedVerificationAttempts",
       100,
     ),
+    extensions: extensionRuntimeState(extensions),
+    ...(extensions.instructions.length === 0 ? {} : { extensionInstructions: extensions.instructions }),
   };
 }
 

@@ -2,7 +2,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createInterface } from "node:readline";
-import type { JournalPort, RunEvent, UserChannelPort, VerifierPort } from "./kernel/contracts.js";
+import type { JournalPort, JsonValue, RunEvent, UserChannelPort, VerifierPort } from "./kernel/contracts.js";
 import type { AgentKernel as AgentKernelType, RunOutcome } from "./kernel/run.js";
 import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
 import {
@@ -49,6 +49,8 @@ import {
   SyntaxCheckTool,
   SyntaxCommandRunner,
   UsageLedger,
+  extensionRuntimeState,
+  resolveExtensions,
   createStreamLifecyclePresenter,
   reviewSessionChanges,
   applyReviewedManifest,
@@ -82,6 +84,8 @@ interface CliOptions {
   readonly verifierEvidence: "full" | "summary";
   readonly publicCheck?: CommandSpec;
   readonly exposeRawProcess: boolean;
+  readonly extensions?: JsonValue;
+  readonly extensionInstructions?: string;
 }
 
 async function main(): Promise<void> {
@@ -362,6 +366,7 @@ function buildConversationRuntime(
     ],
     verifiers: [],
     journal,
+    ...(options.extensions === undefined ? {} : { workingState: { snapshot: () => ({ extensions: options.extensions! }) } }),
     taskAddendum: taskAddendum(options, mutationPolicy),
     ...(userChannel === undefined ? {} : { userChannel }),
     options: {
@@ -443,7 +448,11 @@ async function buildExecutionRuntime(
   const usage = new UsageLedger(options.model);
   // Both durable states ride into every request as runtime-owned context.
   const workingState = {
-    snapshot: () => ({ checkpoint: checkpoint.snapshot(), plan: plan.snapshot() }),
+    snapshot: () => ({
+      checkpoint: checkpoint.snapshot(),
+      plan: plan.snapshot(),
+      ...(options.extensions === undefined ? {} : { extensions: options.extensions }),
+    }),
   };
   const observer: StreamObserver = interactive
     ? combinedObserver(createStreamPresenter(markActivity), usage)
@@ -488,7 +497,10 @@ function taskAddendum(options: CliOptions, mutationPolicy: WorkspaceMutationPoli
   const adaptive = options.adaptiveVerification === true
     ? "\nVanguard expert-mode contract: own the implementation end to end. This project did not have a recognized verification contract at launch. Establish an appropriate deterministic build/test contract as part of the work, use project.check throughout, and finish only when the automatic trusted verifier passes."
     : "";
-  return `Vanguard runtime mutation policy: ${mutationPolicy.describe()}${adaptive}`;
+  const instructions = options.extensionInstructions === undefined || options.extensionInstructions.length === 0
+    ? ""
+    : `\n\nResolved project instructions (with recorded provenance):\n${options.extensionInstructions}`;
+  return `Vanguard runtime mutation policy: ${mutationPolicy.describe()}${adaptive}${instructions}`;
 }
 
 async function runWithBudgets(
@@ -567,6 +579,7 @@ async function writeScorecard(context: ScorecardContext): Promise<void> {
     resumed: context.resumed,
     sessionFile: session.metadataFile,
     configurationFile: context.configurationFile,
+    extensions: options.extensions ?? null,
   };
   await writeFile(context.scorecardFile, JSON.stringify(scorecard, null, 2));
   process.stdout.write(`${JSON.stringify({ ...scorecard, scorecardFile: context.scorecardFile }, null, 2)}\n`);
@@ -728,6 +741,7 @@ async function parseOptions(
   const requireTask = behavior.requireTask !== false;
   const values = parseArgumentMap(args);
   const workspace = required(values, "--workspace");
+  const resolvedExtensions = await resolveExtensions({ workspaceRoot: workspace });
   const task = requireTask ? required(values, "--task") : single(values, "--task") ?? "";
   const provider = required(values, "--provider");
   if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "http") {
@@ -788,6 +802,8 @@ async function parseOptions(
     maxContextBytes,
     maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
+    extensions: extensionRuntimeState(resolvedExtensions),
+    ...(resolvedExtensions.instructions.length === 0 ? {} : { extensionInstructions: resolvedExtensions.instructions }),
   };
 }
 
