@@ -18,6 +18,7 @@ export interface RunOptions {
   readonly maxSteps: number;
   readonly maxRepeatedAction: number;
   readonly maxFailedVerificationAttempts: number;
+  readonly maxCompletionEvidenceAttempts: number;
   readonly maxContextBytes: number;
 }
 
@@ -48,6 +49,7 @@ const DEFAULT_OPTIONS: RunOptions = {
   maxSteps: 50,
   maxRepeatedAction: 2,
   maxFailedVerificationAttempts: 3,
+  maxCompletionEvidenceAttempts: 5,
   maxContextBytes: 1_000_000,
 };
 
@@ -76,10 +78,12 @@ export class AgentKernel {
       !Number.isSafeInteger(this.#options.maxSteps)
       || !Number.isSafeInteger(this.#options.maxRepeatedAction)
       || !Number.isSafeInteger(this.#options.maxFailedVerificationAttempts)
+      || !Number.isSafeInteger(this.#options.maxCompletionEvidenceAttempts)
       || !Number.isSafeInteger(this.#options.maxContextBytes)
       || this.#options.maxSteps < 1
       || this.#options.maxRepeatedAction < 1
       || this.#options.maxFailedVerificationAttempts < 1
+      || this.#options.maxCompletionEvidenceAttempts < 1
       || this.#options.maxContextBytes < 1
     ) {
       throw new Error("Run budgets must be positive integers.");
@@ -95,6 +99,7 @@ export class AgentKernel {
     const transcript = [...restored.transcript];
     const actionFailures = restored.actionFailures;
     let failedVerificationAttempts = restored.failedVerificationAttempts;
+    let failedCompletionEvidenceAttempts = restored.failedCompletionEvidenceAttempts;
     let mutationNeedsExecutionEvidence = restored.mutationNeedsExecutionEvidence;
     let mutationNeedsReview = restored.mutationNeedsReview;
     this.#sequence = restored.sequence;
@@ -162,10 +167,10 @@ export class AgentKernel {
           };
           await this.#record("verification.completed", evidence as unknown as JsonValue);
           transcript.push({ role: "verification", content: evidence as unknown as JsonValue });
-          failedVerificationAttempts += 1;
-          if (failedVerificationAttempts >= this.#options.maxFailedVerificationAttempts) {
+          failedCompletionEvidenceAttempts += 1;
+          if (failedCompletionEvidenceAttempts >= this.#options.maxCompletionEvidenceAttempts) {
             return this.#fail(
-              `Verification failure budget exhausted after ${failedVerificationAttempts} failed completion claims.`,
+              `Completion evidence policy budget exhausted after ${failedCompletionEvidenceAttempts} premature completion claims.`,
               step,
             );
           }
@@ -262,6 +267,7 @@ interface RestoredRun {
   readonly transcript: readonly TranscriptEntry[];
   readonly actionFailures: Map<string, number>;
   readonly failedVerificationAttempts: number;
+  readonly failedCompletionEvidenceAttempts: number;
   readonly mutationNeedsExecutionEvidence: boolean;
   readonly mutationNeedsReview: boolean;
   readonly completedSteps: number;
@@ -289,13 +295,17 @@ function restoreRun(
   let mutationNeedsReview = false;
   let completedSteps = 0;
   let failedVerificationAttempts = 0;
+  let failedCompletionEvidenceAttempts = 0;
   let completionClaimFailed = false;
+  let completionEvidenceFailed = false;
   let pendingCompletion = false;
 
   const flushCompletion = () => {
     if (pendingCompletion && completionClaimFailed) failedVerificationAttempts += 1;
+    if (pendingCompletion && completionEvidenceFailed) failedCompletionEvidenceAttempts += 1;
     pendingCompletion = false;
     completionClaimFailed = false;
+    completionEvidenceFailed = false;
   };
 
   for (const event of events) {
@@ -337,7 +347,10 @@ function restoreRun(
     if (event.type === "verification.completed") {
       transcript.push({ role: "verification", content: event.data });
       const result = event.data as unknown as Partial<VerificationResult>;
-      if (result.passed === false) completionClaimFailed = true;
+      if (result.passed === false) {
+        if (result.verifier === "completion evidence policy") completionEvidenceFailed = true;
+        else completionClaimFailed = true;
+      }
     }
   }
   flushCompletion();
@@ -345,6 +358,7 @@ function restoreRun(
     transcript,
     actionFailures,
     failedVerificationAttempts,
+    failedCompletionEvidenceAttempts,
     mutationNeedsExecutionEvidence,
     mutationNeedsReview,
     completedSteps,

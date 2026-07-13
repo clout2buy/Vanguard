@@ -216,6 +216,30 @@ test("rejects completion until fresh execution evidence follows the latest mutat
   );
 });
 
+test("premature evidence claims do not consume the sealed verification budget", async () => {
+  const mutation: ToolPort = {
+    name: "write", definition: { ...toolDefinition("write"), effect: "mutate" },
+    async execute() { return { ok: true, output: "changed" }; },
+  };
+  const execution: ToolPort = {
+    name: "test", definition: { ...toolDefinition("test"), effect: "execute" },
+    async execute() { return { ok: true, output: "passed" }; },
+  };
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tool", call: { id: "write", name: "write", input: {} } },
+      { kind: "complete", answer: "premature" },
+      { kind: "tool", call: { id: "test", name: "test", input: {} } },
+      { kind: "complete", answer: "verified" },
+    ]),
+    tools: [mutation, execution],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { maxFailedVerificationAttempts: 1 },
+  });
+  assert.equal((await kernel.run("repair then verify")).status, "completed");
+});
+
 test("requires change review after mutation when a review tool is available", async () => {
   const mutation: ToolPort = {
     name: "write", definition: { ...toolDefinition("write"), effect: "mutate" },
