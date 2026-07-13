@@ -59,7 +59,12 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
         toolFrictionFailures += 1;
       } else if (isLocalTestFailure) localTestFailures += 1;
       else toolFrictionFailures += 1;
-      if (serialized.includes("process policy") || serialized.includes("evidence policy")) policyBlocks += 1;
+      if (
+        serialized.includes("process policy")
+        || serialized.includes("evidence policy")
+        || serialized.includes("workspace mutation policy")
+        || serialized.includes("outside the declared editable roots")
+      ) policyBlocks += 1;
     }
     if (event.type === "tool.completed" || event.type === "tool.failed") pendingToolName = undefined;
     if (event.type === "verification.completed") {

@@ -2,6 +2,16 @@
 
 Live results are retained with an audit status. A passing verifier is necessary but not sufficient: trajectory integrity must also survive review.
 
+## 2026-07-12 — v7 six-track DeepSeek audit
+
+- Provider/model: DeepSeek `deepseek-v4-pro`.
+- The full run recorded 5/6 passes in `gauntlet/results/gauntlet-20260712-232337.json`: async-pool 21 steps, atomic-ledger 16, plugin-lifecycle 15, ttl-cache 12, and the long-horizon Ward mod 51. Across the run, Vanguard retained the task through 125 forced context compactions and made one completion claim per case.
+- Ward is the strongest result: seven interacting Java/resource files, 48 compactions, five trusted public builds, one productive compile failure, a final whole-patch review, and both sealed behavior and workspace-integrity verification passed in 507.6 seconds. Manual post-pass review found a coherent implementation rather than stubs or grader-specific test edits.
+- The raw dependency-planner failure was a benchmark false negative, not a code failure. Its useful `circular dependency detected` error was rejected by a sealed `/cycle/i` wording regex after all public behavior passed. The unchanged final workspace passes the corrected `/cycle|circular/i` grader. A regression test now protects semantic error wording.
+- The corrected targeted rerun passed 1/1 in `gauntlet/results/gauntlet-20260712-232827.json`: 20 steps, 17 compactions, one productive public-test failure, zero verifier failures, one completion claim, and execution quality `0.92`.
+- Audited conclusion: every current track has a valid DeepSeek pass under its corrected contract. This is not yet evidence of Claude Code or OpenCode superiority because there is no controlled head-to-head baseline, no external-dependency Forge/Fabric repository in the suite, and only one live provider has been exercised.
+- Core response from this audit: safe normalization for JSON-encoded checkpoint arrays, harmless trusted-check metadata tolerance while command arguments remain fixed, Gradle-wrapper build detection, 30-minute per-command budgets, two-hour run budgets, terminal liveness heartbeats, and a one-command long-project wrapper.
+
 ## 2026-07-11 — v2 interrupted run
 
 - `async-pool`: valid pass, 25 steps, 242.1 seconds, two tool failures, zero verifier failures.

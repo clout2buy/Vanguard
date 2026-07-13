@@ -45,6 +45,10 @@ Ares integration must eventually be an adapter around this kernel. Vanguard must
 - Allowlisted no-shell process execution and command-based verification
 - Persistent hash-chained run journals
 - Runtime-owned working-state checkpoints that survive transcript compaction
+- Durable session resume from validated journals without replaying completed tool calls
+- Two-hour default run budgets, configurable 30-minute build/test budgets, and terminal liveness heartbeats
+- Automatic trusted verification for npm, Gradle wrapper, pytest, and Cargo projects
+- Schema-tolerant checkpoint normalization that absorbs safe provider formatting slips
 - Effect-aware completion policy requiring fresh execution evidence after workspace mutations
 - Historical tool-payload compaction that preserves recent full-fidelity evidence
 - Provider-safe preservation of opaque reasoning and signed thinking state during compaction

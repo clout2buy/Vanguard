@@ -74,3 +74,18 @@ test("trajectory metrics classify invalid Node eval flags as harness friction", 
   assert.equal(metrics.testHarnessFailures, 1);
   assert.equal(metrics.toolFrictionFailures, 1);
 });
+
+test("trajectory metrics count editable-root mutation denials as policy blocks", () => {
+  const events: RunEvent[] = [
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "workspace.write" } } },
+    {
+      sequence: 2,
+      type: "tool.failed",
+      data: { ok: false, output: { error: "Path is outside the declared editable roots." } },
+    },
+  ];
+  const metrics = analyzeTrajectory(events);
+  assert.equal(metrics.toolFailures, 1);
+  assert.equal(metrics.toolFrictionFailures, 1);
+  assert.equal(metrics.policyBlocks, 1);
+});

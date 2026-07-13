@@ -24,13 +24,14 @@ The corpus is derived from sanitized Ares failure shapes, not proprietary compet
 
 ## Private sealed suite v2
 
-The suite currently contains five independent cases:
+The suite currently contains six independent cases:
 
 1. `atomic-ledger` tests repair work involving concurrency and rollback invariants.
 2. `dependency-planner` tests algorithmic implementation and deterministic ordering.
 3. `ttl-cache` tests feature evolution while preserving existing behavior.
 4. `plugin-lifecycle` tests multi-file lifecycle orchestration, rollback, and aggregate cleanup failures.
 5. `async-pool` tests greenfield asynchronous concurrency, ordering, failure, and abort behavior.
+6. `ward-mod` tests long-horizon Java 8 mod work across claims, persistence, concurrency, permissions, commands, resources, and integration wiring under forced context compaction.
 
 Each case exposes only its behavioral task and starter workspace. Its grader remains outside the disposable agent workspace, verifier output is summarized without privileged paths, the agent's Node subprocess is filesystem-confined to the disposable workspace, and the integrity verifier protects manifests and restricts edits to declared source roots.
 
@@ -55,6 +56,8 @@ Provider transport, authentication, and protocol/adapter failures are classified
 Schema v5 adds pre-mutation scope enforcement and distinguishes productive local test failures from malformed test-harness failures. Case graders accept semantically useful error wording rather than requiring one arbitrary phrase.
 
 Schema v6 requires `workspace.changes` review after the final mutation and exposes large patch expansion before completion. Plugin-lifecycle v3 adds prototype-safe status-key behavior.
+
+Schema v7 adds durable context-compaction counts, the long-horizon Ward mod track, fixed trusted project checks across every case, provider/capability outcome separation, and per-case raw-process exposure. Semantically equivalent useful errors are accepted; wording-only grader failures invalidate the benchmark result and require a corrected rerun.
 
 ## Execution-quality score
 
