@@ -119,8 +119,18 @@ function isMissing(error: unknown): boolean {
 }
 
 function stringList(value: JsonValue | undefined, name: string): readonly string[] {
-  if (!Array.isArray(value) || value.length > 50 || !value.every((item) => typeof item === "string" && item.length <= 1_000)) {
+  let normalized = value;
+  if (typeof normalized === "string" && normalized.length <= 100_000) {
+    try {
+      normalized = JSON.parse(normalized) as JsonValue;
+    } catch {}
+  }
+  if (
+    !Array.isArray(normalized)
+    || normalized.length > 50
+    || !normalized.every((item) => typeof item === "string" && item.length <= 1_000)
+  ) {
     throw new Error(`Checkpoint '${name}' must be an array of at most 50 strings, each at most 1,000 characters.`);
   }
-  return value as string[];
+  return normalized as string[];
 }

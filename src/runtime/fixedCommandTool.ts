@@ -27,7 +27,13 @@ export class FixedCommandTool implements ToolPort {
 
   async execute(input: JsonValue, context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
-    if (Object.keys(fields).length > 0) throw new Error(`${this.name} does not accept arguments.`);
+    const unsupported = Object.keys(fields).filter((key) => key !== "summary" && key !== "reason");
+    if (unsupported.length > 0) throw new Error(`${this.name} does not accept arguments that can change the fixed command.`);
+    for (const key of ["summary", "reason"] as const) {
+      if (fields[key] !== undefined && typeof fields[key] !== "string") {
+        throw new Error(`${this.name} metadata '${key}' must be a string.`);
+      }
+    }
     return this.processTool.execute({
       command: this.command.command,
       args: [...this.command.args],

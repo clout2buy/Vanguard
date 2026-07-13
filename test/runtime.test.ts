@@ -213,6 +213,7 @@ test("fixed command tool exposes a trusted check without model-controlled argume
     const result = await tool.execute({}, context);
     assert.equal(result.ok, true);
     assert.match(JSON.stringify(result.output), /fixed/);
+    assert.equal((await tool.execute({ summary: "run trusted checks" }, context)).ok, true);
     await assert.rejects(() => tool.execute({ args: ["malicious"] }, context), /does not accept arguments/);
   } finally {
     await rm(root, { recursive: true, force: true });

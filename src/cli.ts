@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { access, readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { JournalPort, RunEvent, VerifierPort } from "./kernel/contracts.js";
+import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
 import {
   AgentKernel,
   CheckpointTool,
@@ -33,11 +34,6 @@ import {
   FixedCommandTool,
 } from "./index.js";
 
-interface CommandSpec {
-  readonly command: string;
-  readonly args: readonly string[];
-}
-
 interface CliOptions {
   readonly workspace: string;
   readonly task: string;
@@ -48,6 +44,7 @@ interface CliOptions {
   readonly allowedCommands: readonly string[];
   readonly maxSteps: number;
   readonly maxDurationMs: number;
+  readonly commandTimeoutMs: number;
   readonly maxContextBytes: number;
   readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
@@ -81,6 +78,7 @@ async function main(): Promise<void> {
   const versions = new WorkspaceVersionLedger();
   const workingState = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
+  const commandTimeoutMs = Math.min(options.commandTimeoutMs, options.maxDurationMs);
   const agentAllowedCommands = options.restrictProcess
     ? [...new Set(["node", ...options.allowedCommands])]
     : [...new Set(["node", "npm", "npx", "git", options.verification.command, ...options.allowedCommands])];
@@ -89,13 +87,13 @@ async function main(): Promise<void> {
     commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess, mutationPolicy.writableAbsoluteRoots(session.workspaceRoot)),
     deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-experimental-permission"] : [],
     deniedArgumentSubstrings: options.restrictProcess ? ["console.assert"] : [],
-    timeoutMs: 600_000,
+    timeoutMs: commandTimeoutMs,
     maxOutputBytes: 2_000_000,
   });
   const verifierProcessTool = new ProcessTool(workspace, {
     allowedCommands: [options.verification.command],
     commandAliases: commandAliases(session.workspaceRoot, false, []),
-    timeoutMs: 600_000,
+    timeoutMs: commandTimeoutMs,
     maxOutputBytes: 2_000_000,
   });
   const publicCheckTool = options.publicCheck === undefined ? undefined : new FixedCommandTool(
@@ -104,7 +102,7 @@ async function main(): Promise<void> {
     new ProcessTool(workspace, {
       allowedCommands: [options.publicCheck.command],
       commandAliases: commandAliases(session.workspaceRoot, false, []),
-      timeoutMs: 600_000,
+      timeoutMs: commandTimeoutMs,
       maxOutputBytes: 2_000_000,
     }),
     options.publicCheck,
@@ -113,7 +111,8 @@ async function main(): Promise<void> {
   const scorecardFile = path.join(container, "scorecard.json");
   const fileJournal = await FileJournal.open(journalFile);
   const priorEvents = resuming ? await fileJournal.readValidated() : [];
-  const journal = progressJournal(fileJournal);
+  let lastProgressAt = Date.now();
+  const journal = progressJournal(fileJournal, () => { lastProgressAt = Date.now(); });
   const model = createModel(options);
   const verifiers: VerifierPort[] = [
     new CommandVerifier("required command", verifierProcessTool, options.verification, options.verifierEvidence),
@@ -154,8 +153,18 @@ async function main(): Promise<void> {
   const startedAt = Date.now();
   const controller = new AbortController();
   const durationTimer = setTimeout(() => controller.abort(), options.maxDurationMs);
+  const heartbeatTimer = setInterval(() => {
+    const quietMs = Date.now() - lastProgressAt;
+    if (quietMs >= 45_000) {
+      process.stderr.write(`[Vanguard] working: provider or tool response pending (${formatDuration(quietMs)} since last event)\n`);
+    }
+  }, 45_000);
+  heartbeatTimer.unref();
   const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${mutationPolicy.describe()}`;
-  const outcome = await kernel.run(runtimeTask, controller.signal, priorEvents).finally(() => clearTimeout(durationTimer));
+  const outcome = await kernel.run(runtimeTask, controller.signal, priorEvents).finally(() => {
+    clearTimeout(durationTimer);
+    clearInterval(heartbeatTimer);
+  });
   const trajectory = analyzeTrajectory(await fileJournal.readValidated());
   const patch = await analyzePatch(session.sourceRoot, session.workspaceRoot);
   const verified = outcome.status === "completed";
@@ -234,9 +243,13 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   if (!Number.isSafeInteger(maxFailedVerificationAttempts) || maxFailedVerificationAttempts < 1) {
     throw new Error("--max-verification-attempts must be a positive integer.");
   }
+  const commandTimeoutMs = Number(single(values, "--command-timeout-ms") ?? "1800000");
+  if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs < 1) {
+    throw new Error("--command-timeout-ms must be a positive integer.");
+  }
   const explicitCommand = single(values, "--verify-command");
   const verification = explicitCommand === undefined
-    ? await detectVerification(workspace)
+    ? await detectProjectVerification(workspace)
     : { command: explicitCommand, args: values.get("--verify-arg") ?? [] };
   if (verification === undefined) {
     throw new Error("Could not detect project verification. Supply --verify-command and repeat --verify-arg for its arguments.");
@@ -245,6 +258,9 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
   if (publicCheckCommand === undefined && values.has("--check-arg")) {
     throw new Error("--check-arg requires --check-command.");
   }
+  const publicCheck = publicCheckCommand === undefined
+    ? explicitCommand === undefined ? verification : undefined
+    : { command: publicCheckCommand, args: values.get("--check-arg") ?? [] };
   return {
     workspace,
     task,
@@ -257,11 +273,10 @@ async function parseOptions(args: readonly string[]): Promise<CliOptions> {
     restrictProcess: parseBoolean(single(values, "--restrict-process") ?? "false", "--restrict-process"),
     exposeRawProcess: parseBoolean(single(values, "--expose-raw-process") ?? "true", "--expose-raw-process"),
     verifierEvidence: parseEvidenceMode(single(values, "--verifier-evidence") ?? "full"),
-    ...(publicCheckCommand === undefined ? {} : {
-      publicCheck: { command: publicCheckCommand, args: values.get("--check-arg") ?? [] },
-    }),
+    ...(publicCheck === undefined ? {} : { publicCheck }),
     maxSteps,
     maxDurationMs,
+    commandTimeoutMs,
     maxContextBytes,
     maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
@@ -273,7 +288,10 @@ async function readRunConfiguration(file: string): Promise<CliOptions> {
   if (parsed.version !== 1 || parsed.options === undefined) {
     throw new Error("Session run configuration is missing or unsupported.");
   }
-  return parsed.options;
+  return {
+    ...parsed.options,
+    commandTimeoutMs: parsed.options.commandTimeoutMs ?? 1_800_000,
+  };
 }
 
 function parseResumeSession(args: readonly string[]): string {
@@ -288,21 +306,6 @@ function requiredArgument(args: readonly string[], name: string): string {
     if (args[index] === name && args[index + 1] !== undefined) return args[index + 1]!;
   }
   throw new Error(`${name} is required.`);
-}
-
-async function detectVerification(workspace: string): Promise<CommandSpec | undefined> {
-  const root = path.resolve(workspace);
-  try {
-    const parsed = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as {
-      scripts?: Record<string, string>;
-    };
-    if (typeof parsed.scripts?.test === "string") return { command: "npm", args: ["test"] };
-  } catch {}
-  if (await exists(path.join(root, "pyproject.toml")) || await exists(path.join(root, "pytest.ini"))) {
-    return { command: "python", args: ["-m", "pytest"] };
-  }
-  if (await exists(path.join(root, "Cargo.toml"))) return { command: "cargo", args: ["test"] };
-  return undefined;
 }
 
 function commandAliases(
@@ -336,15 +339,6 @@ function parseEvidenceMode(value: string): "full" | "summary" {
   throw new Error("--verifier-evidence must be full or summary.");
 }
 
-async function exists(file: string): Promise<boolean> {
-  try {
-    await access(file);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function required(values: ReadonlyMap<string, string[]>, name: string): string {
   const value = single(values, name);
   if (value === undefined || value.length === 0) throw new Error(`${name} is required.`);
@@ -357,11 +351,12 @@ function single(values: ReadonlyMap<string, string[]>, name: string): string | u
   return all?.[0];
 }
 
-function progressJournal(fileJournal: FileJournal): JournalPort {
+function progressJournal(fileJournal: FileJournal, onActivity: () => void): JournalPort {
   let modelTurns = 0;
   return {
     async append(event: RunEvent): Promise<void> {
       await fileJournal.append(event);
+      onActivity();
       if (event.type === "model.decided") {
         modelTurns += 1;
         const decision = event.data as { kind?: string; call?: { name?: string } };
@@ -380,8 +375,15 @@ function progressJournal(fileJournal: FileJournal): JournalPort {
   };
 }
 
+function formatDuration(durationMs: number): string {
+  const seconds = Math.max(0, Math.floor(durationMs / 1_000));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return minutes === 0 ? `${remainder}s` : `${minutes}m ${remainder}s`;
+}
+
 function printUsage(): void {
-  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard coding-agent preview\n\nUsage:\n  vanguard run --workspace PATH --task TEXT --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nOptions:\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {

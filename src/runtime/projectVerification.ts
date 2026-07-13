@@ -1,0 +1,45 @@
+import { access, readFile } from "node:fs/promises";
+import path from "node:path";
+
+export interface CommandSpec {
+  readonly command: string;
+  readonly args: readonly string[];
+}
+
+export async function detectProjectVerification(workspace: string): Promise<CommandSpec | undefined> {
+  const root = path.resolve(workspace);
+  try {
+    const parsed = JSON.parse(await readFile(path.join(root, "package.json"), "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+    if (typeof parsed.scripts?.test === "string") return { command: "npm", args: ["test"] };
+  } catch {}
+
+  if (await exists(path.join(root, "gradle", "wrapper", "gradle-wrapper.jar"))) {
+    return {
+      command: "java",
+      args: [
+        "-classpath",
+        path.join("gradle", "wrapper", "gradle-wrapper.jar"),
+        "org.gradle.wrapper.GradleWrapperMain",
+        "build",
+        "--no-daemon",
+      ],
+    };
+  }
+
+  if (await exists(path.join(root, "pyproject.toml")) || await exists(path.join(root, "pytest.ini"))) {
+    return { command: "python", args: ["-m", "pytest"] };
+  }
+  if (await exists(path.join(root, "Cargo.toml"))) return { command: "cargo", args: ["test"] };
+  return undefined;
+}
+
+async function exists(file: string): Promise<boolean> {
+  try {
+    await access(file);
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -20,7 +20,10 @@ assert.deepEqual(planTasks([]), []);
 assert.throws(() => planTasks([{ id: "a" }, { id: "a" }]), /duplicate/i);
 assert.throws(() => planTasks([{ id: "a", dependsOn: ["missing"] }]), /missing|unknown/i);
 assert.throws(() => planTasks([{ id: "a", dependsOn: ["a"] }]), /self|cycle/i);
-assert.throws(() => planTasks([{ id: "a", dependsOn: ["b"] }, { id: "b", dependsOn: ["a"] }]), /cycle/i);
+assert.throws(
+  () => planTasks([{ id: "a", dependsOn: ["b"] }, { id: "b", dependsOn: ["a"] }]),
+  /cycle|circular/i,
+);
 assert.throws(() => planTasks(null));
 assert.throws(() => planTasks([{ id: "" }]));
 assert.throws(() => planTasks([{ id: "a", dependsOn: "b" }]));

@@ -53,3 +53,25 @@ test("checkpoint state survives process-style reopening", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("checkpoint accepts JSON-encoded string arrays from schema-imperfect providers", async () => {
+  const ledger = new RunCheckpointLedger();
+  const tool = new CheckpointTool(ledger);
+  const result = await tool.execute({
+    summary: "Reconnaissance complete.",
+    completed: "[\"read source\"]",
+    next: "[\"implement\",\"verify\"]",
+    evidence: "[]",
+    risks: "[\"compatibility\"]",
+  }, { task: "test", step: 1, signal: new AbortController().signal });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(ledger.snapshot(), {
+    revision: 1,
+    summary: "Reconnaissance complete.",
+    completed: ["read source"],
+    next: ["implement", "verify"],
+    evidence: [],
+    risks: ["compatibility"],
+  });
+});

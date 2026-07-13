@@ -153,6 +153,25 @@ test("atomic-ledger grader rejects inherited-property account lookup mutant", as
   }
 });
 
+test("dependency-planner grader accepts useful circular-dependency wording", async () => {
+  const caseDefinition = cases[2];
+  const caseRoot = path.resolve("gauntlet", "cases", caseDefinition.id);
+  const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-dependency-wording-"));
+  const workspace = path.join(container, "workspace");
+  try {
+    await cp(path.join(caseRoot, "workspace"), workspace, { recursive: true });
+    const implementation = caseDefinition.solution.replace(
+      "dependency cycle detected",
+      "circular dependency detected",
+    );
+    await writeFile(path.join(workspace, caseDefinition.sourceFile), implementation);
+    const { stdout } = await executeFile(process.execPath, [path.join(caseRoot, "grader.mjs"), workspace]);
+    assert.match(stdout, /sealed grader passed/);
+  } finally {
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
 for (const caseDefinition of cases) {
   test(`sealed ${caseDefinition.id} grader rejects starter and accepts reference behavior`, async () => {
     const caseRoot = path.resolve("gauntlet", "cases", caseDefinition.id);
