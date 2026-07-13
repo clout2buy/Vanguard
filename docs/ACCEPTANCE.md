@@ -2,6 +2,12 @@
 
 Vanguard may replace Ares's coding core only after it satisfies all gates on held-out tasks.
 
+These original product gates are necessary but not sufficient. Competitive
+parity/superiority language additionally requires the frozen external
+experiment in `CERTIFICATION.md`, and a default-on Ares cutover additionally
+requires the 20-user/200-attempt soak in `ARES_INTEGRATION.md`. Neither has
+been completed at the current supervised-alpha checkpoint.
+
 ## Correctness
 
 - At least 90% task completion on the internal coding suite.
