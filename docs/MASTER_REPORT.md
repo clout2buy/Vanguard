@@ -30,7 +30,7 @@ sealed regression corpus, external competitive evaluation, or human beta.
 | 8 — engine protocol | `9df3847` | Locally implemented and exported. |
 | 9 — extensibility | `3f62902` | Locally implemented within the documented trust boundary. |
 | 10 — product flow | `8c00d49`, `79d9a91` | TUI dogfoods the public engine; terminal/user study evidence pending. |
-| 11 — providers/portability | `df1d16a` | Offline conformance and local Windows package smoke complete; nine-cell CI run pending. |
+| 11 — providers/portability | `df1d16a` + final portability audit | Offline conformance and Node 20/22/24 local Windows package smoke complete; nine-cell CI run pending. |
 | 12 — security | `c811295` | Local boundary implemented; no OS-sandbox or penetration-test claim. |
 | 13 — certification | `0737521` | External-evaluator drivetrain locally complete; no holdout runs or certificate exist. |
 | 14 — Ares integration | `5c68915`, `c0aac44` | Off-by-default adapter locally complete; 20-user/200-attempt beta pending. |
@@ -423,15 +423,24 @@ Phase 5–6 in this historical execution record.
   bounded `Retry-After`, cancellation, malformed payloads, context errors,
   and credential-safe diagnostics. It performs no network calls and cannot
   spend provider credits.
-- **Portability/package:** package engine range `>=20.19 <25`; PowerShell and
+- **Portability/package:** package engine range `>=20.19 <25`; deterministic
+  recursive test discovery independent of shell glob behavior; PowerShell and
   POSIX launchers; LF pinning for the POSIX launcher; real compiled CLI tests
   for Unicode/space paths, split UTF-8 + CRLF stdio, EOF shutdown, and host
   termination. `.github/workflows/portability.yml` defines Windows/macOS/Linux
   × Node 20.19/22/24. `npm pack` prebuilds, then the smoke installs the tarball
-  into a clean spaced path, imports the public ESM engine, and launches its CLI.
-- **Local proof:** provider harness 12/12; Windows portability 5/5; complete
-  suite 178/178; clean packed install/import/CLI smoke passed for
-  `vanguard-0.1.0.tgz` (180,774 bytes).
+  into a clean spaced path, imports the public ESM engine, strict-compiles a
+  TypeScript consumer, exercises the installed bin/platform launcher and TUI
+  module, and validates process-local credential helpers without logging their
+  values. npm/npx resolution no longer assumes they are adjacent to
+  `process.execPath`; the Node permission flag is selected for Node 20 versus
+  Node 22/24 without allowing a model to disable it.
+- **Local proof (2026-07-13):** on Windows, Node 20.19.0, 22.22.2, and 24.4.1
+  each ran 260 tests: 259 passed and the POSIX mode-bit test was intentionally
+  skipped. Provider harness 12/12 and the clean packed consumer passed on all
+  three. Windows PowerShell 5.1 parsed 10/10 scripts and process-local
+  credential-helper checks passed for all three native providers. Exact local
+  evidence and its limits are in `docs/PORTABILITY.md`.
 - **Honest limits:** the nine-cell CI matrix is authored but has not run in
   this local checkpoint. Live-provider conformance/cache-hit measurement is
   deliberately separate and paid; no such claim is inferred from mocks. The

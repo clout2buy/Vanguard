@@ -19,6 +19,7 @@ import {
   WriteFileTool,
   contentHash,
 } from "../src/index.js";
+import { nodePermissionFlag } from "../src/runtime/nodePackageManager.js";
 
 const context = { task: "test", step: 1, signal: new AbortController().signal };
 
@@ -304,10 +305,10 @@ test("restricted Node process cannot read outside workspace or widen its own per
       commandAliases: {
         node: {
           executable: process.execPath,
-          argsPrefix: ["--experimental-permission", `--allow-fs-read=${root}`, `--allow-fs-write=${root}`],
+          argsPrefix: [nodePermissionFlag(), `--allow-fs-read=${root}`, `--allow-fs-write=${root}`],
         },
       },
-      deniedArgumentPrefixes: ["--allow-", "--no-experimental-permission"],
+      deniedArgumentPrefixes: ["--allow-", "--no-permission", "--no-experimental-permission"],
     });
     const allowed = await tool.execute({
       command: "node",
@@ -323,6 +324,9 @@ test("restricted Node process cannot read outside workspace or widen its own per
     const escalation = await tool.execute({ command: "node", args: ["--allow-fs-read=*", "-e", "0"] }, context);
     assert.equal(escalation.ok, false);
     assert.match(JSON.stringify(escalation.output), /blocked by process policy/i);
+    const disable = await tool.execute({ command: "node", args: ["--no-permission", "-e", "0"] }, context);
+    assert.equal(disable.ok, false);
+    assert.match(JSON.stringify(disable.output), /blocked by process policy/i);
   } finally {
     await rm(container, { recursive: true, force: true });
   }
@@ -339,7 +343,7 @@ test("restricted Node process cannot mutate outside declared editable roots", as
       commandAliases: {
         node: {
           executable: process.execPath,
-          argsPrefix: ["--experimental-permission", `--allow-fs-read=${root}`, `--allow-fs-write=${editable}`],
+          argsPrefix: [nodePermissionFlag(), `--allow-fs-read=${root}`, `--allow-fs-write=${editable}`],
         },
       },
     });

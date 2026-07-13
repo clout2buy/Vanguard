@@ -46,7 +46,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/test/**/*.test.js",
+    "test": "npm run build && node scripts/run-tests.mjs",
     "test:providers": "npm run build && node --test dist/test/providerConformance.test.js",
     "test:portability": "npm run build && node --test dist/test/portability.test.js",
     "test:pack": "node scripts/package-smoke.mjs",

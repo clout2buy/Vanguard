@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const temporary = await mkdtemp(path.join(tmpdir(), "vanguard-pack-smoke-"));
@@ -92,21 +92,63 @@ try {
     "--moduleResolution", "NodeNext", "--types", "node",
     "--typeRoots", path.join(root, "node_modules", "@types"), "consumer.ts",
   ], consumer);
-  const credentialHelper = path.join(consumer, "node_modules", "vanguard", "scripts", "export-credential.ps1");
-  const helperResult = spawnSync("powershell.exe", [
-    "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-    "-File", credentialHelper, "-Provider", "deepseek",
-    "-Root", path.join(consumer, "node_modules", "vanguard"),
-  ], {
-    cwd: consumer,
-    encoding: "utf8",
-    env: { ...process.env, DEEPSEEK_API_KEY: "vanguard-pack-smoke-nonsecret" },
-    windowsHide: true,
-  });
-  assert.equal(helperResult.status, 0, helperResult.stderr);
-  assert.equal(helperResult.stdout, "vanguard-pack-smoke-nonsecret");
-  const help = run(process.execPath, [path.join(consumer, "node_modules", "vanguard", "dist", "src", "cli.js"), "--help"], consumer);
+  const installedRoot = path.join(consumer, "node_modules", "vanguard");
+  if (process.platform === "win32") {
+    const credentialHelper = path.join(installedRoot, "scripts", "export-credential.ps1");
+    for (const [provider, variable] of [
+      ["deepseek", "DEEPSEEK_API_KEY"],
+      ["openai", "OPENAI_API_KEY"],
+      ["anthropic", "ANTHROPIC_API_KEY"],
+    ]) {
+      const fixture = `vanguard-pack-${provider}-fixture`;
+      const helperResult = spawnSync("powershell.exe", [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", credentialHelper, "-Provider", provider,
+        "-Root", installedRoot,
+      ], {
+        cwd: consumer,
+        encoding: "utf8",
+        env: { ...process.env, [variable]: fixture },
+        windowsHide: true,
+      });
+      assert.equal(helperResult.status, 0, helperResult.stderr);
+      assert.equal(helperResult.stdout, fixture);
+    }
+    const packedLauncher = path.join(installedRoot, "scripts", "vanguard.ps1");
+    const launcherResult = spawnSync("powershell.exe", [
+      "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+      "-File", packedLauncher, "--help",
+    ], { cwd: consumer, encoding: "utf8", windowsHide: true });
+    assert.equal(launcherResult.status, 0, launcherResult.stderr);
+    assert.match(launcherResult.stdout, /Vanguard expert coding agent/u);
+  } else {
+    const packedLauncher = path.join(installedRoot, "scripts", "vanguard");
+    await chmod(packedLauncher, 0o755);
+    assert.match(run(packedLauncher, ["--help"], consumer), /Vanguard expert coding agent/u);
+  }
+  const cli = path.join(installedRoot, "dist", "src", "cli.js");
+  const help = run(process.execPath, [cli, "--help"], consumer);
   assert.match(help, /Vanguard expert coding agent/u);
+  const installedBin = path.join(consumer, "node_modules", ".bin", "vanguard");
+  const binResult = process.platform === "win32"
+    ? spawnSync("powershell.exe", [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-Command", "& $env:VANGUARD_SMOKE_BIN --help",
+      ], {
+        cwd: consumer,
+        encoding: "utf8",
+        env: { ...process.env, VANGUARD_SMOKE_BIN: `${installedBin}.cmd` },
+        windowsHide: true,
+      })
+    : spawnSync(installedBin, ["--help"], { cwd: consumer, encoding: "utf8" });
+  assert.equal(binResult.status, 0, binResult.stderr);
+  assert.match(binResult.stdout, /Vanguard expert coding agent/u);
+  const tuiUrl = pathToFileURL(path.join(installedRoot, "dist", "src", "tui.js")).href;
+  run(process.execPath, ["--input-type=module", "--eval", [
+    `const tui = await import(${JSON.stringify(tuiUrl)});`,
+    'const welcome = tui.renderWelcomeForTest("C:\\\\portable project", "fixture-model");',
+    'if (!welcome.includes("VANGUARD") || !welcome.includes("fixture-model")) throw new Error("packed TUI unavailable");',
+  ].join("\n")], consumer);
   const installed = JSON.parse(await readFile(path.join(consumer, "node_modules", "vanguard", "package.json"), "utf8"));
   assert.match(installed.engines.node, />=20/u);
   process.stdout.write(`Package smoke passed: ${entry.filename} (${entry.size} bytes)\n`);

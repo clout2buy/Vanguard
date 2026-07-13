@@ -9,6 +9,12 @@ authored but has not produced a recorded nine-cell run, so only the local
 Windows checks and clean-package smoke recorded in `docs/MASTER_REPORT.md`
 count as executed evidence.
 
+The full-suite command does not rely on shell glob expansion. After TypeScript
+compilation, `scripts/run-tests.mjs` recursively enumerates and sorts every
+`dist/test/**/*.test.js` file before starting Node's test runner. This is
+necessary because Windows shells do not expand the glob and supported Node
+releases do not handle a directory/glob argument identically.
+
 ## Launch behavior
 
 The npm package exposes the `vanguard` bin, whose shebang launches the compiled
@@ -24,6 +30,13 @@ Unicode. The PowerShell launcher returns the Node process exit code. The
 stdio engine uses LF-delimited UTF-8 JSON while accepting CRLF and arbitrary
 byte chunk boundaries.
 
+The Windows launcher deliberately selects a real `node.exe`, not a same-named
+PowerShell/npm shim. npm and npx execution inside the engine resolves their
+JavaScript entry points without a command shell, preferring `npm_execpath` and
+then standard Node/prefix/PATH layouts. Restricted Node children use
+`--experimental-permission` on Node 20 and the stable `--permission` spelling
+on Node 22/24; both disable-flag spellings are blocked from model arguments.
+
 ## Artifact smoke
 
 Run:
@@ -35,8 +48,12 @@ npm run test:pack
 The smoke script creates a temporary destination, runs `npm pack --json`,
 asserts the required engine/provider/launcher files are present, installs the
 tarball into a clean project whose path contains spaces, imports the public
-TypeScript/ESM surface, invokes the packed CLI, and removes all temporary
-files. It never publishes and never contacts a model provider.
+TypeScript/ESM surface, strict-compiles a consuming TypeScript project, invokes
+the installed npm bin and platform launcher, loads/renders the packed TUI
+module, and removes all temporary files. On Windows it also verifies all three
+credential helpers using process-local fixture values; values are compared in
+memory and are never logged. It never publishes and never contacts a model
+provider.
 
 `npm pack` runs `prepack`, so the artifact always contains JavaScript and type
 declarations built from the current source. The repository remains marked
@@ -55,3 +72,21 @@ orphaned Vanguard child—not a Unix-only signal number.
 There is not yet a native single-file executable or OS installer. Node and npm
 remain runtime/distribution prerequisites, and CI success is implementation
 evidence rather than proof of behavior on every terminal emulator.
+
+## Executed local Windows matrix (2026-07-13)
+
+This is local compatibility evidence, not the unexecuted nine-cell CI result:
+
+| Runtime | Full suite | Provider fixtures | Packed consumer |
+|---|---:|---:|---:|
+| Node 20.19.0 | 259 passed, 1 intentional Windows skip | 12/12 | passed |
+| Node 22.22.2 / npm 10.9.7 | 259 passed, 1 intentional Windows skip | 12/12 | passed |
+| Node 24.4.1 | 259 passed, 1 intentional Windows skip | 12/12 | passed |
+
+The one skip is the POSIX mode-bit apply test, which is inapplicable on
+Windows. Windows PowerShell 5.1.26100.8737 parsed all 10 project `.ps1` files
+with zero errors; process-environment credential loading passed for DeepSeek,
+OpenAI, and Anthropic without reading the user/DPAPI stores. The packed TUI
+check proves import and rendering from the installed artifact, not interactive
+terminal ergonomics. macOS/Linux and PowerShell 7 cells remain unexecuted
+locally and must not be inferred from this table.

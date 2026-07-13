@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { nodePermissionFlag, resolveNodePackageManagerAlias } from "../src/runtime/nodePackageManager.js";
 
 const compiledCli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -126,4 +127,40 @@ test("declared Node support and portable path behavior are explicit", async () =
   assert.equal(manifest.engines?.node, ">=20.19 <25");
   assert.equal(path.posix.normalize("/workspace/src/../test"), "/workspace/test");
   assert.equal(path.win32.normalize("C:\\workspace\\src\\..\\test"), "C:\\workspace\\test");
+});
+
+test("npm and npx resolution follows npm_execpath outside the Node installation", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "vanguard portable npm "));
+  try {
+    const npmBin = path.join(root, "portable npm", "bin");
+    await mkdir(npmBin, { recursive: true });
+    const npmCli = path.join(npmBin, "npm-cli.js");
+    const npxCli = path.join(npmBin, "npx-cli.js");
+    await writeFile(npmCli, "// fixture\n", "utf8");
+    await writeFile(npxCli, "// fixture\n", "utf8");
+    const nodeExecutable = path.join(root, "standalone node", "node.exe");
+    const environment = { npm_execpath: npmCli, PATH: "" };
+    assert.deepEqual(resolveNodePackageManagerAlias("npm", environment, nodeExecutable), {
+      executable: nodeExecutable,
+      argsPrefix: [npmCli],
+    });
+    assert.deepEqual(resolveNodePackageManagerAlias("npx", environment, nodeExecutable), {
+      executable: nodeExecutable,
+      argsPrefix: [npxCli],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("npm resolution fails closed when no shell-free JavaScript entry point exists", () => {
+  const absentNode = path.join(tmpdir(), "vanguard-absent-node", "node.exe");
+  assert.equal(resolveNodePackageManagerAlias("npm", { PATH: "" }, absentNode), undefined);
+});
+
+test("Node permission flag follows the supported runtime generation", () => {
+  assert.equal(nodePermissionFlag("20.19.0"), "--experimental-permission");
+  assert.equal(nodePermissionFlag("22.0.0"), "--permission");
+  assert.equal(nodePermissionFlag("24.4.1"), "--permission");
+  assert.throws(() => nodePermissionFlag("not-a-version"), /Unsupported Node version/u);
 });

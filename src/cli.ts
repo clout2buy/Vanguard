@@ -4,6 +4,7 @@ import path from "node:path";
 import { createInterface } from "node:readline";
 import type { JournalPort, JsonValue, RunEvent, UserChannelPort, VerifierPort } from "./kernel/contracts.js";
 import type { AgentKernel as AgentKernelType, RunOutcome } from "./kernel/run.js";
+import { nodePermissionFlag, resolveNodePackageManagerAlias } from "./runtime/nodePackageManager.js";
 import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
 import {
   AgentKernel,
@@ -416,7 +417,7 @@ async function buildExecutionRuntime(
   const processTool = new ProcessTool(workspace, {
     allowedCommands: agentAllowedCommands,
     commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess, mutationPolicy.writableAbsoluteRoots(session.workspaceRoot)),
-    deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-experimental-permission"] : [],
+    deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-permission", "--no-experimental-permission"] : [],
     deniedArgumentSubstrings: options.restrictProcess ? ["console.assert"] : [],
     timeoutMs: commandTimeoutMs,
     maxOutputBytes: 2_000_000,
@@ -925,18 +926,19 @@ function commandAliases(
   restricted: boolean,
   writableRoots: readonly string[],
 ): Record<string, { executable: string; argsPrefix: string[] }> {
-  const npmBin = path.join(path.dirname(process.execPath), "node_modules", "npm", "bin");
   const nodePrefix = restricted
     ? [
-        "--experimental-permission",
+        nodePermissionFlag(),
         `--allow-fs-read=${workspaceRoot}`,
         ...writableRoots.map((root) => `--allow-fs-write=${root}`),
       ]
     : [];
+  const npm = resolveNodePackageManagerAlias("npm");
+  const npx = resolveNodePackageManagerAlias("npx");
   return {
     node: { executable: process.execPath, argsPrefix: nodePrefix },
-    npm: { executable: process.execPath, argsPrefix: [path.join(npmBin, "npm-cli.js")] },
-    npx: { executable: process.execPath, argsPrefix: [path.join(npmBin, "npx-cli.js")] },
+    ...(npm === undefined ? {} : { npm: { executable: npm.executable, argsPrefix: [...npm.argsPrefix] } }),
+    ...(npx === undefined ? {} : { npx: { executable: npx.executable, argsPrefix: [...npx.argsPrefix] } }),
   };
 }
 
