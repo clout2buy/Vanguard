@@ -6,5 +6,8 @@ export class MemoryJournal implements JournalPort {
   async append(event: RunEvent): Promise<void> {
     this.events.push(event);
   }
-}
 
+  async readValidated(): Promise<readonly RunEvent[]> {
+    return this.events;
+  }
+}

@@ -542,6 +542,7 @@ export class AgentKernel {
     },
   ): Promise<string | undefined> {
     const allObserve = calls.every((call) => this.#tools.get(call.name)?.definition.effect === "observe");
+    const mutationCalls = calls.filter((call) => this.#tools.get(call.name)?.definition.effect === "mutate");
     const runCall = async (call: ToolCall): Promise<ToolObservation> => {
       const tool = this.#tools.get(call.name);
       if (tool === undefined) {
@@ -553,14 +554,15 @@ export class AgentKernel {
           error: `Tool '${call.name}' is not available before a task contract exists. Use task.execute to begin contracted work.`,
         };
       }
-      // "Substantial" mutation requires a plan: the first narrow edit is
-      // free, but from the second mutation onward the work is multi-step
-      // engineering and must be planned before it continues.
+      // The only plan-free mutation is one genuinely narrow exact-text
+      // replacement. Creates, deletes, overwrites, large replacements, any
+      // second mutation, and multi-mutation batches require a durable plan.
       if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
-        && this.#plan!.isEmpty() && context.completedMutations() >= 1) {
+        && this.#plan!.isEmpty()
+        && (context.completedMutations() > 0 || mutationCalls.length !== 1 || !isNarrowPlanFreeMutation(call))) {
         return {
           callId: call.id, tool: call.name, ok: false,
-          error: "This work has grown beyond a single edit. Materialize an engineering plan with plan.update before mutating further.",
+          error: "This mutation is not one narrow exact-text replacement. Materialize a non-empty engineering plan with plan.update before changing the workspace.",
         };
       }
       try {
@@ -786,6 +788,17 @@ function restoreSession(
 
 function stableFingerprint(name: string, input: JsonValue): string {
   return `${name}:${JSON.stringify(input, objectKeySorter)}`;
+}
+
+function isNarrowPlanFreeMutation(call: ToolCall): boolean {
+  if (call.name !== "workspace.replace" || call.input === null || Array.isArray(call.input)
+    || typeof call.input !== "object") return false;
+  const before = call.input.before;
+  const after = call.input.after;
+  const target = call.input.path;
+  if (typeof target !== "string" || target.length === 0
+    || typeof before !== "string" || before.length === 0 || typeof after !== "string") return false;
+  return Buffer.byteLength(before) + Buffer.byteLength(after) <= 16_384;
 }
 
 function objectKeySorter(_key: string, value: unknown): unknown {

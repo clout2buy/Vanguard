@@ -6,6 +6,7 @@ import test from "node:test";
 import type { CommandRunner } from "../src/index.js";
 import {
   PostEditSyntaxChecker,
+  WorkspaceBoundary,
   buildRepositoryModel,
   delimiterBalance,
 } from "../src/index.js";
@@ -97,57 +98,111 @@ test("delimiter balance catches broken edits and ignores strings and comments", 
 });
 
 test("post-edit syntax checker uses first-party CLIs for deep languages", async () => {
-  const calls: { command: string; args: readonly string[] }[] = [];
+  const root = await scaffold({ "src/a.js": "const x = 1;", "app/main.py": "print(1)" });
+  const calls: { command: string; args: readonly string[]; input?: string }[] = [];
   const okRunner: CommandRunner = {
-    async run(command, args) {
-      calls.push({ command, args });
+    async run(command, args, _cwd, input) {
+      calls.push({ command, args, ...(input === undefined ? {} : { input }) });
       return { exitCode: 0, output: "" };
     },
   };
-  const checker = new PostEditSyntaxChecker(okRunner, "/repo");
-  const js = await checker.check("src/a.js", "const x = 1;");
-  assert.equal(js.ok, true);
-  assert.equal(js.tier, "deep");
-  assert.equal(calls[0]?.command, "node");
-  assert.deepEqual(calls[0]?.args, ["--check", path.join("/repo", "src/a.js")]);
+  try {
+    const checker = new PostEditSyntaxChecker(okRunner, new WorkspaceBoundary(root));
+    const js = await checker.check("src/a.js");
+    assert.equal(js.status, "passed");
+    assert.equal(js.tier, "deep");
+    assert.equal(calls[0]?.command, "node");
+    assert.deepEqual(calls[0]?.args, ["--check", path.join(root, "src/a.js")]);
 
-  const py = await checker.check("app/main.py", "print(1)");
-  assert.equal(py.language, "Python");
-  assert.equal(calls[1]?.command, "python");
+    const py = await checker.check("app/main.py");
+    assert.equal(py.language, "Python");
+    assert.equal(calls[1]?.command, "python");
+    assert.equal(calls[1]?.input, "print(1)");
+    assert.equal(calls[1]?.args.includes(path.join(root, "app/main.py")), false,
+      "Python syntax checks must parse stdin, never py_compile a workspace path");
+    assert.match(js.contentSha256, /^[a-f0-9]{64}$/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("post-edit syntax checker reports a real CLI failure honestly", async () => {
+  const root = await scaffold({ "src/broken.js": "const x = ;" });
   const failRunner: CommandRunner = {
     async run() { return { exitCode: 1, output: "SyntaxError: unexpected token" }; },
   };
-  const checker = new PostEditSyntaxChecker(failRunner, "/repo");
-  const result = await checker.check("src/broken.js", "const x = ;");
-  assert.equal(result.ok, false);
-  assert.match(result.detail, /SyntaxError/);
+  try {
+    const checker = new PostEditSyntaxChecker(failRunner, new WorkspaceBoundary(root));
+    const result = await checker.check("src/broken.js");
+    assert.equal(result.status, "failed");
+    assert.match(result.detail, /SyntaxError/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("post-edit syntax checker falls back to structural check when the toolchain is missing", async () => {
+  const root = await scaffold({
+    "src/a.js": "const x = () => 1;",
+    "src/broken.js": "const x = () => 1;   {{{",
+  });
   const missingRunner: CommandRunner = {
     async run() { throw new Error("spawn ENOENT"); },
   };
-  const checker = new PostEditSyntaxChecker(missingRunner, "/repo");
-  const balanced = await checker.check("src/a.js", "const x = () => 1;");
-  assert.equal(balanced.ok, true, "a missing toolchain must not report a false failure");
-  const broken = await checker.check("src/a.js", "const x = () => 1;   {{{");
-  assert.equal(broken.ok, false);
+  try {
+    const checker = new PostEditSyntaxChecker(missingRunner, new WorkspaceBoundary(root));
+    const balanced = await checker.check("src/a.js");
+    assert.equal(balanced.status, "inconclusive", "a missing parser must not report a false pass");
+    const broken = await checker.check("src/broken.js");
+    assert.equal(broken.status, "failed");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("TypeScript uses the structural rung and generic languages get a structural check too", async () => {
+  const root = await scaffold({
+    "src/a.ts": "export const x: number = 1;",
+    "Main.java": "class Main { }",
+    "notes.txt": "anything at all (",
+  });
   const runner: CommandRunner = { async run() { return { exitCode: 0, output: "" }; } };
-  const checker = new PostEditSyntaxChecker(runner, "/repo");
-  const ts = await checker.check("src/a.ts", "export const x: number = 1;");
-  assert.equal(ts.language, "TypeScript");
-  assert.equal(ts.tier, "deep");
-  assert.equal(ts.ok, true);
-  const java = await checker.check("Main.java", "class Main { }");
-  assert.equal(java.tier, "generic");
-  assert.equal(java.ok, true);
-  const unknownType = await checker.check("notes.txt", "anything at all (");
-  assert.equal(unknownType.ok, true, "unknown file types get no syntax gate");
-  assert.equal(unknownType.tier, "unknown");
+  try {
+    const checker = new PostEditSyntaxChecker(runner, new WorkspaceBoundary(root));
+    const ts = await checker.check("src/a.ts");
+    assert.equal(ts.language, "TypeScript");
+    assert.equal(ts.tier, "deep");
+    assert.equal(ts.status, "inconclusive");
+    const java = await checker.check("Main.java");
+    assert.equal(java.tier, "generic");
+    assert.equal(java.status, "inconclusive");
+    const unknownType = await checker.check("notes.txt");
+    assert.equal(unknownType.status, "inconclusive", "unknown file types cannot claim syntax validity");
+    assert.equal(unknownType.tier, "unknown");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("syntax checks reject traversal and never accept hypothetical model contents", async () => {
+  const root = await scaffold({ "actual.py": "def broken(:\n    pass\n" });
+  const outside = await scaffold({ "outside.py": "print('safe')\n" });
+  const calls: { input?: string }[] = [];
+  const runner: CommandRunner = {
+    async run(_command, _args, _cwd, input) {
+      calls.push({ ...(input === undefined ? {} : { input }) });
+      return { exitCode: 1, output: "SyntaxError" };
+    },
+  };
+  try {
+    const checker = new PostEditSyntaxChecker(runner, new WorkspaceBoundary(root));
+    await assert.rejects(() => checker.check(path.relative(root, path.join(outside, "outside.py"))), /escapes workspace/i);
+    const result = await checker.check("actual.py");
+    assert.equal(result.status, "failed");
+    assert.equal(calls[0]?.input, "def broken(:\n    pass\n",
+      "the checker must read the workspace file rather than model-provided text");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
 });

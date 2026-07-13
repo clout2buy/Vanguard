@@ -32,10 +32,10 @@ test("a 500-turn journal stays within the context budget", () => {
   // The task and an elided-history marker both survive.
   assert.ok(selected.some((entry) => entry.role === "task"));
   assert.ok(selected.some((entry) => entry.role === "user"
-    && String(entry.content).includes("elided history")));
+    && String(entry.content).includes("bounded history digest")));
 });
 
-test("the stable prefix never churns and the digest only grows by suffix", () => {
+test("the cacheable task prefix stays stable while bounded digest generations reset explicitly", () => {
   const policy = new StickyContextPolicy();
   const codec = new OpenAIChatCompletionsCodec("m");
   const budget = 30_000;
@@ -45,31 +45,59 @@ test("the stable prefix never churns and the digest only grows by suffix", () =>
       task: "t", mode: "execution", transcript: selected, tools: [], remainingSteps: 1, workingState: null,
     }) as { messages: { role: string; content: JsonValue }[] };
     const digestMessage = encoded.messages.find((message) => message.role === "user"
-      && String(message.content).includes("elided history"));
+      && String(message.content).includes("bounded history digest"));
     return {
       system: JSON.stringify(encoded.messages[0]),
       task: JSON.stringify(encoded.messages[1]),
       digest: String(digestMessage?.content ?? ""),
     };
   };
-  // Across a wide sweep the system and task prefix bytes must never change,
-  // and the elided-history digest must grow only by appending (its existing
-  // content is never rewritten), so provider prefix caches survive.
+  // System/task bytes remain cacheable. Digest generations may reset as the
+  // bounded window advances, but each generation is deterministic and small.
   const systems = new Set<string>();
   const tasks = new Set<string>();
-  let previousDigest = "";
+  const digests = new Map<number, string>();
   for (let turns = 150; turns <= 220; turns += 5) {
     const { system, task, digest } = parts(turns);
     systems.add(system);
     tasks.add(task);
-    if (previousDigest.length > 0 && digest.length >= previousDigest.length) {
-      assert.ok(digest.startsWith(previousDigest),
-        `digest at ${turns} turns rewrote earlier content instead of appending`);
-    }
-    previousDigest = digest.length >= previousDigest.length ? digest : previousDigest;
+    assert.ok(Buffer.byteLength(digest) < 5_000, `digest at ${turns} turns grew without bound`);
+    digests.set(turns, digest);
   }
   assert.equal(systems.size, 1, "the system prompt must be byte-stable across all turns");
   assert.equal(tasks.size, 1, "the task message must be byte-stable across all turns");
+  for (const [turns, digest] of digests) assert.equal(parts(turns).digest, digest,
+    `digest generation at ${turns} must reconstruct byte-identically`);
+});
+
+test("thousands of huge events can never overflow the selected byte budget", () => {
+  const policy = new StickyContextPolicy();
+  const userHeavy: TranscriptEntry[] = [{ role: "task", content: "t" }];
+  for (let index = 0; index < 500; index += 1) {
+    userHeavy.push({ role: "user", content: `correction-${index}: ${"u".repeat(8_000)}` });
+  }
+  const selectedUsers = policy.select("t", userHeavy, 20_000);
+  assert.ok(Buffer.byteLength(JSON.stringify(selectedUsers)) <= 20_000);
+  assert.equal(selectedUsers.at(-1)?.content, userHeavy.at(-1)?.content,
+    "the latest correction is irreducible");
+
+  const toolHeavy: TranscriptEntry[] = [{ role: "task", content: "t" }];
+  for (let index = 0; index < 2_000; index += 1) {
+    toolHeavy.push(
+      { role: "decision", content: { kind: "tools", calls: [{ id: `h${index}`, name: "workspace.read", input: { path: `f${index}`, noise: "i".repeat(5_000) } }] } },
+      { role: "observation", content: { callId: `h${index}`, tool: "workspace.read", ok: true, output: { contents: "o".repeat(20_000) } } },
+    );
+  }
+  const selectedTools = policy.select("t", toolHeavy, 25_000);
+  assert.ok(Buffer.byteLength(JSON.stringify(selectedTools)) <= 25_000);
+});
+
+test("an irreducible latest correction fails explicitly instead of violating the budget", () => {
+  const policy = new StickyContextPolicy();
+  assert.throws(() => policy.select("t", [
+    { role: "task", content: "t" },
+    { role: "user", content: "x".repeat(20_000) },
+  ], 10_000), /Irreducible context requires/);
 });
 
 test("no boundary placement produces an orphan tool call in the codec", () => {

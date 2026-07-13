@@ -1,13 +1,22 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { LANGUAGE_PROFILES, type SupportTier } from "./repositoryModel.js";
+import { WorkspaceBoundary } from "./workspace.js";
+
+export type SyntaxCheckStatus = "passed" | "failed" | "inconclusive";
 
 export interface SyntaxCheckResult {
+  readonly status: SyntaxCheckStatus;
+  /** Backward-compatible convenience: only a proven failure is false. */
   readonly ok: boolean;
   readonly tier: SupportTier | "unknown";
   readonly language: string;
   readonly detail: string;
+  /** Hash of the exact workspace bytes that were checked. */
+  readonly contentSha256: string;
 }
 
 /**
@@ -15,7 +24,12 @@ export interface SyntaxCheckResult {
  * so the progressive-verification ladder is testable without real toolchains.
  */
 export interface CommandRunner {
-  run(command: string, args: readonly string[], cwd: string): Promise<{ exitCode: number; output: string }>;
+  run(
+    command: string,
+    args: readonly string[],
+    cwd: string,
+    input?: string,
+  ): Promise<{ exitCode: number; output: string }>;
 }
 
 interface SyntaxStrategy {
@@ -23,7 +37,7 @@ interface SyntaxStrategy {
   readonly tier: SupportTier;
   readonly extensions: readonly string[];
   /** Builds the syntax-only check command for a file, or null if unsupported. */
-  command(file: string): { command: string; args: readonly string[] } | null;
+  command(file: string, contents: string): { command: string; args: readonly string[]; input?: string } | null;
 }
 
 /**
@@ -42,7 +56,13 @@ const SYNTAX_STRATEGIES: readonly SyntaxStrategy[] = [
     language: "Python",
     tier: "deep",
     extensions: [".py", ".pyi"],
-    command: (file) => ({ command: "python", args: ["-m", "py_compile", file] }),
+    // Parse stdin in-memory. `py_compile` writes __pycache__ beside its target,
+    // which is an unacceptable side effect for an observe-only tool.
+    command: (_file, contents) => ({
+      command: "python",
+      args: ["-c", "import ast,sys; ast.parse(sys.stdin.read(), filename='<vanguard-workspace>')"],
+      input: contents,
+    }),
   },
   {
     language: "Go",
@@ -84,47 +104,73 @@ const EXTENSION_TO_STRATEGY = new Map<string, SyntaxStrategy>(
 export class PostEditSyntaxChecker {
   constructor(
     private readonly runner: CommandRunner,
-    private readonly root: string,
+    private readonly workspace: WorkspaceBoundary,
   ) {}
 
-  async check(relativeFile: string, contents: string): Promise<SyntaxCheckResult> {
+  async check(relativeFile: string): Promise<SyntaxCheckResult> {
+    // `existing` resolves symlinks/junctions and proves containment before the
+    // file path reaches a parser process.
+    const absoluteFile = await this.workspace.existing(relativeFile);
+    const contents = await readFile(absoluteFile, "utf8");
+    const contentSha256 = createHash("sha256").update(contents).digest("hex");
     const extension = path.extname(relativeFile).toLowerCase();
     const strategy = EXTENSION_TO_STRATEGY.get(extension);
     const profile = LANGUAGE_PROFILES.find((candidate) => candidate.extensions.includes(extension));
 
     if (strategy !== undefined) {
-      const spec = strategy.command(path.join(this.root, relativeFile));
+      const spec = strategy.command(absoluteFile, contents);
       if (spec !== null) {
         try {
-          const result = await this.runner.run(spec.command, spec.args, this.root);
+          const result = await this.runner.run(spec.command, spec.args, this.workspace.root, spec.input);
+          const status: SyntaxCheckStatus = result.exitCode === 0 ? "passed" : "failed";
           return {
-            ok: result.exitCode === 0,
+            status,
+            ok: status !== "failed",
             tier: strategy.tier,
             language: strategy.language,
             detail: result.exitCode === 0 ? "syntax ok" : truncate(result.output),
+            contentSha256,
           };
         } catch (error) {
-          // The toolchain is unavailable; fall back to the structural check
-          // rather than reporting a spurious failure.
-          return this.structural(relativeFile, contents, strategy.language, strategy.tier);
+          // A missing parser cannot prove validity. The structural fallback
+          // may still prove a broken delimiter/string, otherwise it is
+          // explicitly inconclusive.
+          return this.structural(relativeFile, contents, strategy.language, strategy.tier, contentSha256);
         }
       }
-      return this.structural(relativeFile, contents, strategy.language, strategy.tier);
+      return this.structural(relativeFile, contents, strategy.language, strategy.tier, contentSha256);
     }
 
     if (profile !== undefined) {
-      return this.structural(relativeFile, contents, profile.language, profile.tier);
+      return this.structural(relativeFile, contents, profile.language, profile.tier, contentSha256);
     }
-    return { ok: true, tier: "unknown", language: "unknown", detail: "no syntax check for this file type" };
+    return {
+      status: "inconclusive",
+      ok: true,
+      tier: "unknown",
+      language: "unknown",
+      detail: "no syntax parser for this file type",
+      contentSha256,
+    };
   }
 
-  private structural(file: string, contents: string, language: string, tier: SupportTier): SyntaxCheckResult {
+  private structural(
+    file: string,
+    contents: string,
+    language: string,
+    tier: SupportTier,
+    contentSha256: string,
+  ): SyntaxCheckResult {
     const balance = delimiterBalance(contents);
     return {
+      status: balance.ok ? "inconclusive" : "failed",
       ok: balance.ok,
       tier,
       language,
-      detail: balance.ok ? "balanced delimiters" : `unbalanced ${balance.detail} in ${file}`,
+      detail: balance.ok
+        ? "delimiter scan found no obvious truncation; no parser proof is available"
+        : `unbalanced ${balance.detail} in ${file}`,
+      contentSha256,
     };
   }
 }
@@ -186,9 +232,8 @@ export class SyntaxCheckTool implements ToolPort {
       type: "object",
       properties: {
         path: { type: "string", description: "Workspace-relative path of the file to check." },
-        contents: { type: "string", description: "The current file contents to check." },
       },
-      required: ["path", "contents"],
+      required: ["path"],
       additionalProperties: false,
     },
     effect: "observe",
@@ -201,11 +246,10 @@ export class SyntaxCheckTool implements ToolPort {
       throw new Error("Syntax check input must be an object.");
     }
     const file = input.path;
-    const contents = input.contents;
-    if (typeof file !== "string" || typeof contents !== "string") {
-      throw new Error("Syntax check requires string 'path' and 'contents'.");
+    if (typeof file !== "string") {
+      throw new Error("Syntax check requires string 'path'.");
     }
-    const result = await this.checker.check(file, contents);
+    const result = await this.checker.check(file);
     return { ok: result.ok, output: result as unknown as JsonValue };
   }
 }
@@ -225,16 +269,31 @@ export class SyntaxCommandRunner implements CommandRunner {
 
   constructor(private readonly timeoutMs = 15_000) {}
 
-  async run(command: string, args: readonly string[], cwd: string): Promise<{ exitCode: number; output: string }> {
+  async run(
+    command: string,
+    args: readonly string[],
+    cwd: string,
+    input?: string,
+  ): Promise<{ exitCode: number; output: string }> {
     if (!SyntaxCommandRunner.ALLOWED.has(command)) {
       throw new Error(`Syntax runner refuses non-allowlisted command: ${command}`);
     }
     return new Promise((resolve, reject) => {
       const child = spawn(command, [...args], { cwd, windowsHide: true, shell: false });
       let output = "";
-      const capture = (chunk: Buffer): void => { output += chunk.toString("utf8").slice(0, 8_000); };
+      let capturedBytes = 0;
+      const maxOutputBytes = 8_000;
+      const capture = (chunk: Buffer): void => {
+        if (capturedBytes >= maxOutputBytes) return;
+        const remaining = maxOutputBytes - capturedBytes;
+        const slice = chunk.subarray(0, remaining);
+        output += slice.toString("utf8");
+        capturedBytes += slice.length;
+      };
       child.stdout.on("data", capture);
       child.stderr.on("data", capture);
+      if (input === undefined) child.stdin.end();
+      else child.stdin.end(input, "utf8");
       const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("syntax check timed out")); }, this.timeoutMs);
       timer.unref();
       child.once("error", (error) => { clearTimeout(timer); reject(error); });

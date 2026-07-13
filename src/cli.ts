@@ -13,6 +13,7 @@ import {
   FileJournal,
   HttpModelAdapter,
   ImageInspectionTool,
+  JournalEvidenceResolver,
   ListFilesTool,
   ProcessTool,
   ReadFileTool,
@@ -35,6 +36,8 @@ import {
   analyzePatch,
   scoreExecutionQuality,
   classifyOutcome,
+  contractCriterionIds,
+  normalizeContract,
   openCodingSession,
   FixedCommandTool,
   PlanLedger,
@@ -335,7 +338,19 @@ async function buildExecutionRuntime(
   }
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const checkpoint = await RunCheckpointLedger.open(path.join(container, "checkpoint.json"));
-  const plan = await PlanLedger.open(path.join(container, "plan.json"));
+  const priorEvents = await fileJournal.readValidated();
+  const contractedEvent = [...priorEvents].reverse().find((event) => event.type === "run.contracted");
+  const contractedData = contractedEvent?.data;
+  const contract = contractedData !== null && contractedData !== undefined
+    && typeof contractedData === "object" && !Array.isArray(contractedData)
+    ? normalizeContract(contractedData.contract)
+    : undefined;
+  const evidenceResolver = new JournalEvidenceResolver(fileJournal);
+  const plan = await PlanLedger.open(
+    path.join(container, "plan.json"),
+    contract === undefined ? [] : contractCriterionIds(contract),
+    evidenceResolver,
+  );
   const usage = new UsageLedger(options.model);
   // Both durable states ride into every request as runtime-owned context.
   const workingState = {
@@ -357,9 +372,9 @@ async function buildExecutionRuntime(
       new ReviewChangesTool(session.sourceRoot, session.workspaceRoot),
       new ImageInspectionTool(workspace),
       new RepositoryMapTool(workspace),
-      new SyntaxCheckTool(new PostEditSyntaxChecker(new SyntaxCommandRunner(), session.workspaceRoot)),
+      new SyntaxCheckTool(new PostEditSyntaxChecker(new SyntaxCommandRunner(), workspace)),
       new CheckpointTool(checkpoint),
-      new PlanTool(plan),
+      new PlanTool(plan, evidenceResolver),
       ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
       ...(options.exposeRawProcess ? [processTool] : []),
     ],
