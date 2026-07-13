@@ -11,7 +11,7 @@ holdout is supplied and all runs and reviews finish, the only valid status is
 The planning draft in `evaluation/certification-program.json` targets 192
 never-run tasks across at least 24 independently sourced repository groups,
 four engines, and three repetitions: 2,304 executions. The external evaluator
-must replace the draft with a schema-v2 `CertificationManifest` before any
+must replace the draft with a schema-v3 `CertificationManifest` before any
 candidate sees a holdout.
 
 The freeze binds all outcome-relevant settings:
