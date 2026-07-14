@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import {
   link,
   lstat,
@@ -628,10 +629,11 @@ async function removePublishedAliases(file: string): Promise<void> {
     if (!name.startsWith(prefix) || !name.endsWith(".tmp")) continue;
     const candidate = path.join(directory, name);
     try {
-      const metadata = await lstat(candidate, { bigint: true });
+      const metadata = await lstatAfterWindowsDeleteRace(candidate);
+      if (metadata === undefined) continue;
       if (metadata.isFile() && !metadata.isSymbolicLink()
         && metadata.dev === target.dev && metadata.ino === target.ino) {
-        await rm(candidate, { force: true });
+        await removeAfterWindowsDeleteRace(candidate);
         removed = true;
       }
     } catch (error) {
@@ -639,6 +641,48 @@ async function removePublishedAliases(file: string): Promise<void> {
     }
   }
   if (removed) await syncDirectoryBestEffort(directory);
+}
+
+/**
+ * Windows can transiently report EPERM/EACCES while another store instance is
+ * unlinking the same hard-link alias. Retry only this narrow temp-file race;
+ * a persistent denial still fails closed instead of hiding an alias.
+ */
+async function lstatAfterWindowsDeleteRace(file: string): Promise<BigIntStats | undefined> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      return await lstat(file, { bigint: true });
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      if (!isTransientWindowsDeleteRace(error)) throw error;
+      lastError = error;
+      await briefDeleteRaceBackoff(attempt);
+    }
+  }
+  throw lastError;
+}
+
+async function removeAfterWindowsDeleteRace(file: string): Promise<void> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(file, { force: true });
+      return;
+    } catch (error) {
+      if (isMissing(error)) return;
+      if (!isTransientWindowsDeleteRace(error)) throw error;
+      lastError = error;
+      await briefDeleteRaceBackoff(attempt);
+    }
+  }
+  const remaining = await lstatAfterWindowsDeleteRace(file);
+  if (remaining === undefined) return;
+  throw lastError;
+}
+
+async function briefDeleteRaceBackoff(attempt: number): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, 1 << attempt));
 }
 
 async function assertRealDirectory(directory: string, label: string): Promise<void> {
@@ -814,6 +858,11 @@ function isMissing(error: unknown): boolean {
 
 function isAlreadyExists(error: unknown): boolean {
   return error instanceof Error && "code" in error && ["EEXIST", "ENOTEMPTY", "EPERM"].includes(String(error.code));
+}
+
+function isTransientWindowsDeleteRace(error: unknown): boolean {
+  return process.platform === "win32" && error instanceof Error && "code" in error
+    && ["EACCES", "EPERM"].includes(String(error.code));
 }
 
 function isUnsupportedDirectorySync(error: unknown): boolean {

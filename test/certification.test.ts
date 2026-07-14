@@ -383,7 +383,8 @@ test("blinding separates artifacts, binds every field, and requires evaluator au
   assert.doesNotThrow(() => validateAssignmentArtifacts(frozen, one.publicArtifact, one.privateArtifact, authority));
   const tampered = structuredClone(one.publicArtifact);
   const first = tampered.assignments[0]!;
-  (tampered.assignments as PublicAssignment[])[0] = { ...first, taskId: frozen.tasks[1]!.id };
+  const differentTask = frozen.tasks.find((task) => task.id !== first.taskId)!;
+  (tampered.assignments as PublicAssignment[])[0] = { ...first, taskId: differentTask.id };
   assert.throws(() => validateAssignmentArtifacts(frozen, tampered, one.privateArtifact, authority), /binding mismatch/);
   const leaking = structuredClone(one.publicArtifact) as unknown as { assignments: Array<Record<string, unknown>> };
   leaking.assignments[0]!.engineHint = "vanguard";
