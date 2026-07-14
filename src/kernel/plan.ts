@@ -8,11 +8,14 @@ import type {
   TaskContract,
   ToolContext,
   ToolDefinition,
+  ToolEvidenceAuthority,
   ToolPort,
   ToolResult,
 } from "./contracts.js";
 import { PLAN_TOOL_NAME } from "./contracts.js";
 import { durableStateSha256, type DurableStateAnchorRequirement } from "./durableState.js";
+import { journalWorkspaceGeneration, validWorkspaceGeneration } from "./evidenceAuthority.js";
+import { logicalRunEvents } from "./logicalHistory.js";
 
 export type MilestoneStatus = "pending" | "active" | "blocked" | "proven" | "invalidated";
 export type EvidenceKind = "tool" | "verification" | "user";
@@ -21,6 +24,9 @@ export type EvidenceKind = "tool" | "verification" | "user";
 export interface EvidenceClaim {
   readonly kind: EvidenceKind;
   readonly sequence?: number;
+  /** Runtime-owned journal handle preferred for fresh tool citations. */
+  readonly evidenceId?: string;
+  /** Provider continuation id retained for old journals and legacy models. */
   readonly callId?: string;
   readonly tool?: string;
   readonly verifier?: string;
@@ -31,6 +37,10 @@ export interface EvidenceClaim {
 export interface EvidenceRef extends EvidenceClaim {
   readonly sequence: number;
   readonly sha256: string;
+  /** Runtime-derived authority; model-supplied copies are never accepted. */
+  readonly evidenceAuthority?: ToolEvidenceAuthority;
+  /** Candidate-workspace epoch in which executable evidence was produced. */
+  readonly workspaceGeneration?: number;
 }
 
 export interface PlanInvalidation {
@@ -68,6 +78,8 @@ export interface PlanState {
 
 export interface EvidenceResolverPort {
   resolve(claim: EvidenceClaim): Promise<EvidenceRef | undefined>;
+  /** Revalidate an exact persisted reference without requiring it to be fresh. */
+  revalidate?(reference: EvidenceRef): Promise<EvidenceRef | undefined>;
 }
 
 interface JournalReader {
@@ -79,28 +91,83 @@ export class JournalEvidenceResolver implements EvidenceResolverPort {
   constructor(private readonly journal: JournalReader) {}
 
   async resolve(claim: EvidenceClaim): Promise<EvidenceRef | undefined> {
-    const events = await this.journal.readValidated();
+    return this.#resolve(claim, true);
+  }
+
+  async revalidate(reference: EvidenceRef): Promise<EvidenceRef | undefined> {
+    return this.#resolve(reference, false);
+  }
+
+  async #resolve(claim: EvidenceClaim, requireCurrent: boolean): Promise<EvidenceRef | undefined> {
+    const auditEvents = await this.journal.readValidated();
+    // Restores retain abandoned events for audit, never for authority. Only
+    // the checkpoint branch plus the current restore epoch may supply proof
+    // or user authorization; workspace generations remain monotonic over the
+    // full audit journal so the restore still stales older proof.
+    const events = logicalRunEvents(auditEvents);
     const latestUser = [...events].reverse().find((event) => event.type === "user.message");
+    if (claim.kind === "tool") {
+      let event: RunEvent | undefined;
+      if (claim.sequence !== undefined) {
+        // Persisted references are revalidated against their one exact event.
+        // A later reuse of either provider callId cannot redirect the binding.
+        const exactSequence = events.find((candidate) => candidate.sequence === claim.sequence);
+        if (exactSequence === undefined) return undefined;
+        const data = eligibleToolData(exactSequence, auditEvents, requireCurrent);
+        if (data === undefined) return undefined;
+        if (claim.evidenceId !== undefined && data.evidenceId !== claim.evidenceId) return undefined;
+        if (claim.callId !== undefined && data.callId !== claim.callId) return undefined;
+        event = exactSequence;
+      } else if (typeof claim.evidenceId === "string") {
+        const matches = events.filter((candidate) =>
+          eligibleToolData(candidate, auditEvents, requireCurrent)?.evidenceId === claim.evidenceId);
+        if (matches.length !== 1) return undefined;
+        event = matches[0];
+      } else if (typeof claim.callId === "string") {
+        // Compatibility for pre-evidenceId journals/models. Resolve the latest
+        // terminal occurrence, rather than permanently freezing a provider id
+        // after it is reused. A latest failure cannot fall back to an older
+        // success under the same id.
+        const terminal = [...events].reverse().find((candidate) => {
+          if (candidate.type !== "tool.completed" && candidate.type !== "tool.failed") return false;
+          return record(candidate.data)?.callId === claim.callId;
+        });
+        if (terminal === undefined || eligibleToolData(terminal, auditEvents, requireCurrent) === undefined) return undefined;
+        event = terminal;
+      } else {
+        return undefined;
+      }
+      if (event === undefined) return undefined;
+      const data = eligibleToolData(event, auditEvents, requireCurrent);
+      if (data === undefined) return undefined;
+      return canonicalEvidence({
+        kind: "tool",
+        ...(typeof data.evidenceId === "string" ? { evidenceId: data.evidenceId } : {}),
+        callId: data.callId as string,
+        tool: data.tool as string,
+        evidenceAuthority: data.evidenceAuthority as ToolEvidenceAuthority,
+        workspaceGeneration: data.workspaceGeneration as number,
+      }, event);
+    }
     const candidates = claim.sequence === undefined
       ? [...events].reverse()
       : events.filter((event) => event.sequence === claim.sequence);
     for (const event of candidates) {
       const data = record(event.data);
-      if (claim.kind === "tool") {
-        if (event.type !== "tool.completed" || data?.ok === false) continue;
-        if (typeof claim.callId !== "string" || data?.callId !== claim.callId) continue;
-        if (typeof claim.tool !== "string" || data?.tool !== claim.tool) continue;
-        return canonicalEvidence(claim, event);
-      }
       if (claim.kind === "verification") {
         if (event.type !== "verification.completed" || data?.passed !== true) continue;
         if (typeof claim.verifier !== "string" || data?.verifier !== claim.verifier) continue;
-        return canonicalEvidence(claim, event);
+        const workspaceGeneration = eligibleWorkspaceGeneration(event, auditEvents, requireCurrent);
+        if (workspaceGeneration === undefined) continue;
+        return canonicalEvidence({ ...claim, workspaceGeneration }, event);
       }
       if (claim.kind === "user") {
-        // Requirement invalidation is authorized only by the most recent
-        // exact user message, not by an arbitrary old conversation fragment.
-        if (event !== latestUser || typeof claim.exactText !== "string") continue;
+        if (event.type !== "user.message") continue;
+        // A fresh invalidation is authorized only by the latest exact user
+        // message at revision time. A persisted reference carries a sequence,
+        // so later steering cannot retroactively invalidate the committed plan.
+        if (claim.sequence === undefined && event !== latestUser) continue;
+        if (typeof claim.exactText !== "string") continue;
         if (record(event.data)?.text !== claim.exactText) continue;
         return canonicalEvidence(claim, event) as EvidenceRef & { kind: "user" };
       }
@@ -110,6 +177,11 @@ export class JournalEvidenceResolver implements EvidenceResolverPort {
 }
 
 const MILESTONE_STATUSES: readonly MilestoneStatus[] = ["pending", "active", "blocked", "proven", "invalidated"];
+const PLAN_INVALIDATION_APPROVAL_PREFIX = "VANGUARD_PLAN_INVALIDATION_APPROVAL ";
+
+function planInvalidationApprovalText(milestoneId: string, supersededBy: string): string {
+  return `${PLAN_INVALIDATION_APPROVAL_PREFIX}${JSON.stringify({ milestoneId, supersededBy })}`;
+}
 
 export function contractCriterionIds(contract: TaskContract): readonly string[] {
   return [
@@ -124,11 +196,18 @@ export class PlanLedger implements PlanStatusPort {
   #state: PlanState | undefined;
   readonly #file: string | undefined;
   readonly #requiredCriteria: readonly string[];
+  #evidenceResolver: EvidenceResolverPort | undefined;
 
-  constructor(initial?: PlanState, file?: string, requiredCriteria: readonly string[] = []) {
+  constructor(
+    initial?: PlanState,
+    file?: string,
+    requiredCriteria: readonly string[] = [],
+    evidenceResolver?: EvidenceResolverPort,
+  ) {
     this.#state = initial;
     this.#file = file;
     this.#requiredCriteria = initial?.requiredCriteria ?? uniqueStrings(requiredCriteria, "required criteria", 100);
+    this.#evidenceResolver = evidenceResolver;
   }
 
   static async open(
@@ -154,11 +233,11 @@ export class PlanLedger implements PlanStatusPort {
       if (requested.length > 0 && JSON.stringify(requested) !== JSON.stringify(state.requiredCriteria)) {
         throw new Error("Persisted plan criterion IDs do not match the contracted task.");
       }
-      return new PlanLedger(state, absolute);
+      return new PlanLedger(state, absolute, state.requiredCriteria, evidenceResolver);
     } catch (error) {
       if (!isMissing(error)) throw error;
       if (anchor?.expectedSha256 !== undefined) throw new Error("Committed plan state is missing from disk.");
-      return new PlanLedger(undefined, absolute, requiredCriteria);
+      return new PlanLedger(undefined, absolute, requiredCriteria, evidenceResolver);
     }
   }
 
@@ -171,6 +250,34 @@ export class PlanLedger implements PlanStatusPort {
     return this.#state.milestones
       .filter((milestone) => milestone.status !== "proven" && milestone.status !== "invalidated")
       .map((milestone) => `${milestone.id} — ${milestone.title}`);
+  }
+
+  /**
+   * Keep authentic historical proof auditable after a mutation/restore, but
+   * fail completion closed until every proven milestone is refreshed in the
+   * current workspace generation.
+   */
+  async evidenceBlockers(): Promise<readonly string[]> {
+    if (this.#state === undefined || this.#evidenceResolver === undefined) return [];
+    const blockers: string[] = [];
+    for (const milestone of this.#state.milestones) {
+      if (milestone.status !== "proven") continue;
+      let current = true;
+      for (const reference of milestone.evidence) {
+        if (reference.kind !== "tool" && reference.kind !== "verification") continue;
+        const resolved = await this.#evidenceResolver.resolve(reference);
+        if (resolved === undefined || !sameEvidence(reference, resolved)) {
+          current = false;
+          break;
+        }
+      }
+      if (!current) blockers.push(`${milestone.id} - ${milestone.title}`);
+    }
+    return blockers;
+  }
+
+  attachEvidenceResolver(resolver: EvidenceResolverPort | undefined): void {
+    if (resolver !== undefined) this.#evidenceResolver = resolver;
   }
 
   requiredCriteria(): readonly string[] {
@@ -215,6 +322,7 @@ export class PlanLedger implements PlanStatusPort {
       milestones,
       history,
     };
+    validateNewInvalidationTransitions(this.#state, next);
     validatePlanState(next);
     validateRevision(this.#state, next);
     if (this.#file !== undefined) await atomicJsonWrite(this.#file, next);
@@ -231,10 +339,11 @@ export class PlanTool implements ToolPort {
     private readonly ledger: PlanLedger,
     private readonly evidenceResolver?: EvidenceResolverPort,
   ) {
+    ledger.attachEvidenceResolver(evidenceResolver);
     const criteria = ledger.requiredCriteria();
     this.definition = {
       name: this.name,
-      description: "Establish or revise the durable engineering plan. Revisions are monotonic: never delete or weaken a milestone. Proven milestones require runtime-bound successful tool/verifier evidence. Invalidations require the latest exact user message and a superseding milestone."
+      description: "Establish or revise the durable engineering plan. Revisions are monotonic: never delete or weaken a milestone. Proven milestones require fresh runtime-authorized independent execution/review or sealed-verifier evidence; reads, writes, state tools, and unmarked execute tools cannot prove work. Cite an eligible successful tool result with exactly {\"kind\":\"tool\",\"evidenceId\":\"<observation evidenceId>\"}; Vanguard derives its provider call id, tool, authority, workspace generation, journal sequence, and hash. Legacy callId-only citations remain supported. Never invent runtime fields or copy output text. Initial plans cannot contain invalidations. A later invalidation requires the latest user message to be exactly `VANGUARD_PLAN_INVALIDATION_APPROVAL {\"milestoneId\":\"<invalidated-id>\",\"supersededBy\":\"<superseding-id>\"}`. The non-invalidated superseder must inherit every acceptance criterion and contract criterion, and must remain unproven in that revision until later executable proof."
         + (criteria.length === 0 ? "" : ` Contract criterion IDs that must be covered exactly: ${criteria.join(", ")}.`),
       inputSchema: {
         type: "object",
@@ -290,12 +399,13 @@ export class PlanTool implements ToolPort {
     const milestones: PlanMilestone[] = [];
     for (const draft of drafts) {
       const evidence = await this.#resolveAll(draft.evidence, draft.id);
+      const priorMilestone = this.ledger.state()?.milestones.find((milestone) => milestone.id === draft.id);
       const invalidation = draft.invalidation === undefined
         ? undefined
         : {
             reason: draft.invalidation.reason,
             supersededBy: draft.invalidation.supersededBy,
-            evidence: await this.#resolveUser(draft.invalidation.evidence, draft.id),
+            evidence: await this.#resolveInvalidationEvidence(draft, priorMilestone),
           };
       const { evidence: _claims, invalidation: _invalidationClaim, ...base } = draft;
       milestones.push({
@@ -316,23 +426,51 @@ export class PlanTool implements ToolPort {
     };
   }
 
+  async #resolveInvalidationEvidence(
+    draft: MilestoneDraft,
+    prior: PlanMilestone | undefined,
+  ): Promise<EvidenceRef & { kind: "user" }> {
+    const invalidation = draft.invalidation!;
+    const carried = prior?.status === "invalidated" ? prior.invalidation : undefined;
+    if (carried !== undefined
+      && invalidation.reason === carried.reason
+      && invalidation.supersededBy === carried.supersededBy
+      && invalidation.evidence.kind === "user"
+      && invalidation.evidence.exactText === carried.evidence.exactText) {
+      const revalidated = await this.evidenceResolver?.resolve(carried.evidence);
+      if (revalidated?.kind !== "user" || !sameEvidence(carried.evidence, revalidated)) {
+        throw new Error(`Milestone '${draft.id}' carried invalidation no longer resolves to its canonical user authorization.`);
+      }
+      return carried.evidence;
+    }
+    return this.#resolveUser(invalidation.evidence, draft.id, invalidation.supersededBy);
+  }
+
   async #resolveAll(claims: readonly EvidenceClaim[], milestone: string): Promise<readonly EvidenceRef[]> {
     const resolved: EvidenceRef[] = [];
     for (const claim of claims) {
       const reference = await this.evidenceResolver?.resolve(claim);
       if (reference === undefined) {
-        throw new Error(`Milestone '${milestone}' cites evidence that does not resolve to a successful journal event.`);
+        throw new Error(`Milestone '${milestone}' cites evidence that does not resolve to one fresh runtime-authorized execution/review or sealed-verifier journal event. For tool evidence use exactly {"kind":"tool","evidenceId":"<eligible successful observation evidenceId>"}; reads, mutations, state operations, and unmarked execute tools are not proof.`);
       }
       resolved.push(reference);
     }
     return resolved;
   }
 
-  async #resolveUser(claim: EvidenceClaim, milestone: string): Promise<EvidenceRef & { kind: "user" }> {
+  async #resolveUser(
+    claim: EvidenceClaim,
+    milestone: string,
+    supersededBy: string,
+  ): Promise<EvidenceRef & { kind: "user" }> {
     if (claim.kind !== "user") throw new Error(`Milestone '${milestone}' invalidation requires user evidence.`);
+    const requiredText = planInvalidationApprovalText(milestone, supersededBy);
+    if (claim.exactText !== requiredText) {
+      throw new Error(`Milestone '${milestone}' invalidation requires this exact latest user message: ${requiredText}`);
+    }
     const reference = await this.evidenceResolver?.resolve(claim);
     if (reference?.kind !== "user") {
-      throw new Error(`Milestone '${milestone}' invalidation does not match the latest exact user message.`);
+      throw new Error(`Milestone '${milestone}' invalidation does not match the latest exact user message. Required: ${requiredText}`);
     }
     return reference as EvidenceRef & { kind: "user" };
   }
@@ -391,14 +529,14 @@ function validatePlanState(state: PlanState): void {
     throw new Error("A materialized plan holds between 1 and 24 milestones.");
   }
   const required = new Set(uniqueStrings(state.requiredCriteria, "required criteria", 100));
-  const covered = new Set<string>();
+  const activelyCovered = new Set<string>();
   const ids = new Set<string>();
   for (const milestone of state.milestones) {
     if (ids.has(milestone.id)) throw new Error(`Milestone id '${milestone.id}' is duplicated.`);
     ids.add(milestone.id);
     for (const criterion of milestone.covers) {
       if (!required.has(criterion)) throw new Error(`Milestone '${milestone.id}' covers unknown criterion '${criterion}'.`);
-      covered.add(criterion);
+      if (milestone.status !== "invalidated") activelyCovered.add(criterion);
     }
     if (milestone.status === "proven") {
       if (milestone.evidence.length === 0
@@ -414,7 +552,9 @@ function validatePlanState(state: PlanState): void {
     }
   }
   for (const criterion of required) {
-    if (!covered.has(criterion)) throw new Error(`Contract criterion '${criterion}' is not covered by any milestone.`);
+    if (!activelyCovered.has(criterion)) {
+      throw new Error(`Contract criterion '${criterion}' is not covered by any non-invalidated milestone.`);
+    }
   }
   for (const milestone of state.milestones) {
     for (const dependency of milestone.dependsOn) {
@@ -425,13 +565,41 @@ function validatePlanState(state: PlanState): void {
       if (superseding === undefined || superseding.status === "invalidated" || superseding.id === milestone.id) {
         throw new Error(`Milestone '${milestone.id}' has no active superseding milestone.`);
       }
+      const requiredApproval = planInvalidationApprovalText(milestone.id, superseding.id);
+      if (milestone.invalidation.evidence.exactText !== requiredApproval) {
+        throw new Error(`Milestone '${milestone.id}' invalidation lacks the required structured human approval: ${requiredApproval}`);
+      }
+      for (const criterion of milestone.acceptanceCriteria) {
+        if (!superseding.acceptanceCriteria.includes(criterion)) {
+          throw new Error(`Superseding milestone '${superseding.id}' must inherit acceptance criterion '${criterion}' from '${milestone.id}'.`);
+        }
+      }
+      for (const criterion of milestone.covers) {
+        if (!superseding.covers.includes(criterion)) {
+          throw new Error(`Superseding milestone '${superseding.id}' must inherit contract criterion '${criterion}' from '${milestone.id}'.`);
+        }
+      }
+      if (superseding.status === "proven") {
+        const authorizationSequence = milestone.invalidation.evidence.sequence;
+        const executableProof = superseding.evidence.filter((evidence: EvidenceRef) =>
+          evidence.kind === "tool" || evidence.kind === "verification");
+        if (executableProof.some((evidence: EvidenceRef) => evidence.sequence <= authorizationSequence)) {
+          throw new Error(`Superseding milestone '${superseding.id}' must use fresh executable proof recorded after the structured human approval for '${milestone.id}'.`);
+        }
+      }
     }
   }
   assertAcyclic(state.milestones);
 }
 
 function validateRevision(previous: PlanState | undefined, next: PlanState): void {
-  if (previous === undefined) return;
+  if (previous === undefined) {
+    const invalidated = next.milestones.find((milestone) => milestone.status === "invalidated");
+    if (invalidated !== undefined) {
+      throw new Error(`Initial plan cannot invalidate milestone '${invalidated.id}'. Establish it first, then request explicit human approval in a later revision.`);
+    }
+    return;
+  }
   const nextById = new Map(next.milestones.map((milestone) => [milestone.id, milestone]));
   for (const prior of previous.milestones) {
     const current = nextById.get(prior.id);
@@ -444,11 +612,60 @@ function validateRevision(previous: PlanState | undefined, next: PlanState): voi
     if ((prior.status === "proven" || prior.status === "invalidated") && current.status !== prior.status) {
       throw new Error(`Terminal milestone '${prior.id}' cannot move back from ${prior.status}.`);
     }
+    if (prior.status === "invalidated"
+      && JSON.stringify(prior.invalidation) !== JSON.stringify(current.invalidation)) {
+      throw new Error(`Terminal milestone '${prior.id}' invalidation authorization is immutable.`);
+    }
+    if (prior.status !== "invalidated" && current.status === "invalidated") {
+      const superseding = nextById.get(current.invalidation!.supersededBy);
+      if (superseding?.status === "proven") {
+        throw new Error(`Superseding milestone '${superseding.id}' cannot be proven in the same revision that invalidates '${prior.id}'. Record the approved invalidation first, then prove the superseder with fresh executable evidence in a later revision.`);
+      }
+    }
     if (prior.status === "proven"
-      && JSON.stringify(prior.evidence) !== JSON.stringify(current.evidence)) {
-      throw new Error(`Proven milestone '${prior.id}' evidence is immutable.`);
+      && JSON.stringify(prior.evidence) !== JSON.stringify(current.evidence)
+      && !isStrictlyNewerExecutableEvidence(prior.evidence, current.evidence)) {
+      throw new Error(`Proven milestone '${prior.id}' evidence is immutable except for a complete refresh in a newer workspace generation.`);
     }
   }
+}
+
+function validateNewInvalidationTransitions(previous: PlanState | undefined, next: PlanState): void {
+  if (previous === undefined) return;
+  const nextById = new Map(next.milestones.map((milestone) => [milestone.id, milestone]));
+  for (const prior of previous.milestones) {
+    const current = nextById.get(prior.id);
+    if (prior.status === "invalidated" || current?.status !== "invalidated" || current.invalidation === undefined) {
+      continue;
+    }
+    const superseding = nextById.get(current.invalidation.supersededBy);
+    const hasCanonicalApproval = current.invalidation.evidence.exactText
+      === planInvalidationApprovalText(current.id, current.invalidation.supersededBy);
+    const preservesAcceptance = superseding !== undefined
+      && current.acceptanceCriteria.every((criterion) => superseding.acceptanceCriteria.includes(criterion));
+    const preservesCoverage = superseding !== undefined
+      && current.covers.every((criterion) => superseding.covers.includes(criterion));
+    if (superseding?.status === "proven" && hasCanonicalApproval && preservesAcceptance && preservesCoverage) {
+      throw new Error(`Superseding milestone '${superseding.id}' cannot be proven in the same revision that invalidates '${prior.id}'. Record the approved invalidation first, then prove the superseder with fresh executable evidence in a later revision.`);
+    }
+  }
+}
+
+function isStrictlyNewerExecutableEvidence(
+  prior: readonly EvidenceRef[],
+  current: readonly EvidenceRef[],
+): boolean {
+  const priorGenerations = prior
+    .filter((evidence) => evidence.kind === "tool" || evidence.kind === "verification")
+    .map((evidence) => evidence.workspaceGeneration);
+  const currentGenerations = current
+    .filter((evidence) => evidence.kind === "tool" || evidence.kind === "verification")
+    .map((evidence) => evidence.workspaceGeneration);
+  if (priorGenerations.length === 0 || currentGenerations.length === 0
+    || priorGenerations.some((generation) => !validWorkspaceGeneration(generation))
+    || currentGenerations.some((generation) => !validWorkspaceGeneration(generation))) return false;
+  const priorMaximum = Math.max(...priorGenerations as number[]);
+  return (currentGenerations as number[]).every((generation) => generation > priorMaximum);
 }
 
 async function validatePersistedEvidence(
@@ -457,13 +674,17 @@ async function validatePersistedEvidence(
 ): Promise<void> {
   for (const milestone of state.milestones) {
     for (const reference of milestone.evidence) {
-      const resolved = await resolver.resolve(reference);
+      const resolved = resolver.revalidate === undefined
+        ? await resolver.resolve(reference)
+        : await resolver.revalidate(reference);
       if (resolved === undefined || !sameEvidence(reference, resolved)) {
         throw new Error(`Persisted plan evidence integrity failure in milestone '${milestone.id}'.`);
       }
     }
     if (milestone.invalidation !== undefined) {
-      const resolved = await resolver.resolve(milestone.invalidation.evidence);
+      const resolved = resolver.revalidate === undefined
+        ? await resolver.resolve(milestone.invalidation.evidence)
+        : await resolver.revalidate(milestone.invalidation.evidence);
       if (resolved === undefined || !sameEvidence(milestone.invalidation.evidence, resolved)) {
         throw new Error(`Persisted plan invalidation integrity failure in milestone '${milestone.id}'.`);
       }
@@ -475,6 +696,9 @@ function sameEvidence(left: EvidenceRef, right: EvidenceRef): boolean {
   return left.kind === right.kind
     && left.sequence === right.sequence
     && left.sha256 === right.sha256
+    && left.evidenceAuthority === right.evidenceAuthority
+    && left.workspaceGeneration === right.workspaceGeneration
+    && left.evidenceId === right.evidenceId
     && left.callId === right.callId
     && left.tool === right.tool
     && left.verifier === right.verifier
@@ -498,18 +722,46 @@ function assertAcyclic(milestones: readonly PlanMilestone[]): void {
 
 function evidenceSchema(): JsonValue {
   return {
-    type: "object",
-    properties: {
-      kind: { type: "string", enum: ["tool", "verification", "user"] },
-      sequence: { type: "integer", minimum: 1 },
-      callId: { type: "string" },
-      tool: { type: "string" },
-      verifier: { type: "string" },
-      exactText: { type: "string" },
-      sha256: { type: "string" },
-    },
-    required: ["kind"],
-    additionalProperties: false,
+    description: "Evidence selector. For a new successful tool citation, send exactly {\"kind\":\"tool\",\"evidenceId\":\"<observation evidenceId>\"}. Legacy callId-only selectors remain supported. Runtime-owned provider id, sequence, tool, and sha256 values are derived and must not be guessed.",
+    oneOf: [
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["tool"] },
+          evidenceId: { type: "string", description: "Exact runtime-owned evidenceId from one successful tool observation." },
+        },
+        required: ["kind", "evidenceId"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["tool"] },
+          callId: { type: "string", description: "Exact callId from one successful tool observation." },
+        },
+        required: ["kind", "callId"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["verification"] },
+          sequence: { type: "integer", minimum: 1 },
+          verifier: { type: "string" },
+        },
+        required: ["kind", "verifier"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", enum: ["user"] },
+          exactText: { type: "string" },
+        },
+        required: ["kind", "exactText"],
+        additionalProperties: false,
+      },
+    ],
   };
 }
 
@@ -525,7 +777,7 @@ function evidenceClaim(value: JsonValue | undefined, name: string): EvidenceClai
   if (value.kind !== "tool" && value.kind !== "verification" && value.kind !== "user") {
     throw new Error(`Plan '${name}' has an invalid evidence kind.`);
   }
-  const optional = (field: "callId" | "tool" | "verifier" | "exactText"): string | undefined => {
+  const optional = (field: "evidenceId" | "callId" | "tool" | "verifier" | "exactText"): string | undefined => {
     const item = value[field];
     if (item === undefined) return undefined;
     if (typeof item !== "string" || item.length === 0 || item.length > 4_000) {
@@ -533,6 +785,29 @@ function evidenceClaim(value: JsonValue | undefined, name: string): EvidenceClai
     }
     return item;
   };
+  if (value.kind === "tool") {
+    const evidenceId = optional("evidenceId");
+    if (evidenceId !== undefined) {
+      // Prefer the runtime handle and discard any copied/guessed provider or
+      // canonical metadata. The resolver derives all of it from the journal.
+      return { kind: "tool", evidenceId };
+    }
+    const callId = optional("callId");
+    if (callId === undefined) {
+      throw new Error(`Plan '${name}.evidenceId' (or legacy callId) is required for tool evidence.`);
+    }
+    // Tool metadata copied or guessed by a model is intentionally ignored.
+    // The resolver rehydrates the canonical identity from the validated
+    // successful journal event selected solely by callId.
+    return { kind: "tool", callId };
+  }
+  if (value.kind === "user") {
+    const exactText = optional("exactText");
+    if (exactText === undefined) throw new Error(`Plan '${name}.exactText' is required for user evidence.`);
+    // Model-authored invalidations are always fresh. Sequence is runtime-owned
+    // and appears only when a canonical persisted reference is revalidated.
+    return { kind: "user", exactText };
+  }
   const sequence = value.sequence;
   if (sequence !== undefined && (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 1)) {
     throw new Error(`Plan '${name}.sequence' must be a positive integer.`);
@@ -551,7 +826,47 @@ function evidenceClaim(value: JsonValue | undefined, name: string): EvidenceClai
   };
 }
 
-function canonicalEvidence(claim: EvidenceClaim, event: RunEvent): EvidenceRef {
+function successfulToolData(event: RunEvent): Record<string, unknown> | undefined {
+  if (event.type !== "tool.completed") return undefined;
+  const data = record(event.data);
+  return data?.ok === true && typeof data.callId === "string" && typeof data.tool === "string"
+    ? data
+    : undefined;
+}
+
+function eligibleToolData(
+  event: RunEvent,
+  events: readonly RunEvent[],
+  requireCurrent: boolean,
+): Record<string, unknown> | undefined {
+  const data = successfulToolData(event);
+  if (data === undefined) return undefined;
+  const authority = data.evidenceAuthority;
+  if (authority !== "independent-execution" && authority !== "independent-review") return undefined;
+  if (eligibleWorkspaceGeneration(event, events, requireCurrent) === undefined) return undefined;
+  return data;
+}
+
+function eligibleWorkspaceGeneration(
+  event: RunEvent,
+  events: readonly RunEvent[],
+  requireCurrent: boolean,
+): number | undefined {
+  const value = record(event.data)?.workspaceGeneration;
+  if (!validWorkspaceGeneration(value)) return undefined;
+  const atEvent = journalWorkspaceGeneration(events, event.sequence);
+  if (atEvent === undefined || value !== atEvent) return undefined;
+  if (requireCurrent && value !== journalWorkspaceGeneration(events)) return undefined;
+  return value;
+}
+
+function canonicalEvidence(
+  claim: EvidenceClaim & {
+    readonly evidenceAuthority?: ToolEvidenceAuthority;
+    readonly workspaceGeneration?: number;
+  },
+  event: RunEvent,
+): EvidenceRef {
   return {
     ...claim,
     sequence: event.sequence,

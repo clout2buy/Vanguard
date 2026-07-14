@@ -16,8 +16,10 @@ $Task = Get-Content -Raw -LiteralPath (Join-Path $Fixture "TASK.md")
 
 Push-Location $Root
 try {
-  npm run build
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if (Test-Path -LiteralPath (Join-Path $Root "src") -PathType Container) {
+    npm run build
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
 
   node dist/src/cli.js run `
     --workspace $Fixture `

@@ -202,6 +202,8 @@ export function classifyFailure(error: unknown, context: FailureClassificationCo
   const status = context.status ?? numericProperty(error, "status");
   const retryAfterMs = context.retryAfterMs ?? numericProperty(error, "retryAfterMs");
   const code = asciiUppercase(stringProperty(error, "code"));
+  const providerKind = asciiLowercase(stringProperty(error, "kind"));
+  const providerDeclaredRetryable = booleanProperty(error, "retryable");
   const base = {
     version: 1 as const,
     message,
@@ -232,6 +234,22 @@ export function classifyFailure(error: unknown, context: FailureClassificationCo
     return { ...base, code: "cancelled", source: context.source, disposition: "cancelled", retryable: false };
   }
   if (context.source === "provider") {
+    // A provider can return a syntactically valid HTTP response whose model
+    // decision is not decodable (for example malformed function arguments).
+    // Retrying the inference decision is safe because no decoded decision has
+    // reached the kernel and therefore no tool can have executed. Honor only
+    // the adapter's explicit retry marker, and never reinterpret an HTTP
+    // client error as a response-protocol glitch.
+    if (providerKind === "protocol" && providerDeclaredRetryable === true
+      && (status === undefined || status < 400)) {
+      return {
+        ...base,
+        code: "provider_protocol_invalid",
+        source: "provider",
+        disposition: "transient",
+        retryable: true,
+      };
+    }
     if (status === 409) return { ...base, code: "provider_conflict", source: "provider", disposition: "transient", retryable: true };
     if (status === 429) return { ...base, code: "provider_rate_limited", source: "provider", disposition: "transient", retryable: true };
     if (status !== undefined && status >= 500) {
@@ -420,6 +438,12 @@ function numericProperty(value: unknown, key: string): number | undefined {
   return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : undefined;
 }
 
+function booleanProperty(value: unknown, key: string): boolean | undefined {
+  if (value === null || typeof value !== "object" || !(key in value)) return undefined;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === "boolean" ? candidate : undefined;
+}
+
 function stringProperty(value: unknown, key: string): string {
   if (value === null || typeof value !== "object" || !(key in value)) return "";
   const candidate = (value as Record<string, unknown>)[key];
@@ -465,7 +489,7 @@ function isDisposition(value: unknown): value is FailureDescriptor["disposition"
 
 const FAILURE_CODES = new Set<FailureDescriptor["code"]>([
   "provider_timeout", "provider_rate_limited", "provider_conflict", "provider_unavailable",
-  "provider_disconnect", "provider_authentication", "provider_request_invalid", "tool_transient",
+  "provider_disconnect", "provider_protocol_invalid", "provider_authentication", "provider_request_invalid", "tool_transient",
   "tool_failed", "process_exit", "process_timeout", "verifier_failed", "verifier_exception",
   "policy_denied", "context_budget", "context_invalid", "environment_missing_dependency",
   "environment_io", "cancelled", "unknown_failure",

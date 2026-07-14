@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { JsonValue, ModelRequest, PublicRunEvent } from "../src/index.js";
 import {
+  AnthropicMessagesCodec,
   HttpModelAdapter,
+  InferenceError,
   OpenAIChatCompletionsCodec,
+  OpenAIResponsesCodec,
   createStreamLifecyclePresenter,
 } from "../src/index.js";
 
@@ -11,6 +14,13 @@ const encoder = new TextEncoder();
 
 function sseResponse(events: readonly string[]): Response {
   return new Response(events.map((event) => `data: ${event}\n\n`).join("") + "data: [DONE]\n\n", {
+    status: 200,
+    headers: { "content-type": "text/event-stream" },
+  });
+}
+
+function cleanEofSseResponse(events: readonly string[]): Response {
+  return new Response(events.map((event) => `data: ${event}\n\n`).join(""), {
     status: 200,
     headers: { "content-type": "text/event-stream" },
   });
@@ -118,17 +128,198 @@ test("a compatible endpoint that ignores streaming falls back to plain JSON safe
 
 test("malformed SSE fails honestly after retries with a single failure notification", async () => {
   const log = lifecycleLog();
+  let attempts = 0;
   const adapter = new HttpModelAdapter({
     endpoint: "http://127.0.0.1:9/bad",
     codec: new OpenAIChatCompletionsCodec("m"),
     streamObserver: log.observer,
     maxAttempts: 2,
     retryBaseMs: 1,
-    fetchImplementation: (async () => sseResponse(["this is not json"])) as typeof fetch,
+    fetchImplementation: (async () => {
+      attempts += 1;
+      return sseResponse(["this is not json"]);
+    }) as typeof fetch,
   });
   await assert.rejects(() => adapter.decide(baseRequest()));
+  assert.equal(attempts, 2, "protocol failures retry only to the configured adapter bound");
   assert.equal(log.events.filter((event) => event.startsWith("failed:")).length, 1);
   assert.equal(log.events.some((event) => event === "committed"), false);
+});
+
+test("clean EOF cannot finalize complete-looking Chat Completions text or tool calls", async () => {
+  const fixtures: readonly (readonly string[])[] = [[
+    '{"choices":[{"delta":{"content":"Looks complete."}}]}',
+    '{"choices":[{"finish_reason":"stop","delta":{}}]}',
+  ], [
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"workspace_read","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}',
+    '{"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
+  ]];
+
+  for (const events of fixtures) {
+    const adapter = new HttpModelAdapter({
+      endpoint: "http://127.0.0.1:9/truncated-chat",
+      codec: new OpenAIChatCompletionsCodec("m"),
+      maxAttempts: 1,
+      fetchImplementation: (async () => cleanEofSseResponse(events)) as typeof fetch,
+    });
+    await assert.rejects(
+      () => adapter.decide(baseRequest()),
+      (error: unknown) => error instanceof InferenceError
+        && error.kind === "protocol"
+        && /terminal \[DONE\] marker/u.test(error.message),
+    );
+  }
+});
+
+test("clean EOF cannot finalize complete-looking Anthropic text or tool calls", async () => {
+  const fixtures: readonly (readonly string[])[] = [[
+    '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+    '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Looks complete."}}',
+    '{"type":"content_block_stop","index":0}',
+    '{"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+  ], [
+    '{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"workspace.read","input":{}}}',
+    '{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"a.ts\\"}"}}',
+    '{"type":"content_block_stop","index":0}',
+    '{"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
+  ]];
+
+  for (const events of fixtures) {
+    const adapter = new HttpModelAdapter({
+      endpoint: "http://127.0.0.1:9/truncated-anthropic",
+      codec: new AnthropicMessagesCodec("m"),
+      maxAttempts: 1,
+      fetchImplementation: (async () => cleanEofSseResponse(events)) as typeof fetch,
+    });
+    await assert.rejects(
+      () => adapter.decide(baseRequest()),
+      (error: unknown) => error instanceof InferenceError
+        && error.kind === "protocol"
+        && /terminal message_stop event/u.test(error.message),
+    );
+  }
+});
+
+test("the [DONE] marker terminates a hanging SSE body without waiting for socket EOF", async () => {
+  let cancelled = false;
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/hanging-after-done",
+    codec: new OpenAIChatCompletionsCodec("m"),
+    maxAttempts: 1,
+    timeoutMs: 2_000,
+    fetchImplementation: (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode([
+          'data: {"choices":[{"delta":{"content":"Finished."}}]}',
+          'data: {"choices":[{"finish_reason":"stop","delta":{}}]}',
+          "data: [DONE]",
+          "",
+        ].join("\n\n")));
+      },
+      cancel() { cancelled = true; },
+    }), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch,
+  });
+
+  const decision = await adapter.decide(baseRequest());
+  assert.equal(decision.kind === "respond" ? decision.message : "", "Finished.");
+  assert.equal(cancelled, true, "the body reader must be cancelled after [DONE] instead of waiting for EOF");
+});
+
+test("payload after [DONE] is a protocol failure, not a second hidden response", async () => {
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/data-after-done",
+    codec: new OpenAIChatCompletionsCodec("m"),
+    maxAttempts: 1,
+    fetchImplementation: (async () => new Response([
+      'data: {"choices":[{"delta":{"content":"First."}}]}',
+      'data: {"choices":[{"finish_reason":"stop","delta":{}}]}',
+      "data: [DONE]",
+      'data: {"choices":[{"delta":{"content":"Hidden second payload"}}]}',
+      "",
+    ].join("\n\n"), { status: 200, headers: { "content-type": "text/event-stream" } })) as typeof fetch,
+  });
+
+  await assert.rejects(
+    () => adapter.decide(baseRequest()),
+    (error: unknown) => error instanceof InferenceError
+      && error.kind === "protocol"
+      && /after its terminal \[DONE\] marker/u.test(error.message),
+  );
+});
+
+test("OpenAI Responses incomplete and failed terminal events remain failures with usage evidence", async () => {
+  for (const type of ["response.incomplete", "response.failed"] as const) {
+    const usage: JsonValue[] = [];
+    const adapter = new HttpModelAdapter({
+      endpoint: "http://127.0.0.1:9/non-success-response-terminal",
+      codec: new OpenAIResponsesCodec("m"),
+      maxAttempts: 1,
+      streamObserver: { delta: () => {}, usage: (value) => usage.push(value) },
+      fetchImplementation: (async () => sseResponse([JSON.stringify({
+        type,
+        response: {
+          output: [{ type: "message", content: [{ type: "output_text", text: "Not a final answer" }] }],
+          usage: { input_tokens: 8, output_tokens: 3 },
+        },
+      })])) as typeof fetch,
+    });
+
+    await assert.rejects(
+      () => adapter.decide(baseRequest()),
+      (error: unknown) => error instanceof InferenceError
+        && error.kind === "protocol"
+        && error.message.includes(type),
+    );
+    assert.deepEqual(usage, [{ input_tokens: 8, output_tokens: 3 }]);
+  }
+});
+
+test("malformed Anthropic streamed tool input retries exactly to the adapter bound", async () => {
+  let attempts = 0;
+  const usage: JsonValue[] = [];
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/anthropic-bad-tool-input",
+    codec: new AnthropicMessagesCodec("m"),
+    maxAttempts: 2,
+    retryBaseMs: 1,
+    streamObserver: { delta: () => {}, usage: (value) => usage.push(value) },
+    fetchImplementation: (async () => {
+      attempts += 1;
+      return sseResponse([
+        JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 2 } } }),
+        JSON.stringify({
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: "bad-tool", name: "workspace.read", input: {} },
+        }),
+        JSON.stringify({
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: '{"path":"a.ts"} trailing' },
+        }),
+        JSON.stringify({ type: "content_block_stop", index: 0 }),
+        // Anthropic reports output usage after the tool block closes. Invalid
+        // JSON must not abort stream consumption before this billable terminal
+        // event is captured.
+        JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: "tool_use" },
+          usage: { output_tokens: 3 },
+        }),
+        JSON.stringify({ type: "message_stop" }),
+      ]);
+    }) as typeof fetch,
+  });
+
+  await assert.rejects(
+    () => adapter.decide(baseRequest()),
+    (error: unknown) => error instanceof InferenceError && error.kind === "protocol",
+  );
+  assert.equal(attempts, 2, "streamed tool-input protocol failures must stop at maxAttempts");
+  assert.deepEqual(usage, [
+    { input_tokens: 2, output_tokens: 3 },
+    { input_tokens: 2, output_tokens: 3 },
+  ], "each rejected, billable stream attempt must retain terminal usage exactly once");
 });
 
 test("streamed usage metadata is preserved and reported", async () => {

@@ -81,6 +81,30 @@ test("conversation mode offers only observation and control tools to the model",
   assert.deepEqual(offered, ["task.execute", "user.ask", "workspace.list", "workspace.read"]);
 });
 
+test("the kernel refuses a context policy that drops the latest human message", async () => {
+  let decisions = 0;
+  const kernel = new AgentKernel({
+    model: {
+      async decide() {
+        decisions += 1;
+        return { kind: "respond" as const, message: "must not run" };
+      },
+    },
+    tools: [],
+    verifiers: [],
+    journal: new MemoryJournal(),
+    contextPolicy: {
+      select() { return []; },
+    },
+    options: { interactive: true },
+  });
+
+  const outcome = await kernel.advance({ userMessage: "Keep the public API unchanged." });
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /Context failure/u);
+  assert.equal(decisions, 0);
+});
+
 test("conversation may inspect read-only tools but a mutation call is refused", async () => {
   let reads = 0;
   let mutations = 0;
@@ -152,6 +176,117 @@ test("an actionable request produces a journaled contract and execution continue
   // The conversation that produced the contract is preserved for the executor.
   assert.equal(executionModel.requests[0]?.transcript.some((entry) => entry.role === "user"
     && JSON.stringify(entry.content).includes("task manager")), true);
+});
+
+test("resume durably finishes an interrupted task.execute transaction without another model decision", async () => {
+  const journal = new MemoryJournal();
+  const contract = {
+    objective: "Repair the parser without changing its public API",
+    successCriteria: ["all parser tests pass"],
+  };
+  await journal.append({ sequence: 1, type: "user.message", data: { text: "Repair the parser." } });
+  await journal.append({ sequence: 2, type: "model.decided", data: { kind: "execute", contract } });
+
+  let unexpectedModelCalls = 0;
+  const recovering = new AgentKernel({
+    model: {
+      async decide() {
+        unexpectedModelCalls += 1;
+        throw new Error("the durable execute decision must not be decided twice");
+      },
+    },
+    tools: [],
+    verifiers: [neverVerifier],
+    journal,
+    taskAddendum: "Vanguard runtime mutation policy: preserve the public API.",
+    options: { interactive: true },
+  });
+  const recovered = await recovering.advance({}, new AbortController().signal, [...journal.events]);
+  assert.equal(recovered.status, "contracted");
+  assert.equal(unexpectedModelCalls, 0);
+  assert.equal(journal.events.filter((event) => event.type === "run.contracted").length, 1);
+  assert.equal(journal.events.filter((event) => event.type === "run.resumed").length, 0);
+  assert.match(JSON.stringify(journal.events.at(-1)?.data), /preserve the public API/);
+
+  // A normal resume sees the durable contract and must not append it again.
+  const executionModel = new CapturingModel([{ kind: "complete", answer: "verified" }]);
+  const execution = new AgentKernel({
+    model: executionModel,
+    tools: [],
+    verifiers: [{
+      name: "tests",
+      async verify() { return { verifier: "tests", passed: true, evidence: "all parser tests pass" }; },
+    }],
+    journal,
+    options: { interactive: true },
+  });
+  const completed = await execution.advance({}, new AbortController().signal, [...journal.events]);
+  assert.equal(completed.status, "completed");
+  assert.equal(executionModel.requests.length, 1);
+  assert.equal(journal.events.filter((event) => event.type === "run.contracted").length, 1);
+});
+
+test("an execute decision made after run.started can never replace the contracted task on resume", async () => {
+  const prior = [
+    { sequence: 1, type: "run.started" as const, data: { task: "ORIGINAL TASK" } },
+    {
+      sequence: 2,
+      type: "model.decided" as const,
+      data: {
+        kind: "execute",
+        contract: { objective: "HIJACKED TASK", successCriteria: ["replace the original"] },
+      },
+    },
+    {
+      sequence: 3,
+      type: "tool.failed" as const,
+      data: {
+        callId: "task-execute",
+        tool: "task.execute",
+        ok: false,
+        error: "Execution is already contracted.",
+      },
+    },
+  ];
+  const journal = new MemoryJournal();
+  const model = new CapturingModel([{ kind: "complete", answer: "original remains active" }]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [],
+    verifiers: [{
+      name: "tests",
+      async verify() { return { verifier: "tests", passed: true, evidence: "original verified" }; },
+    }],
+    journal,
+    options: { interactive: true },
+  });
+
+  const outcome = await kernel.advance({}, undefined, prior);
+  assert.equal(outcome.status, "completed");
+  assert.equal(model.requests.length, 1);
+  assert.equal(model.requests[0]?.task, "ORIGINAL TASK");
+  assert.equal(journal.events.some((event) => event.type === "run.contracted"), false);
+});
+
+test("an older uncontracted execute artifact cannot override a later durable model decision", async () => {
+  const journal = new MemoryJournal();
+  const staleContract = { objective: "stale objective", successCriteria: [] };
+  await journal.append({ sequence: 1, type: "user.message", data: { text: "Discuss the repair." } });
+  await journal.append({ sequence: 2, type: "model.decided", data: { kind: "execute", contract: staleContract } });
+  await journal.append({ sequence: 3, type: "run.resumed", data: { completedSteps: 1 } });
+  await journal.append({ sequence: 4, type: "model.decided", data: { kind: "respond", message: "Need a fresh decision." } });
+
+  const model = new CapturingModel([{ kind: "respond", message: "Still discussing." }]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [],
+    verifiers: [neverVerifier],
+    journal,
+    options: { interactive: true },
+  });
+  const outcome = await kernel.advance({}, new AbortController().signal, [...journal.events]);
+  assert.equal(outcome.status, "responded");
+  assert.equal(journal.events.some((event) => event.type === "run.contracted"), false);
 });
 
 test("an ambiguous request can pause on a clarifying question and contract after the answer", async () => {

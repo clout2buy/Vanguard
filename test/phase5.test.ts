@@ -19,6 +19,7 @@ import {
   FileJournal,
   AgentKernel,
   MemoryJournal,
+  acquireSessionLease,
   applyReviewedManifest,
   createCodingSession,
   createSessionCheckpoint,
@@ -62,6 +63,24 @@ async function fixture(files: Readonly<Record<string, string | Buffer>>): Promis
     },
   };
 }
+
+test("public review and time-travel APIs cannot bypass an active session lease", async () => {
+  const context = await fixture({ "state.txt": "zero" });
+  const lease = await acquireSessionLease(path.dirname(context.session.workspaceRoot), "active-agent-run");
+  try {
+    await assert.rejects(
+      reviewSessionChanges(context.session, context.journal),
+      /Session is busy/u,
+    );
+    await assert.rejects(
+      createSessionCheckpoint(context.session, context.journal, "blocked"),
+      /Session is busy/u,
+    );
+  } finally {
+    await lease.release();
+    await context.cleanup();
+  }
+});
 
 test("review is deterministic and transactional apply/undo preserves binary data and renames", async () => {
   const context = await fixture({
@@ -290,20 +309,27 @@ test("checkpoint, restore, crash recovery, and fork retain durable journal linea
     const container = path.dirname(context.session.workspaceRoot);
     await writeFile(path.join(context.session.workspaceRoot, "state.txt"), "one");
     await writeFile(path.join(container, "plan.json"), JSON.stringify({ revision: 1 }));
+    await writeFile(path.join(container, "delegations.json"), JSON.stringify({ revision: 1, children: ["one"] }));
     await context.journal.append({ sequence: 1, type: "run.completed", data: { answer: "historical completion" } });
     const first = await createSessionCheckpoint(context.session, context.journal, "one");
     await writeFile(path.join(context.session.workspaceRoot, "state.txt"), "two");
     await writeFile(path.join(container, "plan.json"), JSON.stringify({ revision: 2 }));
+    await writeFile(path.join(container, "delegations.json"), JSON.stringify({ revision: 2, children: ["two"] }));
     const second = await createSessionCheckpoint(context.session, context.journal, "two");
     assert.deepEqual((await listSessionCheckpoints(context.session)).map((entry) => entry.label), ["one", "two"]);
 
     const restored = await restoreSessionCheckpoint(context.session, context.journal, first.id, first.id);
     assert.equal(restored.restoredRootHash, first.rootHash);
+    assert.equal(restored.checkpointRootHash, first.rootHash);
+    assert.equal(restored.checkpointJournalHash, first.journalHash);
+    assert.equal(restored.checkpointJournalSequence, first.journalSequence);
     assert.equal(await readFile(path.join(context.session.workspaceRoot, "state.txt"), "utf8"), "one");
     assert.equal(JSON.parse(await readFile(path.join(container, "plan.json"), "utf8")).revision, 1);
+    assert.equal(JSON.parse(await readFile(path.join(container, "delegations.json"), "utf8")).revision, 1);
 
     await writeFile(path.join(context.session.workspaceRoot, "state.txt"), "three");
     await writeFile(path.join(container, "plan.json"), JSON.stringify({ revision: 3 }));
+    await writeFile(path.join(container, "delegations.json"), JSON.stringify({ revision: 3, children: ["three"] }));
     await assert.rejects(
       restoreSessionCheckpoint(context.session, context.journal, second.id, second.id, { simulateCrashAfterOldMove: true }),
       /Simulated restore crash/,
@@ -312,11 +338,13 @@ test("checkpoint, restore, crash recovery, and fork retain durable journal linea
     const reopened = await openCodingSession(path.dirname(context.session.workspaceRoot));
     assert.equal(await readFile(path.join(reopened.workspaceRoot, "state.txt"), "utf8"), "three");
     assert.equal(JSON.parse(await readFile(path.join(container, "plan.json"), "utf8")).revision, 3);
+    assert.equal(JSON.parse(await readFile(path.join(container, "delegations.json"), "utf8")).revision, 3);
 
     const forked = await forkSessionCheckpoint(reopened, context.journal, second.id);
     childRoot = path.dirname(forked.session.workspaceRoot);
     assert.equal(await readFile(path.join(forked.session.workspaceRoot, "state.txt"), "utf8"), "two");
     assert.equal(JSON.parse(await readFile(path.join(childRoot, "plan.json"), "utf8")).revision, 2);
+    assert.equal(JSON.parse(await readFile(path.join(childRoot, "delegations.json"), "utf8")).revision, 2);
     assert.equal(forked.session.lineage?.parentCheckpointId, second.id);
     assert.equal(forked.session.lineage?.parentJournalHash, second.journalHash);
     const childJournal = await FileJournal.open(forked.journalFile, {
@@ -325,15 +353,33 @@ test("checkpoint, restore, crash recovery, and fork retain durable journal linea
     const childEvents = await childJournal.readValidated();
     assert.equal(childEvents.at(-1)?.type, "session.forked");
     assert.equal((childEvents.at(-1)?.data as { parentJournalHash?: string }).parentJournalHash, second.journalHash);
+    const branchResumeJournal = new MemoryJournal();
     const branchKernel = new AgentKernel({
       model: { async decide() { return { kind: "respond" as const, message: "Branch is open." }; } },
+      tools: [],
+      verifiers: [],
+      journal: branchResumeJournal,
+      options: { interactive: true },
+    });
+    const branchOutcome = await branchKernel.advance({}, undefined, childEvents);
+    assert.equal(branchOutcome.status, "responded");
+    assert.equal(branchResumeJournal.events[0]?.type, "run.resumed");
+
+    // The time-travel event is an explicit one-shot resume trigger. Once the
+    // corresponding run.resumed is in the lineage, runtime-authored context
+    // cannot manufacture another conversation turn.
+    const consumedLineage = [...childEvents, ...branchResumeJournal.events];
+    const branchAgain = new AgentKernel({
+      model: { async decide() { return { kind: "respond" as const, message: "must not run" }; } },
       tools: [],
       verifiers: [],
       journal: new MemoryJournal(),
       options: { interactive: true },
     });
-    const branchOutcome = await branchKernel.advance({}, undefined, childEvents);
-    assert.equal(branchOutcome.status, "responded");
+    await assert.rejects(
+      branchAgain.advance({}, undefined, consumedLineage),
+      /Nothing to advance/,
+    );
     const parentEvents = await context.journal.readValidated();
     assert.ok(parentEvents.some((event) => event.type === "session.restored"));
     assert.ok(parentEvents.some((event) => event.type === "session.forked"));
@@ -341,6 +387,31 @@ test("checkpoint, restore, crash recovery, and fork retain durable journal linea
     if (childRoot !== undefined) await rm(childRoot, { recursive: true, force: true });
     await context.cleanup();
   }
+});
+
+test("runtime notes alone never authorize a conversational advance", async () => {
+  let decisions = 0;
+  const kernel = new AgentKernel({
+    model: {
+      async decide() {
+        decisions += 1;
+        return { kind: "respond" as const, message: "must not run" };
+      },
+    },
+    tools: [],
+    verifiers: [],
+    journal: new MemoryJournal(),
+    options: { interactive: true },
+  });
+  await assert.rejects(
+    kernel.advance({}, undefined, [{
+      sequence: 1,
+      type: "runtime.note",
+      data: { text: "Trusted runtime context, not a human request." },
+    }]),
+    /Nothing to advance/,
+  );
+  assert.equal(decisions, 0);
 });
 
 test("compiled review/apply/undo commands are explicit and machine-readable", async () => {

@@ -13,52 +13,128 @@ import { promisify } from "node:util";
 
 const execute = promisify(execFile);
 const JOURNAL_GENESIS = "0".repeat(64);
-const IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
+const IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules"]);
 const OUTPUT_LIMIT = 20_000;
+const DEFAULT_MAX_DURATION_MS = 600_000;
+const DEFAULT_COMMAND_TIMEOUT_MS = 1_800_000;
+const DEFAULT_MAX_CONTEXT_BYTES = 2_000_000;
+const DEFAULT_MAX_VERIFICATION_ATTEMPTS = 3;
+const SEALED_DEFAULT_EXTENSIONS = {
+  config: {
+    version: 1,
+    permissions: {
+      effects: ["observe", "review", "state"],
+      customTools: [],
+      mcpServers: [],
+      hooks: [],
+      commandCount: 0,
+    },
+    skills: {
+      roots: [".vanguard/skills"],
+      maxFiles: 32,
+      maxFileBytes: 128 * 1024,
+      maxTotalBytes: 512 * 1024,
+    },
+    tools: [],
+    mcp: [],
+    hooks: [],
+  },
+  provenance: [],
+  instructionBytes: 0,
+};
+const RUN_CONFIGURATION_KEYS = ["options", "version"];
+const RUN_OPTION_KEYS = [
+  "allowedCommands", "commandTimeoutMs", "disableExtensions", "editableRoots", "exposeRawProcess",
+  "extensions", "maxContextBytes", "maxDurationMs", "maxFailedVerificationAttempts", "maxSteps", "model",
+  "protectedPaths", "provider", "publicCheck", "restrictProcess", "securityProfile", "task", "verification",
+  "verifierEvidence", "workspace",
+];
 
-let request;
-try {
-  request = process.argv.includes("--case-file")
-    ? await requestFromCaseFile()
-    : JSON.parse(Buffer.from(argument("--request-base64"), "base64").toString("utf8"));
-  validateRequest(request);
-} catch (error) {
-  process.stderr.write(`Evaluator request is invalid: ${message(error)}\n`);
-  process.exit(2);
+if (process.argv.includes("--preflight-case-file")) {
+  try {
+    const material = await readCaseMaterial("--preflight-case-file");
+    process.stdout.write(`${JSON.stringify({
+      caseFile: material.caseFile,
+      sourceWorkspace: material.sourceWorkspace,
+      taskFile: material.taskFile,
+      grader: material.grader,
+    })}\n`);
+  } catch (error) {
+    process.stderr.write(`Evaluator case preflight is invalid: ${message(error)}\n`);
+    process.exit(2);
+  }
+} else {
+  let request;
+  try {
+    request = process.argv.includes("--case-file")
+      ? await requestFromCaseFile()
+      : JSON.parse(Buffer.from(argument("--request-base64"), "base64").toString("utf8"));
+    validateRequest(request);
+  } catch (error) {
+    process.stderr.write(`Evaluator request is invalid: ${message(error)}\n`);
+    process.exit(2);
+  }
+
+  const result = await evaluate(request);
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-const result = await evaluate(request);
-process.stdout.write(`${JSON.stringify(result)}\n`);
-
 async function requestFromCaseFile() {
-  const caseFile = await realpath(path.resolve(argument("--case-file")));
-  const caseRoot = path.dirname(caseFile);
-  const definition = parseSingleObject(await readFile(caseFile, "utf8"), "case definition");
-  validateCaseDefinition(definition);
-  const sourceWorkspace = await confinedCasePath(caseRoot, definition.workspace, "workspace", "directory");
-  const taskFile = await confinedCasePath(caseRoot, definition.task, "task", "file");
-  const grader = await confinedCasePath(caseRoot, definition.grader, "grader", "file");
+  const { definition, sourceWorkspace, taskFile, grader } = await readCaseMaterial("--case-file");
   const engineExitCodeText = argument("--engine-exit-code");
   if (!/^-?\d+$/u.test(engineExitCodeText)) throw new Error("engine exit code is invalid");
   const engineExitCode = Number(engineExitCodeText);
   if (!Number.isSafeInteger(engineExitCode)) throw new Error("engine exit code is invalid");
+  const engineTimedOutText = argument("--engine-timed-out");
+  if (engineTimedOutText !== "true" && engineTimedOutText !== "false") {
+    throw new Error("engine timed-out flag is invalid");
+  }
   return {
     caseId: definition.id,
     caseVersion: definition.version ?? 1,
     track: definition.track,
     candidateOutputFile: path.resolve(argument("--candidate-output-file")),
     engineExitCode,
+    engineTimedOut: engineTimedOutText === "true",
     sourceWorkspace,
     grader,
     provider: argument("--provider"),
     model: argument("--model"),
-    task: await readFile(taskFile, "utf8"),
+    task: await readUtf8Strict(taskFile, "case task"),
     maxSteps: definition.maxSteps,
+    maxDurationMs: definition.maxDurationMs ?? DEFAULT_MAX_DURATION_MS,
+    commandTimeoutMs: DEFAULT_COMMAND_TIMEOUT_MS,
+    maxContextBytes: definition.maxContextBytes ?? DEFAULT_MAX_CONTEXT_BYTES,
+    maxFailedVerificationAttempts: DEFAULT_MAX_VERIFICATION_ATTEMPTS,
+    exposeRawProcess: definition.rawProcess ?? false,
+    disableExtensions: true,
     graderTimeoutMs: 600_000,
     editableRoots: definition.editableRoots,
     protectedPaths: definition.protected,
     publicCheck: definition.publicCheck,
   };
+}
+
+async function readCaseMaterial(argumentName) {
+  const caseFile = await realpath(path.resolve(argument(argumentName)));
+  const caseRoot = path.dirname(caseFile);
+  const definition = parseSingleObject(await readUtf8Strict(caseFile, "case definition"), "case definition");
+  validateCaseDefinition(definition);
+  const sourceWorkspace = await confinedCasePath(caseRoot, definition.workspace, "workspace", "directory");
+  const taskFile = await confinedCasePath(caseRoot, definition.task, "task", "file");
+  const grader = await confinedCasePath(caseRoot, definition.grader, "grader", "file");
+  const sealedFiles = [["case definition", caseFile], ["task", taskFile], ["grader", grader]];
+  for (const [label, file] of sealedFiles) {
+    if (isWithin(sourceWorkspace, file)) throw new Error(`case ${label} must be outside the source workspace`);
+  }
+  for (let left = 0; left < sealedFiles.length; left += 1) {
+    for (let right = left + 1; right < sealedFiles.length; right += 1) {
+      if (samePath(sealedFiles[left][1], sealedFiles[right][1])) {
+        throw new Error(`case ${sealedFiles[left][0]} and ${sealedFiles[right][0]} must be distinct files`);
+      }
+    }
+  }
+  return { caseFile, caseRoot, definition, sourceWorkspace, taskFile, grader };
 }
 
 function validateCaseDefinition(value) {
@@ -71,17 +147,31 @@ function validateCaseDefinition(value) {
     if (!allowed.has(key)) throw new Error(`case definition contains unsupported field '${key}'`);
   }
   for (const field of ["id", "track", "workspace", "task", "grader"]) requireString(value[field], field);
-  if (value.version !== undefined && (!Number.isSafeInteger(value.version) || value.version < 1)) {
+  if (!/^[a-z0-9][a-z0-9_-]*$/u.test(value.id)) throw new Error("case id is invalid");
+  if (value.version !== undefined
+    && (!Number.isSafeInteger(value.version) || value.version < 1 || value.version > 1_000_000)) {
     throw new Error("case version is invalid");
   }
   if (!Number.isSafeInteger(value.maxSteps) || value.maxSteps < 1) throw new Error("case maxSteps is invalid");
+  if (value.maxDurationMs !== undefined
+    && (!Number.isSafeInteger(value.maxDurationMs) || value.maxDurationMs < 1 || value.maxDurationMs > 604_800_000)) {
+    throw new Error("case maxDurationMs is invalid");
+  }
+  if (value.maxContextBytes !== undefined
+    && (!Number.isSafeInteger(value.maxContextBytes) || value.maxContextBytes < 1_024 || value.maxContextBytes > 100_000_000)) {
+    throw new Error("case maxContextBytes is invalid");
+  }
+  if (value.rawProcess !== undefined && typeof value.rawProcess !== "boolean") {
+    throw new Error("case rawProcess is invalid");
+  }
+  if (value.rawProcess === true) throw new Error("case rawProcess is incompatible with guarded execution");
   if (!Array.isArray(value.editableRoots) || !value.editableRoots.every((entry) => typeof entry === "string")) {
     throw new Error("case editableRoots is invalid");
   }
   if (!Array.isArray(value.protected) || !value.protected.every((entry) => typeof entry === "string")) {
     throw new Error("case protected paths are invalid");
   }
-  if (!isObject(value.publicCheck) || typeof value.publicCheck.command !== "string"
+  if (!isObject(value.publicCheck) || typeof value.publicCheck.command !== "string" || value.publicCheck.command.length === 0
     || !Array.isArray(value.publicCheck.args)
     || !value.publicCheck.args.every((entry) => typeof entry === "string")) {
     throw new Error("case publicCheck is invalid");
@@ -118,7 +208,7 @@ async function evaluate(input) {
     score: 0,
     verified: false,
     classification: "engine_error",
-    capabilityEligible: true,
+    canaryDenominatorEligible: true,
     steps: 0,
     durationMs: 0,
     toolFailures: 0,
@@ -141,6 +231,7 @@ async function evaluate(input) {
     engineOutputFile: path.resolve(input.candidateOutputFile),
     engineOutputSha256: null,
     exitCode: input.engineExitCode,
+    timedOut: input.engineTimedOut,
     evaluator: {
       bindingPassed: false,
       integrityPassed: false,
@@ -158,6 +249,14 @@ async function evaluate(input) {
   let workspace;
   let journal;
   const violations = base.evaluator.violations;
+  if (input.engineTimedOut) {
+    try {
+      const rawBytes = await readFile(input.candidateOutputFile);
+      base.engineOutputSha256 = createHash("sha256").update(rawBytes).digest("hex");
+    } catch {}
+    violations.push("candidate engine exceeded the sealed harness wall-clock deadline");
+    return base;
+  }
   try {
     const rawBytes = await readFile(input.candidateOutputFile);
     base.engineOutputSha256 = createHash("sha256").update(rawBytes).digest("hex");
@@ -213,7 +312,7 @@ async function evaluate(input) {
   const engineClassification = scorecard?.grade?.classification;
   const engineCompleted = scorecard?.outcome?.status === "completed";
   const engineVerified = scorecard?.grade?.verified === true;
-  const externallyAccepted = base.evaluator.bindingPassed
+  const canaryAccepted = base.evaluator.bindingPassed
     && base.evaluator.integrityPassed
     && base.evaluator.graderPassed
     && violations.length === 0
@@ -221,22 +320,22 @@ async function evaluate(input) {
     && engineVerified
     && input.engineExitCode === 0;
 
-  if (externallyAccepted) {
+  if (canaryAccepted) {
     base.verified = true;
     base.score = 1;
     base.classification = "verified";
-    base.capabilityEligible = true;
+    base.canaryDenominatorEligible = true;
   } else if (base.evaluator.bindingPassed && engineClassification === "infrastructure_error") {
     base.score = 0;
     base.classification = "infrastructure_error";
-    base.capabilityEligible = false;
+    base.canaryDenominatorEligible = false;
   } else {
     // Invalid stdout, broken session bindings, verifier mismatches, and engine
     // crashes are candidate failures. They must not disappear from the
     // denominator under the infrastructure-error label.
     base.score = 0;
     base.classification = base.evaluator.bindingPassed ? "capability_failure" : "engine_error";
-    base.capabilityEligible = true;
+    base.canaryDenominatorEligible = true;
   }
   return base;
 }
@@ -317,16 +416,25 @@ async function validateSessionArtifacts(input, scorecard, workspace, violations)
   }
   const configuration = parseSingleObject(await readFile(expected.configurationFile, "utf8"), "run configuration");
   const options = configuration.options;
-  if (configuration.version !== 1 || !isObject(options)
+  if (!hasExactKeys(configuration, RUN_CONFIGURATION_KEYS)
+    || configuration.version !== 1 || !hasExactKeys(options, RUN_OPTION_KEYS)
     || !samePath(path.resolve(options.workspace ?? ""), path.resolve(input.sourceWorkspace))
     || options.task !== input.task || options.provider !== input.provider || options.model !== input.model
     || stableJson(options.verification) !== stableJson({ command: "node", args: [path.resolve(input.grader), "."] })
     || stableJson(options.publicCheck) !== stableJson(input.publicCheck)
     || stableJson(options.protectedPaths) !== stableJson(input.protectedPaths)
     || stableJson(options.editableRoots) !== stableJson(input.editableRoots)
+    || stableJson(options.allowedCommands) !== stableJson([])
     || options.securityProfile !== "guarded" || options.restrictProcess !== true
-    || options.exposeRawProcess !== false || options.verifierEvidence !== "summary"
-    || options.maxSteps !== input.maxSteps) {
+    || options.exposeRawProcess !== input.exposeRawProcess || options.verifierEvidence !== "summary"
+    || options.maxSteps !== input.maxSteps
+    || options.maxDurationMs !== input.maxDurationMs
+    || options.commandTimeoutMs !== input.commandTimeoutMs
+    || options.maxContextBytes !== input.maxContextBytes
+    || options.maxFailedVerificationAttempts !== input.maxFailedVerificationAttempts
+    || options.disableExtensions !== input.disableExtensions
+    || stableJson(options.extensions) !== stableJson(SEALED_DEFAULT_EXTENSIONS)
+  ) {
     violations.push("run configuration does not bind the sealed case and guarded execution policy");
   }
 
@@ -508,7 +616,20 @@ function validateRequest(value) {
   ]) requireString(value[field], field);
   if (!Number.isSafeInteger(value.caseVersion) || value.caseVersion < 1) throw new Error("caseVersion is invalid");
   if (!Number.isSafeInteger(value.engineExitCode)) throw new Error("engineExitCode is invalid");
+  if (typeof value.engineTimedOut !== "boolean") throw new Error("engineTimedOut is invalid");
   if (!Number.isSafeInteger(value.maxSteps) || value.maxSteps < 1) throw new Error("maxSteps is invalid");
+  if (!Number.isSafeInteger(value.maxDurationMs) || value.maxDurationMs < 1) throw new Error("maxDurationMs is invalid");
+  if (!Number.isSafeInteger(value.commandTimeoutMs) || value.commandTimeoutMs < 1) {
+    throw new Error("commandTimeoutMs is invalid");
+  }
+  if (!Number.isSafeInteger(value.maxContextBytes) || value.maxContextBytes < 1_024) {
+    throw new Error("maxContextBytes is invalid");
+  }
+  if (!Number.isSafeInteger(value.maxFailedVerificationAttempts) || value.maxFailedVerificationAttempts < 1) {
+    throw new Error("maxFailedVerificationAttempts is invalid");
+  }
+  if (value.exposeRawProcess !== false) throw new Error("exposeRawProcess must be false");
+  if (value.disableExtensions !== true) throw new Error("disableExtensions must be true");
   if (!Number.isSafeInteger(value.graderTimeoutMs) || value.graderTimeoutMs < 1) throw new Error("graderTimeoutMs is invalid");
   if (!Array.isArray(value.editableRoots) || !value.editableRoots.every((entry) => typeof entry === "string")) {
     throw new Error("editableRoots is invalid");
@@ -519,6 +640,15 @@ function validateRequest(value) {
   if (!isObject(value.publicCheck) || typeof value.publicCheck.command !== "string"
     || !Array.isArray(value.publicCheck.args) || !value.publicCheck.args.every((entry) => typeof entry === "string")) {
     throw new Error("publicCheck is invalid");
+  }
+}
+
+async function readUtf8Strict(file, label) {
+  const bytes = await readFile(file);
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`${label} is not valid UTF-8`);
   }
 }
 
@@ -535,6 +665,13 @@ function parseSingleObject(text, label) {
 
 function stableJson(value) {
   return JSON.stringify(sortValue(value));
+}
+
+function hasExactKeys(value, expected) {
+  if (!isObject(value)) return false;
+  const actual = Object.keys(value).sort(compareOrdinal);
+  const wanted = [...expected].sort(compareOrdinal);
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
 }
 
 function sortValue(value) {

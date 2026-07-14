@@ -18,6 +18,7 @@ import type { FileJournal } from "../kernel/fileJournal.js";
 import type { CodingSession } from "./session.js";
 import { loadSessionBaseline } from "./session.js";
 import { appendSessionEvent } from "./sessionJournal.js";
+import { withSessionLease } from "./sessionLease.js";
 import {
   SESSION_EXCLUDED_DIRECTORIES,
   assertSafeRelativePath,
@@ -105,6 +106,11 @@ export interface TransactionTestOptions {
 }
 
 export async function reviewSessionChanges(session: CodingSession, journal: FileJournal): Promise<PatchManifest> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "change.review", () =>
+    reviewSessionChangesUnlocked(session, journal));
+}
+
+async function reviewSessionChangesUnlocked(session: CodingSession, journal: FileJournal): Promise<PatchManifest> {
   requireMaterialized(session);
   const baseline = await loadSessionBaseline(session);
   const candidate = await snapshotTree(session.workspaceRoot);
@@ -215,12 +221,23 @@ export async function applyReviewedManifest(
   confirmation: string,
   testOptions: TransactionTestOptions = {},
 ): Promise<ApplyResult> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "change.apply", () =>
+    applyReviewedManifestUnlocked(session, journal, manifestHash, confirmation, testOptions));
+}
+
+async function applyReviewedManifestUnlocked(
+  session: CodingSession,
+  journal: FileJournal,
+  manifestHash: string,
+  confirmation: string,
+  testOptions: TransactionTestOptions = {},
+): Promise<ApplyResult> {
   requireMaterialized(session);
   if (!isSha256(manifestHash) || confirmation !== manifestHash) {
     throw new Error("Apply requires --manifest and an exact --confirm copy of its SHA-256 hash.");
   }
   return withSourceLock(session.sourceRoot, async () => {
-    await recoverApplyTransactions(session);
+    await recoverApplyTransactionsUnlocked(session);
     const manifest = await loadReviewedManifest(session, journal, manifestHash);
     if (manifest.changes.length === 0) throw new Error("Reviewed manifest has no changes to apply.");
     if (manifest.changes.some((change) => !change.supported)) {
@@ -300,12 +317,23 @@ export async function undoAppliedTransaction(
   confirmation: string,
   testOptions: TransactionTestOptions = {},
 ): Promise<UndoResult> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "change.undo", () =>
+    undoAppliedTransactionUnlocked(session, journal, transactionId, confirmation, testOptions));
+}
+
+async function undoAppliedTransactionUnlocked(
+  session: CodingSession,
+  journal: FileJournal,
+  transactionId: string,
+  confirmation: string,
+  testOptions: TransactionTestOptions = {},
+): Promise<UndoResult> {
   requireMaterialized(session);
   if (!/^apply-[a-f0-9-]+$/.test(transactionId) || confirmation !== transactionId) {
     throw new Error("Undo requires --apply and an exact --confirm copy of the transaction ID.");
   }
   return withSourceLock(session.sourceRoot, async () => {
-    await recoverApplyTransactions(session);
+    await recoverApplyTransactionsUnlocked(session);
     let transaction = await loadTransaction(session, transactionId);
     if (transaction.state !== "applied") throw new Error(`Transaction ${transactionId} is not currently applied.`);
     const sourceNow = await snapshotTree(session.sourceRoot);
@@ -347,6 +375,11 @@ export async function undoAppliedTransaction(
 
 /** Rolls incomplete apply/revert operations back to their last committed state. */
 export async function recoverApplyTransactions(session: CodingSession): Promise<readonly string[]> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "change.recovery", () =>
+    recoverApplyTransactionsUnlocked(session));
+}
+
+async function recoverApplyTransactionsUnlocked(session: CodingSession): Promise<readonly string[]> {
   const directory = path.join(path.dirname(session.workspaceRoot), "transactions");
   let children: string[];
   try {

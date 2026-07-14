@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, VerificationResult, VerifierPort } from "../kernel/contracts.js";
+import { SESSION_EXCLUDED_DIRECTORIES } from "./treeSnapshot.js";
 
 export interface IntegrityVerifierOptions {
   readonly sourceRoot: string;
@@ -9,8 +10,6 @@ export interface IntegrityVerifierOptions {
   readonly protectedPaths?: readonly string[];
   readonly editableRoots?: readonly string[];
 }
-
-const IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
 
 export class WorkspaceIntegrityVerifier implements VerifierPort {
   readonly name = "workspace integrity";
@@ -59,7 +58,7 @@ async function snapshot(root: string): Promise<Map<string, string>> {
       const absolute = path.join(directory, entry.name);
       const relative = normalizeRelative(path.relative(resolvedRoot, absolute));
       if (entry.isDirectory()) {
-        if (!IGNORED_DIRECTORIES.has(entry.name)) queue.push(absolute);
+        if (!SESSION_EXCLUDED_DIRECTORIES.has(entry.name)) queue.push(absolute);
         continue;
       }
       if (entry.isSymbolicLink()) {

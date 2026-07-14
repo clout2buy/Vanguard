@@ -40,8 +40,12 @@
     "scripts/credential.ps1",
     "scripts/export-credential.ps1",
     "scripts/set-project-secret.ps1",
+    "scripts/install-cli.ps1",
+    "scripts/run-preview.ps1",
+    "scripts/run-project.ps1",
     "scripts/vanguard",
     "scripts/vanguard.ps1",
+    "gauntlet/fixtures/repair-cart",
     "README.md"
   ],
   "scripts": {
@@ -55,8 +59,10 @@
     "vanguard": "npm run build && node dist/src/cli.js",
     "certify": "npm run build && node dist/src/evaluation/certificationCli.js"
   },
+  "dependencies": {
+    "@types/node": "^22.0.0"
+  },
   "devDependencies": {
-    "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   }
 }

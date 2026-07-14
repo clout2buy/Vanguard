@@ -8,6 +8,21 @@ import test from "node:test";
 
 const root = process.cwd();
 const evaluator = path.join(root, "scripts", "gauntlet-evaluator.mjs");
+const sealedExtensions = {
+  config: {
+    version: 1,
+    permissions: {
+      effects: ["observe", "review", "state"],
+      customTools: [], mcpServers: [], hooks: [], commandCount: 0,
+    },
+    skills: {
+      roots: [".vanguard/skills"], maxFiles: 32, maxFileBytes: 128 * 1024, maxTotalBytes: 512 * 1024,
+    },
+    tools: [], mcp: [], hooks: [],
+  },
+  provenance: [],
+  instructionBytes: 0,
+};
 
 test("independent gauntlet evaluator accepts only a bound, in-scope, freshly graded result", async () => {
   const fixture = await createFixture({ candidateValue: 42 });
@@ -18,6 +33,8 @@ test("independent gauntlet evaluator accepts only a bound, in-scope, freshly gra
     assert.equal(result.evaluator.bindingPassed, true);
     assert.equal(result.evaluator.integrityPassed, true);
     assert.equal(result.evaluator.graderPassed, true);
+    assert.equal(result.canaryDenominatorEligible, true);
+    assert.equal("capabilityEligible" in result, false);
     assert.deepEqual(result.evaluator.changedPaths, ["src/answer.mjs"]);
     assert.match(result.evaluator.workspaceManifestSha256, /^[a-f0-9]{64}$/u);
     assert.match(result.evaluator.journalTipSha256, /^[a-f0-9]{64}$/u);
@@ -32,7 +49,7 @@ test("a self-reported pass is rejected when the independent sealed grader fails"
     const result = evaluate(fixture.request);
     assert.equal(result.verified, false);
     assert.equal(result.classification, "capability_failure");
-    assert.equal(result.capabilityEligible, true);
+    assert.equal(result.canaryDenominatorEligible, true);
     assert.equal(result.evaluator.bindingPassed, true);
     assert.equal(result.evaluator.integrityPassed, true);
     assert.equal(result.evaluator.graderPassed, false);
@@ -87,7 +104,7 @@ test("malformed engine stdout is an evaluated engine failure, not an excluded in
     const result = evaluate(fixture.request);
     assert.equal(result.verified, false);
     assert.equal(result.classification, "engine_error");
-    assert.equal(result.capabilityEligible, true);
+    assert.equal(result.canaryDenominatorEligible, true);
     assert.equal(result.score, 0);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
@@ -116,7 +133,7 @@ test("an engine cannot exclude an internal failure by relabeling it as infrastru
     const result = evaluate(fixture.request);
     assert.equal(result.verified, false);
     assert.equal(result.classification, "engine_error");
-    assert.equal(result.capabilityEligible, true);
+    assert.equal(result.canaryDenominatorEligible, true);
     assert.equal(result.score, 0);
     assert.ok(result.evaluator.violations.some((entry: string) => /failed scorecard is inconsistent/u.test(entry)));
   } finally {
@@ -146,7 +163,7 @@ test("a canonically bound provider failure is diagnostic infrastructure but stil
     const result = evaluate(fixture.request);
     assert.equal(result.verified, false);
     assert.equal(result.classification, "infrastructure_error");
-    assert.equal(result.capabilityEligible, false);
+    assert.equal(result.canaryDenominatorEligible, false);
     assert.equal(result.score, 0);
     assert.equal(result.evaluator.bindingPassed, true);
   } finally {
@@ -154,8 +171,45 @@ test("a canonically bound provider failure is diagnostic infrastructure but stil
   }
 });
 
-test("case-file transport preserves an exact trailing-newline task without PowerShell JSON", async () => {
+test("the independent evaluator does not ignore out-of-scope dist output", async () => {
   const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    const workspace = String(JSON.parse(await readFile(fixture.request.candidateOutputFile, "utf8")).workspaceRoot);
+    await mkdir(path.join(workspace, "dist"), { recursive: true });
+    await writeFile(path.join(workspace, "dist", "payload.js"), "export const payload = true;\n", "utf8");
+    const result = evaluate(fixture.request);
+    assert.equal(result.verified, false);
+    assert.equal(result.evaluator.integrityPassed, false);
+    assert.ok(result.evaluator.violations.some((entry: string) =>
+      /out-of-scope workspace change: dist\/payload\.js/u.test(entry)));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("a harness candidate timeout is scored as an engine failure", async () => {
+  const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    fixture.request.engineExitCode = 124;
+    fixture.request.engineTimedOut = true;
+    await writeFile(fixture.request.candidateOutputFile, "partial output", "utf8");
+    const result = evaluate(fixture.request);
+    assert.equal(result.verified, false);
+    assert.equal(result.classification, "engine_error");
+    assert.equal(result.canaryDenominatorEligible, true);
+    assert.equal(result.score, 0);
+    assert.equal(result.timedOut, true);
+    assert.ok(result.evaluator.violations.some((entry: string) => /wall-clock deadline/u.test(entry)));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("case-file transport preserves exact UTF-8 and trailing-newline task text without PowerShell JSON", async () => {
+  const fixture = await createFixture({
+    candidateValue: 42,
+    task: "Repair the résumé cache → keep café keys exact.\nFinish with evidence.\n",
+  });
   try {
     const task = fixture.request.task as string;
     assert.equal(task.endsWith("\n"), true);
@@ -172,12 +226,16 @@ test("case-file transport preserves an exact trailing-newline task without Power
       protected: fixture.request.protectedPaths,
       editableRoots: fixture.request.editableRoots,
       maxSteps: fixture.request.maxSteps,
+      maxDurationMs: fixture.request.maxDurationMs,
+      maxContextBytes: fixture.request.maxContextBytes,
+      rawProcess: fixture.request.exposeRawProcess,
     }, null, 2), "utf8");
     const completed = spawnSync(process.execPath, [
       evaluator,
       "--case-file", caseFile,
       "--candidate-output-file", fixture.request.candidateOutputFile,
       "--engine-exit-code", String(fixture.request.engineExitCode),
+      "--engine-timed-out", "false",
       "--provider", String(fixture.request.provider),
       "--model", String(fixture.request.model),
     ], { cwd: root, encoding: "utf8", timeout: 20_000 });
@@ -190,9 +248,79 @@ test("case-file transport preserves an exact trailing-newline task without Power
   }
 });
 
+test("independent evaluator rejects drift in sealed limits and extension defaults", async () => {
+  const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    const stdout = JSON.parse(await readFile(fixture.request.candidateOutputFile, "utf8"));
+    const scorecard = JSON.parse(await readFile(stdout.scorecardFile, "utf8"));
+    const configuration = JSON.parse(await readFile(scorecard.configurationFile, "utf8"));
+    configuration.options.maxContextBytes += 1;
+    configuration.options.allowedCommands = ["pwsh"];
+    configuration.options.extensions.config.permissions.effects.push("execute");
+    await writeFile(scorecard.configurationFile, JSON.stringify(configuration, null, 2), "utf8");
+
+    const result = evaluate(fixture.request);
+    assert.equal(result.verified, false);
+    assert.equal(result.evaluator.bindingPassed, false);
+    assert.ok(result.evaluator.violations.some((entry: string) => /run configuration does not bind/u.test(entry)));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("independent evaluator rejects unknown run configuration fields", async () => {
+  const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    const stdout = JSON.parse(await readFile(fixture.request.candidateOutputFile, "utf8"));
+    const scorecard = JSON.parse(await readFile(stdout.scorecardFile, "utf8"));
+    const configuration = JSON.parse(await readFile(scorecard.configurationFile, "utf8"));
+    configuration.options.futureBehaviorOverride = true;
+    await writeFile(scorecard.configurationFile, JSON.stringify(configuration, null, 2), "utf8");
+    const result = evaluate(fixture.request);
+    assert.equal(result.verified, false);
+    assert.equal(result.evaluator.bindingPassed, false);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("case preflight separates sealed files while hermetic workspace extension sources remain inert", async () => {
+  const temporary = await mkdtemp(path.join(tmpdir(), "vanguard-case-preflight-"));
+  try {
+    const workspace = path.join(temporary, "workspace");
+    await mkdir(workspace);
+    await writeFile(path.join(temporary, "TASK.md"), "task\n", "utf8");
+    await writeFile(path.join(temporary, "grader.mjs"), "process.exit(0);\n", "utf8");
+    const caseFile = path.join(temporary, "case.json");
+    const definition = {
+      id: "preflight", version: 1, track: "repair", workspace: "workspace", task: "TASK.md", grader: "grader.mjs",
+      publicCheck: { command: "node", args: ["check.mjs"] }, protected: [], editableRoots: ["src"], maxSteps: 4,
+    };
+    await writeFile(caseFile, JSON.stringify(definition), "utf8");
+    assert.equal(preflight(caseFile).status, 0);
+
+    await writeFile(path.join(workspace, "AGENTS.md"), "injected", "utf8");
+    assert.equal(preflight(caseFile).status, 0);
+    await rm(path.join(workspace, "AGENTS.md"));
+
+    await mkdir(path.join(workspace, ".vanguard"));
+    assert.equal(preflight(caseFile).status, 0);
+    await rm(path.join(workspace, ".vanguard"), { recursive: true });
+
+    await writeFile(path.join(workspace, "TASK.md"), "hidden task", "utf8");
+    await writeFile(caseFile, JSON.stringify({ ...definition, task: "workspace/TASK.md" }), "utf8");
+    const separated = preflight(caseFile);
+    assert.equal(separated.status, 2);
+    assert.match(separated.stderr, /must be outside the source workspace/u);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+});
+
 interface FixtureOptions {
   readonly candidateValue: number;
   readonly mutateProtected?: boolean;
+  readonly task?: string;
 }
 
 async function createFixture(options: FixtureOptions): Promise<{
@@ -230,7 +358,7 @@ async function createFixture(options: FixtureOptions): Promise<{
   const canonicalSource = await realpath(source);
   const canonicalWorkspace = await realpath(workspace);
   const id = path.basename(sessionRoot);
-  const task = "Make the answer exactly 42.\n";
+  const task = options.task ?? "Make the answer exactly 42.\n";
   const provider = "deepseek";
   const model = "deepseek-v4-pro";
   const maxSteps = 8;
@@ -257,14 +385,21 @@ async function createFixture(options: FixtureOptions): Promise<{
       provider,
       model,
       verification,
+      allowedCommands: [],
       publicCheck,
       protectedPaths,
       editableRoots,
       securityProfile: "guarded",
       restrictProcess: true,
       exposeRawProcess: false,
+      disableExtensions: true,
       verifierEvidence: "summary",
       maxSteps,
+      maxDurationMs: 600_000,
+      commandTimeoutMs: 1_800_000,
+      maxContextBytes: 2_000_000,
+      maxFailedVerificationAttempts: 3,
+      extensions: sealedExtensions,
     },
   }, null, 2), "utf8");
   const event = { sequence: 1, type: "run.completed", data: { step: 1, answer: "done" } };
@@ -319,12 +454,19 @@ async function createFixture(options: FixtureOptions): Promise<{
       track: "repair",
       candidateOutputFile,
       engineExitCode: 0,
+      engineTimedOut: false,
       sourceWorkspace: canonicalSource,
       grader,
       provider,
       model,
       task,
       maxSteps,
+      maxDurationMs: 600_000,
+      commandTimeoutMs: 1_800_000,
+      maxContextBytes: 2_000_000,
+      maxFailedVerificationAttempts: 3,
+      exposeRawProcess: false,
+      disableExtensions: true,
       graderTimeoutMs: 10_000,
       editableRoots,
       protectedPaths,
@@ -342,6 +484,12 @@ function evaluate(request: Record<string, unknown>): any {
   });
   assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`);
   return JSON.parse(completed.stdout);
+}
+
+function preflight(caseFile: string) {
+  return spawnSync(process.execPath, [evaluator, "--preflight-case-file", caseFile], {
+    cwd: root, encoding: "utf8", timeout: 10_000,
+  });
 }
 
 async function patchMetrics(beforeRoot: string, afterRoot: string): Promise<{

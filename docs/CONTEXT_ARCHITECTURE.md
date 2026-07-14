@@ -1,90 +1,101 @@
-# Phase 3 design: durable context architecture
+# Vanguard durable-context architecture
 
-Replaces per-turn churn compaction with sticky, monotonic context management.
-This document is the implementation contract for Phase 3; tests must map to
-the acceptance list at the bottom.
+This document describes the implemented long-horizon context boundary. The
+journal remains the source of truth; provider messages are a bounded,
+deterministic projection of the current logical branch.
 
-## The problem being replaced
+## Message authority
 
-`EvidenceContextPolicy` re-selects transcript chunks every turn by priority
-within a byte budget. Under budget the prefix is byte-stable; over budget the
-selection churns, invalidating provider prefix caches from the first changed
-byte on every turn (the six-track audit recorded 125 forced compactions in
-one run). Working state is also injected at the *task position* — early in
-the message stream — so every checkpoint/plan revision rewrites early bytes.
+Vanguard keeps four sources distinct:
 
-## Target message layout (conceptual, all providers)
+1. The system prompt is runtime-authored policy.
+2. The contracted task is immutable runtime-owned context.
+3. Human messages retain the `user` role and the latest one is preserved
+   exactly.
+4. Plans, checkpoints, repository data, summaries, and other working state are
+   inert assistant-side history. Their strings are quoted data, never human
+   instructions.
 
-1. **System prompt** — stable per mode.
-2. **Task/contract message** — immutable once contracted. No working state.
-3. **Elided-history summary block** — one versioned entry; grows
-   monotonically; changes only when the compaction boundary advances.
-4. **Recent transcript window** — append-only between boundary advances.
-5. **Runtime state tail** — plan + checkpoint + unproven milestones as the
-   final message. Changes freely; being last, it invalidates nothing.
+When dynamic working state is present, the codec appends it as an inert
+assistant message. If the transcript contains a human message, the codec then
+re-anchors that exact latest message after the state block. This prevents
+model- or workspace-authored text from becoming the final user authority.
 
-Cache economics: (1)(2) never change; (3) pays one cache miss per boundary
-advance instead of per turn; (4) is append-only; (5) is tail-only.
+## Bounded context projection
 
-## Sticky boundary rules
+`StickyContextPolicy` accounts for the complete serialized request tail and
+fails closed with `ContextBudgetExceededError` when the irreducible task,
+latest human correction, and runtime tail cannot fit.
 
-- The transcript is summarized oldest-first. The boundary index only moves
-  forward, and its position is a deterministic function of cumulative entry
-  sizes and the byte budget — so it reconstructs identically after resume,
-  keeping prefixes byte-stable across process restarts.
-- Boundary advances happen only when the recent window exceeds its share of
-  the budget; each advance moves the boundary far enough to free
-  headroom (hysteresis), not one entry at a time.
-- Entries behind the boundary are represented in the summary block as
-  compact structural digests with source references (journal sequence /
-  entry index): `#12 workspace.read src/a.ts → ok (sha 1f3c…)`.
+- Tool decisions and all corresponding observations form one causal chunk; a
+  compaction boundary never creates an orphan tool call.
+- Oversized old tool exchanges become inert structural summaries containing
+  category, status, counts, byte size, and hashes. Raw arguments, output, and
+  workspace prose are not promoted into instructions.
+- Omitted history is represented by a bounded cumulative digest. Recent
+  verification and human corrections are retained when the budget permits.
+- The newest human message and task anchor are irreducible.
+- Private provider continuation state, including DeepSeek reasoning content and
+  Anthropic thinking/signatures, is replayed only through the provider codec
+  path that owns it; public streaming never emits it.
 
-## Preservation invariants (never summarized away)
+Selection is deterministic from the same logical journal, byte budget, and
+runtime tail. Resume therefore rebuilds the same context instead of depending
+on process-local memory.
 
-- Task/contract entries (also re-anchored by codecs if absent).
-- User messages and corrections — retained verbatim in the summary block
-  when they fall behind the boundary, never paraphrased away.
-- Verification results and the most recent failure of each distinct kind.
-- Runtime re-grounding notes may be dropped entirely (they are regenerated).
-- Tool call/observation pairing: the boundary never splits a decision from
-  its observations; codecs continue to see fully paired calls.
-- Pending questions cannot fall behind the boundary (the kernel pauses on
-  them; the answer arrives adjacent).
+## Logical history and time travel
 
-## Working-state tail
+The physical journal is append-only and hash-chained. Restoring a checkpoint
+does not delete the abandoned suffix. `logicalRunEvents` verifies the bound
+checkpoint ID, journal hash, sequence, and workspace root hash, then projects
+the checkpoint prefix plus the restore suffix. Step budgets, recovery budgets,
+plans, evidence, and model context resume from that logical branch while the
+discarded history remains auditable on disk.
 
-Codecs stop injecting working state into the task message. Instead, when
-`workingState !== null`, the final rendered message becomes:
-`[Vanguard runtime state] {json}` (user role). The kernel already refreshes
-the snapshot per request.
+All public review/apply/undo/checkpoint/list/restore/fork operations acquire the
+same cross-process session lease used by execution. Workspace swaps and journal
+appends therefore cannot race a live agent run through either the CLI or the
+exported library surface.
 
-## Provider cache breakpoints
+## Evidence freshness
 
-- Anthropic: `cache_control: {type: "ephemeral"}` on the system prompt, the
-  task message, and the summary block (≤4 breakpoints total).
-- OpenAI/DeepSeek: automatic prefix caching — byte stability is the
-  optimization; no markup.
+Every monitored workspace state has a durable fingerprint and monotonically
+increasing generation. Vanguard checks the boundary at run/resume, each model
+decision boundary, after inference, around every tool batch, and before and
+after sealed verification.
 
-## Usage and cost normalization
+- Any detected or uncertain change opens a new generation.
+- A changed or interrupted operation cannot certify itself.
+- Only runtime-authorized, successful, non-mutating execution or review
+  observations can clear the post-change gates.
+- Proven plan milestones must cite evidence from the current generation.
+- An unmatched verifier start is recovered as an interrupted, failed claim and
+  opens an uncertain generation on resume.
 
-- The Phase 1 `StreamObserver.usage` channel feeds a `UsageLedger`
-  (per-session accumulation: input/output/cached tokens, calls).
-- Scorecards gain `usage` (normalized across providers) and `estimatedCost`
-  (per-model price table; DeepSeek defaults included, overridable via
-  configuration). Latency per model call is recorded alongside.
-- `context.compacted` events gain summary-block version and boundary index
-  so compaction-induced evidence loss is detectable and reportable.
+This is a freshness and integrity boundary, not a substitute for sealed tests
+or external isolation.
 
-## Acceptance tests (Phase 3)
+## Provider caching and usage
 
-1. A 500-turn synthetic journal stays within the context budget end to end.
-2. The rendered prefix (system/task/summary) is byte-stable across ordinary
-   turns — asserted by encoding consecutive requests and comparing prefixes.
-3. No orphan tool calls at any boundary position (property test across
-   boundary placements).
-4. A user correction issued early survives 100+ subsequent turns of
-   compaction verbatim.
-5. Cost calculations reproduce fixture usage payloads exactly across the
-   three provider shapes.
-6. Boundary reconstruction after resume yields byte-identical context to an
-   uninterrupted run of the same journal.
+The task and stable prefix stay byte-stable between boundary advances.
+Anthropic receives ephemeral cache markers on the system prompt and stable task
+boundary; OpenAI-compatible providers rely on prefix stability. Normalized
+usage, cached tokens, call latency, and configured cost estimates flow through
+the usage ledger into scorecards.
+
+## Required invariants
+
+The test suite covers:
+
+1. hard context-byte limits across long synthetic histories;
+2. exact latest-human retention after compaction;
+3. no orphan tool/control calls at any boundary;
+4. deterministic reconstruction after resume and time travel;
+5. private reasoning preservation without public leakage;
+6. workspace-generation invalidation across tools, inference, verification,
+   interruption, and out-of-process drift;
+7. cross-process lease exclusion for CLI and public library mutation paths; and
+8. normalized provider usage and cache-breakpoint rendering.
+
+These local invariants support long-horizon reliability. They do not, by
+themselves, certify competitive parity or superiority.

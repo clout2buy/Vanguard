@@ -32,6 +32,13 @@ if (-not [string]::IsNullOrWhiteSpace($CaseIdJsonBase64)) {
 . (Join-Path $PSScriptRoot "credential.ps1")
 . (Join-Path $PSScriptRoot "canary-support.ps1")
 Import-VanguardCredential -Provider $Provider -Root $HarnessRoot
+$CredentialVariable = switch ($Provider) {
+  "openai" { "OPENAI_API_KEY" }
+  "anthropic" { "ANTHROPIC_API_KEY" }
+  "deepseek" { "DEEPSEEK_API_KEY" }
+}
+$CanaryEnvironment = Get-CanaryProcessEnvironment -CredentialVariable $CredentialVariable
+$EvaluatorEnvironment = Get-CanaryProcessEnvironment
 if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
   $PSNativeCommandUseErrorActionPreference = $false
 }
@@ -61,11 +68,11 @@ try {
   $CaseFiles = @(Get-ChildItem -LiteralPath $CasesRoot -Filter case.json -Recurse | Sort-Object FullName)
   $CaseCatalog = @{}
   foreach ($CaseFile in $CaseFiles) {
-    $CandidateCase = Get-Content -Raw -LiteralPath $CaseFile.FullName | ConvertFrom-Json
+    $CandidateCase = Read-CanaryUtf8Text -Path $CaseFile.FullName | ConvertFrom-Json
     $CandidateVersion = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "version" -Default 1
     $CandidateMaxDurationMs = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "maxDurationMs" -Default 600000
-    $CandidateMaxContextBytes = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "maxContextBytes"
-    $CandidateRawProcess = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "rawProcess"
+    $CandidateMaxContextBytes = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "maxContextBytes" -Default 2000000
+    $CandidateRawProcess = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "rawProcess" -Default $false
     if ([string]$CandidateCase.id -notmatch "^[a-z0-9][a-z0-9_-]*$") {
       throw "Gauntlet case has an invalid id: $($CaseFile.FullName)"
     }
@@ -81,23 +88,40 @@ try {
       -or $CandidateCase.protected -isnot [array] `
       -or $CandidateVersion -isnot [int] -or $CandidateVersion -lt 1 -or $CandidateVersion -gt 1000000 `
       -or $CandidateMaxDurationMs -isnot [int] -or $CandidateMaxDurationMs -lt 1 -or $CandidateMaxDurationMs -gt 604800000 `
-      -or ($null -ne $CandidateMaxContextBytes -and (
-        $CandidateMaxContextBytes -isnot [int] -or $CandidateMaxContextBytes -lt 1024 -or $CandidateMaxContextBytes -gt 100000000
-      )) `
-      -or ($null -ne $CandidateRawProcess -and $CandidateRawProcess -isnot [bool])) {
+      -or $CandidateMaxContextBytes -isnot [int] -or $CandidateMaxContextBytes -lt 1024 -or $CandidateMaxContextBytes -gt 100000000 `
+      -or $CandidateRawProcess -isnot [bool] -or $CandidateRawProcess -ne $false) {
       throw "Gauntlet case schema is invalid: $($CaseFile.FullName)"
     }
     if ($CaseCatalog.ContainsKey([string]$CandidateCase.id)) {
       throw "Duplicate gauntlet case id '$($CandidateCase.id)'."
     }
+    $PreflightProcess = Invoke-CanaryUtf8Process `
+      -FilePath "node" `
+      -ArgumentList @($Evaluator, "--preflight-case-file", $CaseFile.FullName) `
+      -Environment $EvaluatorEnvironment `
+      -WorkingDirectory $Root `
+      -TimeoutMs 30000
+    if ($PreflightProcess.timedOut) {
+      throw "Gauntlet case preflight timed out for '$($CandidateCase.id)'."
+    }
+    if ($PreflightProcess.exitCode -ne 0) {
+      throw "Gauntlet case preflight failed for '$($CandidateCase.id)': $($PreflightProcess.stderr)"
+    }
+    try {
+      $Preflight = $PreflightProcess.stdout | ConvertFrom-Json
+    }
+    catch {
+      throw "Gauntlet case preflight returned malformed JSON for '$($CandidateCase.id)': $($_.Exception.Message)"
+    }
     $CaseCatalog[[string]$CandidateCase.id] = [pscustomobject]@{
       file = $CaseFile
       case = $CandidateCase
+      paths = $Preflight
       options = [pscustomobject]@{
         version = [int]$CandidateVersion
         maxDurationMs = [int]$CandidateMaxDurationMs
-        maxContextBytes = $CandidateMaxContextBytes
-        rawProcess = $CandidateRawProcess
+        maxContextBytes = [int]$CandidateMaxContextBytes
+        rawProcess = [bool]$CandidateRawProcess
       }
     }
   }
@@ -115,17 +139,21 @@ try {
   $Results = @()
   foreach ($CatalogEntry in $CaseCatalog.Values | Sort-Object { $_.file.FullName }) {
     $CaseFile = $CatalogEntry.file
-    $CaseRoot = Split-Path -Parent $CaseFile.FullName
     $Case = $CatalogEntry.case
     $CaseOptions = $CatalogEntry.options
+    $CasePaths = $CatalogEntry.paths
     if ($CaseId.Count -gt 0 -and $Case.id -notin $CaseId) { continue }
-    $Workspace = Join-Path $CaseRoot $Case.workspace
-    $Task = Get-Content -Raw -LiteralPath (Join-Path $CaseRoot $Case.task)
-    $Grader = Join-Path $CaseRoot $Case.grader
+    $Workspace = [string]$CasePaths.sourceWorkspace
+    $TaskFile = [string]$CasePaths.taskFile
+    # Validate the sealed bytes before model work, but pass only the absolute
+    # path to Node. Windows PowerShell 5.1 corrupts quotes and non-ASCII text
+    # when a multiline task is marshalled as a native command argument.
+    $null = Read-CanaryUtf8Text -Path $TaskFile
+    $Grader = [string]$CasePaths.grader
     $Arguments = @(
       "dist/src/cli.js", "run",
       "--workspace", $Workspace,
-      "--task", $Task,
+      "--task-file", $TaskFile,
       "--provider", $Provider,
       "--model", $Model,
       "--verify-command", "node",
@@ -134,22 +162,34 @@ try {
       "--security-profile", "guarded",
       "--restrict-process", "true",
       "--verifier-evidence", "summary",
+      "--disable-extensions", "true",
       "--max-duration-ms", [string]$CaseOptions.maxDurationMs,
+      "--command-timeout-ms", "1800000",
+      "--max-context-bytes", [string]$CaseOptions.maxContextBytes,
       "--max-verification-attempts", "3",
-      "--max-steps", [string]$Case.maxSteps
+      "--max-steps", [string]$Case.maxSteps,
+      "--expose-raw-process", ([string]$CaseOptions.rawProcess).ToLowerInvariant()
     )
-    if ($null -ne $CaseOptions.maxContextBytes) { $Arguments += @("--max-context-bytes", [string]$CaseOptions.maxContextBytes) }
     if ($null -ne $Case.publicCheck) {
       $Arguments += @("--check-command", [string]$Case.publicCheck.command)
       foreach ($CheckArgument in $Case.publicCheck.args) { $Arguments += @("--check-arg", [string]$CheckArgument) }
     }
-    if ($null -ne $CaseOptions.rawProcess) { $Arguments += @("--expose-raw-process", ([string]$CaseOptions.rawProcess).ToLowerInvariant()) }
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
     foreach ($EditableRoot in $Case.editableRoots) { $Arguments += @("--editable-root", [string]$EditableRoot) }
 
     Write-Host "Running $($Case.id) [$($Case.track)]..." -ForegroundColor Cyan
-    $Raw = (& node @Arguments | Out-String)
-    $ExitCode = $LASTEXITCODE
+    $EngineTimeoutMs = [int][Math]::Min(604800000, ([int64]$CaseOptions.maxDurationMs + 30000))
+    $EngineProcess = Invoke-CanaryUtf8Process `
+      -FilePath "node" `
+      -ArgumentList $Arguments `
+      -Environment $CanaryEnvironment `
+      -WorkingDirectory $Root `
+      -TimeoutMs $EngineTimeoutMs
+    $Raw = $EngineProcess.stdout
+    $ExitCode = $EngineProcess.exitCode
+    if (-not [string]::IsNullOrWhiteSpace($EngineProcess.stderr)) {
+      Write-Host $EngineProcess.stderr -ForegroundColor DarkGray
+    }
     $EngineOutputFile = Join-Path $ResultsRoot "engine-$($Case.id)-$([guid]::NewGuid().ToString('N')).json"
     [IO.File]::WriteAllText($EngineOutputFile, $Raw, [Text.UTF8Encoding]::new($false))
     # The evaluator derives its sealed request directly from the pinned case
@@ -161,13 +201,23 @@ try {
       "--case-file", $CaseFile.FullName,
       "--candidate-output-file", $EngineOutputFile,
       "--engine-exit-code", [string]$ExitCode,
+      "--engine-timed-out", ([string][bool]$EngineProcess.timedOut).ToLowerInvariant(),
       "--provider", $Provider,
       "--model", $Model
     )
-    $EvaluationRaw = (& node @EvaluatorArguments | Out-String)
-    $EvaluatorExit = $LASTEXITCODE
+    $EvaluatorProcess = Invoke-CanaryUtf8Process `
+      -FilePath "node" `
+      -ArgumentList $EvaluatorArguments `
+      -Environment $EvaluatorEnvironment `
+      -WorkingDirectory $Root `
+      -TimeoutMs 660000
+    if ($EvaluatorProcess.timedOut) {
+      throw "Independent evaluator timed out for '$($Case.id)'."
+    }
+    $EvaluationRaw = $EvaluatorProcess.stdout
+    $EvaluatorExit = $EvaluatorProcess.exitCode
     if ($EvaluatorExit -ne 0) {
-      throw "Independent evaluator failed for '$($Case.id)' with exit code $EvaluatorExit. $EvaluationRaw"
+      throw "Independent evaluator failed for '$($Case.id)' with exit code $EvaluatorExit. $($EvaluatorProcess.stderr)"
     }
     try {
       $Evaluation = $EvaluationRaw | ConvertFrom-Json
@@ -182,12 +232,13 @@ try {
   if ($Total -eq 0) {
     throw "No gauntlet cases matched -CaseId: $($CaseId -join ', ')."
   }
-  $EvaluatedResults = @($Results | Where-Object capabilityEligible)
+  $EvaluatedResults = @($Results | Where-Object canaryDenominatorEligible)
   $Evaluated = $EvaluatedResults.Count
   $InfrastructureErrors = $Total - $Evaluated
   $Passed = @($Results | Where-Object verified).Count
   $Aggregate = [pscustomobject]@{
-    version = 8
+    version = 9
+    evidenceBoundary = New-CanaryEvidenceBoundary -Purpose "regression-diagnostic"
     provider = $Provider
     model = $Model
     passed = $Passed
@@ -219,7 +270,7 @@ try {
       beforeLines = [int](($Results | Measure-Object -Property beforeLines -Sum).Sum)
       afterLines = [int](($Results | Measure-Object -Property afterLines -Sum).Sum)
     }
-    externalEvaluation = [pscustomobject]@{
+    hostCaseEvaluation = [pscustomobject]@{
       bindingFailures = @($Results | Where-Object { -not $_.evaluator.bindingPassed }).Count
       integrityFailures = @($Results | Where-Object { -not $_.evaluator.integrityPassed }).Count
       graderFailures = @($Results | Where-Object { -not $_.evaluator.graderPassed }).Count
@@ -239,6 +290,7 @@ try {
   Write-CanaryJson -InputObject $Aggregate -Path $Output -Depth 10
   $Aggregate | ConvertTo-Json -Depth 10
   Write-Host "Aggregate scorecard: $Output" -ForegroundColor Green
+  Write-Host "Developer-visible inner-harness result only. This is not Phase 13 certification and cannot establish competitive parity or superiority." -ForegroundColor Yellow
   if ($InfrastructureErrors -gt 0) { exit 2 }
   if ($Passed -ne $Total) { exit 1 }
 }

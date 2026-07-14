@@ -3,8 +3,10 @@
 Continuously updated execution record for the master directive. It tracks
 phase commits, intended KPIs, implementation and adversarial evidence,
 invalidated results, and unresolved risks. Canary metrics are recorded only
-when a run clears the Gate Zero validity boundary; missing runs stay explicit.
-Implementation completion is never described as competitive certification.
+when a run clears the Gate Zero validity boundary; `valid` means usable as a
+visible regression diagnostic, not passed or certifiable. Missing runs stay
+explicit. Implementation completion is never described as competitive
+certification.
 
 Baseline: commit `4430711` (conversational kernel + streaming + steering),
 104 tests, live DeepSeek smoke verified. Pre-registered certificate outcomes:
@@ -19,7 +21,7 @@ sealed regression corpus, external competitive evaluation, or human beta.
 
 | Phase | Primary commits | Current status |
 |---|---|---|
-| 0 — Gate Zero | `d8c3e9f`, `a9aeae5` | Reproducible runner implemented; valid pinned final canary and sealed shadow set pending. |
+| 0 — Gate Zero | `d8c3e9f`, `a9aeae5` | Reproducible runner implemented; one pinned visible v3 diagnostic recorded at 2/6, with a post-fix diagnostic and sealed shadow set pending. |
 | 1 — stream lifecycle | `2a2dcff` | Locally implemented and adversarially tested. |
 | 2 — plan spine | `bd433b7`, `17d5b9a` | Locally implemented and adversarially tested. |
 | 3 — durable context/cost | `8fd8edb` | Locally implemented; paid cache-hit evidence pending. |
@@ -54,6 +56,13 @@ not attest whole execution-tree containment, so the Ares adapter refuses
 activation. No file in Ares was edited and no integration was activated;
 Vanguard remains a standalone engine candidate.
 
+Gate Zero's six repository-visible cases are now machine-labeled
+`development-canary` / `regression-diagnostic`; both competitive-claim and
+Phase-13 eligibility are permanently false in their closed artifact schema.
+The word `valid` on such a wrapper certifies only its pinned local transport
+and scoring boundary. It never upgrades that artifact into hidden, blinded,
+externally isolated competitive evidence.
+
 ## Phase ledger
 
 The numbered status table above is canonical. The detailed entries below
@@ -84,8 +93,10 @@ Phase 5–6 in this historical execution record.
   zero to the total-case headline and mark the aggregate incomplete and
   non-comparable, preventing a partial 1.0. Probe wrappers are deliberately not
   capability evidence.
-- **Canary baseline:** no valid baseline is currently claimed. A replacement
-  must be produced by the hardened runner from an explicitly pinned commit.
+- **Canary baseline:** the pinned v3 run is a validly transported visible
+  diagnostic at 2/6, not a passed baseline or capability certificate. A
+  post-fix replacement must be produced by the hardened runner from an
+  explicitly pinned commit; the external shadow set remains missing.
 - **Commits:** recorded below as they land.
 
 ### Phase 1 — Provisional-stream lifecycle

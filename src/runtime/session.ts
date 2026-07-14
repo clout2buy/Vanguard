@@ -470,7 +470,7 @@ async function restoreOptionalStateBackup(source: string, container: string): Pr
     if (isMissing(error)) return;
     throw error;
   }
-  const allowed = ["run-config.json", "plan.json", "checkpoint.json"] as const;
+  const allowed = ["run-config.json", "plan.json", "checkpoint.json", "delegations.json"] as const;
   if (
     parsed.version !== 1 || !Array.isArray(parsed.present)
     || !parsed.present.every((name) => typeof name === "string" && allowed.includes(name as typeof allowed[number]))

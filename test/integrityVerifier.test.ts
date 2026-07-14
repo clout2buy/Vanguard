@@ -23,6 +23,12 @@ test("integrity verifier accepts scoped source changes and rejects test tamperin
 
     await writeFile(path.join(workspace, "src", "code.js"), "fixed");
     assert.equal((await verifier.verify("done", "repair")).passed, true);
+    await mkdir(path.join(workspace, "dist"));
+    await writeFile(path.join(workspace, "dist", "payload.js"), "out of scope");
+    const generatedRejected = await verifier.verify("done", "repair");
+    assert.equal(generatedRejected.passed, false);
+    assert.match(JSON.stringify(generatedRejected.evidence), /dist\/payload\.js/);
+    await rm(path.join(workspace, "dist"), { recursive: true });
     await writeFile(path.join(workspace, "test.js"), "weakened");
     const rejected = await verifier.verify("done", "repair");
     assert.equal(rejected.passed, false);

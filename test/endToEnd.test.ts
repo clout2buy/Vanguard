@@ -29,6 +29,7 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
   );
   let receivedToolSchemas = false;
   let inferenceRequests = 0;
+  const observedDecisionCounts: number[] = [];
 
   const server = createServer((request, response) => {
     let body = "";
@@ -47,6 +48,7 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
       };
       receivedToolSchemas ||= payload.tools.some((tool) => tool.name === "workspace.replace");
       const decisions = payload.transcript.filter((entry) => entry.role === "decision").length;
+      observedDecisionCounts.push(decisions);
       let decision: unknown;
       if (decisions === 0) {
         decision = { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } };
@@ -95,7 +97,7 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
     });
 
     const outcome = await kernel.run("Repair answer.mjs so test.mjs passes.");
-    assert.equal(outcome.status, "completed");
+    assert.equal(outcome.status, "completed", JSON.stringify({ outcome, inferenceRequests, observedDecisionCounts }));
     assert.equal(receivedToolSchemas, true);
     assert.equal(inferenceRequests >= 5, true);
     assert.match(await readFile(path.join(root, "answer.mjs"), "utf8"), /42/);
@@ -103,6 +105,60 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("an oversized irreducible task fails before any inference request", async () => {
+  let modelCalls = 0;
+  const kernel = new AgentKernel({
+    model: {
+      async decide() {
+        modelCalls += 1;
+        return { kind: "respond" as const, message: "must not be called" };
+      },
+    },
+    tools: [],
+    verifiers: [],
+    journal: new MemoryJournal(),
+    options: { maxSteps: 2, maxContextBytes: 500 },
+  });
+
+  const outcome = await kernel.run(`oversized-task:${"x".repeat(2_000)}`);
+  assert.equal(outcome.status, "failed");
+  assert.equal(modelCalls, 0, "context authority must fail closed before reaching a provider");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /Context failure/);
+});
+
+test("oversized dynamic working state fails before inference and is snapshotted once", async () => {
+  let modelCalls = 0;
+  let snapshotCalls = 0;
+  const snapshot = { summary: "x".repeat(2_000) };
+  const kernel = new AgentKernel({
+    model: {
+      async decide() {
+        modelCalls += 1;
+        return { kind: "respond" as const, message: "must not be called" };
+      },
+    },
+    tools: [],
+    verifiers: [],
+    journal: new MemoryJournal(),
+    workingState: {
+      snapshot() {
+        snapshotCalls += 1;
+        return snapshot;
+      },
+    },
+    // A third-party policy may ignore the reserved tail; the kernel's sealed
+    // post-check must still prevent an oversized provider request.
+    contextPolicy: { select: () => [] },
+    options: { maxSteps: 2, maxContextBytes: 500 },
+  });
+
+  const outcome = await kernel.run("small task");
+  assert.equal(outcome.status, "failed");
+  assert.equal(modelCalls, 0);
+  assert.equal(snapshotCalls, 1);
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /Context failure/);
 });
 
 function lastObservation(transcript: readonly WireEntry[]): unknown {

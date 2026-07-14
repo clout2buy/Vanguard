@@ -33,6 +33,8 @@ export interface DelegateChildConfiguration {
   readonly commandTimeoutMs: number;
   readonly maxContextBytes: number;
   readonly maxFailedVerificationAttempts: number;
+  /** Preserve the parent's complete extension-isolation policy in every child. */
+  readonly disableExtensions: boolean;
   /** Injectable compiled entry point for integration tests. */
   readonly cliFile?: string;
 }
@@ -193,6 +195,7 @@ export class CliDelegateRunner implements DelegateRunnerPort {
       "--command-timeout-ms", String(Math.min(configuration.commandTimeoutMs, configuration.maxDurationMs)),
       "--max-context-bytes", String(configuration.maxContextBytes),
       "--max-verification-attempts", String(configuration.maxFailedVerificationAttempts),
+      "--disable-extensions", String(configuration.disableExtensions),
       // Children receive the fixed project check and syntax tools, but no
       // arbitrary subprocess surface. This keeps provider credentials in the
       // inference process rather than exposing them to model-authored code.

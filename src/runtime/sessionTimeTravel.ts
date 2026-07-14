@@ -9,6 +9,7 @@ import {
   type SessionLineage,
 } from "./session.js";
 import { appendSessionEvent } from "./sessionJournal.js";
+import { withSessionLease } from "./sessionLease.js";
 import {
   SESSION_EXCLUDED_DIRECTORIES,
   atomicWriteJson,
@@ -40,6 +41,10 @@ export interface RestoreResult {
   readonly checkpointId: string;
   readonly fromRootHash: string;
   readonly restoredRootHash: string;
+  /** Exact logical journal branch point restored with the workspace. */
+  readonly checkpointJournalHash: string;
+  readonly checkpointJournalSequence: number;
+  readonly checkpointRootHash: string;
 }
 
 export interface ForkResult {
@@ -55,11 +60,20 @@ export async function createSessionCheckpoint(
   journal: FileJournal,
   label?: string,
 ): Promise<SessionCheckpoint> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "session.checkpoint", () =>
+    createSessionCheckpointUnlocked(session, journal, label));
+}
+
+async function createSessionCheckpointUnlocked(
+  session: CodingSession,
+  journal: FileJournal,
+  label?: string,
+): Promise<SessionCheckpoint> {
   requireMaterialized(session);
   if (label !== undefined && (label.length === 0 || label.length > 200)) {
     throw new Error("Checkpoint labels must contain 1 to 200 characters.");
   }
-  await recoverSessionRestore(session);
+  await recoverSessionRestoreUnlocked(session);
   const container = path.dirname(session.workspaceRoot);
   const parent = path.join(container, "time-travel", "checkpoints");
   await mkdir(parent, { recursive: true });
@@ -68,7 +82,7 @@ export async function createSessionCheckpoint(
   const stable = path.join(parent, id);
   const snapshot = await snapshotTree(session.workspaceRoot);
   const tip = await journal.tip();
-  const prior = (await listSessionCheckpoints(session)).at(-1);
+  const prior = (await listSessionCheckpointsUnlocked(session)).at(-1);
   const checkpoint: SessionCheckpoint = {
     version: 1,
     id,
@@ -114,6 +128,11 @@ export async function createSessionCheckpoint(
 }
 
 export async function listSessionCheckpoints(session: CodingSession): Promise<readonly SessionCheckpoint[]> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "session.list", () =>
+    listSessionCheckpointsUnlocked(session));
+}
+
+async function listSessionCheckpointsUnlocked(session: CodingSession): Promise<readonly SessionCheckpoint[]> {
   const directory = path.join(path.dirname(session.workspaceRoot), "time-travel", "checkpoints");
   let children: string[];
   try {
@@ -139,9 +158,20 @@ export async function restoreSessionCheckpoint(
   confirmation: string,
   options: { readonly simulateCrashAfterOldMove?: boolean } = {},
 ): Promise<RestoreResult> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "session.restore", () =>
+    restoreSessionCheckpointUnlocked(session, journal, checkpointId, confirmation, options));
+}
+
+async function restoreSessionCheckpointUnlocked(
+  session: CodingSession,
+  journal: FileJournal,
+  checkpointId: string,
+  confirmation: string,
+  options: { readonly simulateCrashAfterOldMove?: boolean } = {},
+): Promise<RestoreResult> {
   requireMaterialized(session);
   assertCheckpointConfirmation(checkpointId, confirmation);
-  await recoverSessionRestore(session);
+  await recoverSessionRestoreUnlocked(session);
   const checkpoint = await loadSessionCheckpoint(session, checkpointId);
   const container = path.dirname(session.workspaceRoot);
   const timeTravelRoot = path.join(container, "time-travel");
@@ -178,7 +208,15 @@ export async function restoreSessionCheckpoint(
     await writeRestoreMarker(markerFile, marker("new_moved"));
     const restored = await snapshotTree(session.workspaceRoot);
     if (restored.rootHash !== checkpoint.rootHash) throw new Error("Restored workspace failed its content hash.");
-    const result = { restoreId, checkpointId, fromRootHash: before.rootHash, restoredRootHash: restored.rootHash };
+    const result = {
+      restoreId,
+      checkpointId,
+      fromRootHash: before.rootHash,
+      restoredRootHash: restored.rootHash,
+      checkpointJournalHash: checkpoint.journalHash,
+      checkpointJournalSequence: checkpoint.journalSequence,
+      checkpointRootHash: checkpoint.rootHash,
+    };
     await appendSessionEvent(journal, "session.restored", result);
     await writeRestoreMarker(markerFile, marker("committed"));
     await rm(backupWorkspace, { recursive: true, force: true });
@@ -188,13 +226,18 @@ export async function restoreSessionCheckpoint(
     return result;
   } catch (error) {
     if (error instanceof SimulatedRestoreCrash) throw error;
-    await recoverSessionRestore(session);
+    await recoverSessionRestoreUnlocked(session);
     throw error;
   }
 }
 
 /** Any interrupted swap is rolled back to the pre-restore workspace. */
 export async function recoverSessionRestore(session: CodingSession): Promise<boolean> {
+  return withSessionLease(path.dirname(session.workspaceRoot), "session.restore-recovery", () =>
+    recoverSessionRestoreUnlocked(session));
+}
+
+async function recoverSessionRestoreUnlocked(session: CodingSession): Promise<boolean> {
   const container = path.dirname(session.workspaceRoot);
   const markerFile = path.join(container, "time-travel", "restore.json");
   try {
@@ -238,6 +281,15 @@ export async function recoverSessionRestore(session: CodingSession): Promise<boo
 }
 
 export async function forkSessionCheckpoint(
+  parent: CodingSession,
+  parentJournal: FileJournal,
+  checkpointId: string,
+): Promise<ForkResult> {
+  return withSessionLease(path.dirname(parent.workspaceRoot), "session.fork", () =>
+    forkSessionCheckpointUnlocked(parent, parentJournal, checkpointId));
+}
+
+async function forkSessionCheckpointUnlocked(
   parent: CodingSession,
   parentJournal: FileJournal,
   checkpointId: string,
@@ -302,20 +354,25 @@ async function loadSessionCheckpoint(session: CodingSession, checkpointId: strin
 }
 
 async function copyOptionalSessionState(container: string, destination: string): Promise<void> {
-  for (const name of ["run-config.json", "plan.json", "checkpoint.json"]) {
+  for (const name of OPTIONAL_SESSION_STATE) {
     const source = path.join(container, name);
     if (await exists(source)) await copyFile(source, path.join(destination, name));
   }
 }
 
 async function restoreOptionalSessionState(source: string, destination: string): Promise<void> {
-  for (const name of ["run-config.json", "plan.json", "checkpoint.json"]) {
+  for (const name of OPTIONAL_SESSION_STATE) {
     const file = path.join(source, name);
     if (await exists(file)) await copyFile(file, path.join(destination, name));
   }
 }
 
-const OPTIONAL_SESSION_STATE = ["run-config.json", "plan.json", "checkpoint.json"] as const;
+const OPTIONAL_SESSION_STATE = [
+  "run-config.json",
+  "plan.json",
+  "checkpoint.json",
+  "delegations.json",
+] as const;
 
 async function captureOptionalState(source: string, destination: string): Promise<void> {
   await mkdir(destination, { recursive: true });

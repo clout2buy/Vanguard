@@ -41,6 +41,18 @@ const toolDefinition = (name: string): ToolDefinition => ({
   inputSchema: { type: "object" },
 });
 
+const trustedExecutionDefinition = (name: string): ToolDefinition => ({
+  ...toolDefinition(name),
+  effect: "execute",
+  evidenceAuthority: "independent-execution",
+});
+
+const trustedReviewDefinition = (name: string): ToolDefinition => ({
+  ...toolDefinition(name),
+  effect: "review",
+  evidenceAuthority: "independent-review",
+});
+
 test("requires independent verification before completion", async () => {
   let attempt = 0;
   const verifier: VerifierPort = {
@@ -182,7 +194,7 @@ test("a successful mutation resets repeated execution failure history", async ()
   let attempts = 0;
   const execution: ToolPort = {
     name: "test",
-    definition: { ...toolDefinition("test"), effect: "execute" },
+    definition: trustedExecutionDefinition("test"),
     async execute() {
       attempts += 1;
       return attempts === 1
@@ -239,6 +251,47 @@ test("executes a successful tool action and completes", async () => {
   assert.equal(outcome.steps, 2);
 });
 
+test("rejects a top-level historical elision marker before tool dispatch", async () => {
+  let executions = 0;
+  const tool: ToolPort = {
+    name: "plan.update",
+    definition: toolDefinition("plan.update"),
+    async execute() {
+      executions += 1;
+      return { ok: true, output: "must not execute" };
+    },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      {
+        kind: "tools",
+        calls: [{
+          id: "copied-history",
+          name: "plan.update",
+          input: {
+            vanguardElided: true,
+            bytes: 42,
+            sha256: "deadbeef",
+            preview: "historical plan arguments",
+          },
+        }],
+      },
+      { kind: "complete", answer: "recovered without dispatch" },
+    ]),
+    tools: [tool],
+    verifiers: [passingVerifier],
+    journal,
+  });
+
+  const outcome = await kernel.run("never execute compacted history");
+  assert.equal(outcome.status, "completed");
+  assert.equal(executions, 0);
+  const rejected = journal.events.find((event) => event.type === "tool.failed");
+  assert.match(JSON.stringify(rejected?.data), /reserved historical compaction metadata/);
+  assert.equal((rejected?.data as { callId?: string } | undefined)?.callId, "copied-history");
+});
+
 test("independent reads in one decision all execute and journal in call order", async () => {
   const running = new Set<string>();
   let sawConcurrency = false;
@@ -288,7 +341,11 @@ test("a batch containing a mutation runs strictly sequentially", async () => {
   let sawConcurrency = false;
   const makeTool = (name: string, effect: ToolDefinition["effect"]): ToolPort => ({
     name,
-    definition: { ...toolDefinition(name), ...(effect === undefined ? {} : { effect }) },
+    definition: {
+      ...toolDefinition(name),
+      ...(effect === undefined ? {} : { effect }),
+      ...(effect === "execute" ? { evidenceAuthority: "independent-execution" as const } : {}),
+    },
     async execute() {
       concurrent += 1;
       if (concurrent > 1) sawConcurrency = true;
@@ -328,7 +385,7 @@ test("rejects completion until fresh execution evidence follows the latest mutat
   };
   const execution: ToolPort = {
     name: "test",
-    definition: { ...toolDefinition("test"), effect: "execute" },
+    definition: trustedExecutionDefinition("test"),
     async execute() { return { ok: true, output: "passed" }; },
   };
   const journal = new MemoryJournal();
@@ -360,7 +417,7 @@ test("premature evidence claims do not consume the sealed verification budget", 
     async execute() { return { ok: true, output: "changed" }; },
   };
   const execution: ToolPort = {
-    name: "test", definition: { ...toolDefinition("test"), effect: "execute" },
+    name: "test", definition: trustedExecutionDefinition("test"),
     async execute() { return { ok: true, output: "passed" }; },
   };
   const kernel = new AgentKernel({
@@ -384,11 +441,11 @@ test("requires change review after mutation when a review tool is available", as
     async execute() { return { ok: true, output: "changed" }; },
   };
   const execution: ToolPort = {
-    name: "test", definition: { ...toolDefinition("test"), effect: "execute" },
+    name: "test", definition: trustedExecutionDefinition("test"),
     async execute() { return { ok: true, output: "passed" }; },
   };
   const review: ToolPort = {
-    name: "changes", definition: { ...toolDefinition("changes"), effect: "review" },
+    name: "changes", definition: trustedReviewDefinition("changes"),
     async execute() { return { ok: true, output: "reviewed" }; },
   };
   const kernel = new AgentKernel({
@@ -531,7 +588,10 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
     verifiers: [passingVerifier],
     journal: new MemoryJournal(),
     workingState: ledger,
-    options: { maxContextBytes: 2 },
+    // Exercise total transcript elision without relying on an impossible byte
+    // budget: the real policies now correctly reserve the task and fail closed
+    // when even that irreducible anchor cannot fit.
+    contextPolicy: { select: () => [] },
   });
   const outcome = await kernel.run("long task");
   assert.equal(outcome.status, "completed");
@@ -544,6 +604,28 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
     evidence: ["read src/index.ts"],
     risks: ["edge-case escaping"],
   });
+});
+
+test("kernel snapshots working state once and passes the identical snapshot object", async () => {
+  const snapshot = { revision: 7, summary: "stable identity" };
+  let snapshotCalls = 0;
+  const model = new CapturingModel([{ kind: "complete", answer: "done" }]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    workingState: {
+      snapshot() {
+        snapshotCalls += 1;
+        return snapshot;
+      },
+    },
+  });
+  const outcome = await kernel.run("identity test");
+  assert.equal(outcome.status, "completed");
+  assert.equal(snapshotCalls, 1);
+  assert.strictEqual(model.requests[0]?.workingState, snapshot);
 });
 
 test("kernel resumes journaled transcript and sequence without replaying completed tools", async () => {
@@ -594,14 +676,334 @@ test("kernel closes an orphaned tool call with interruption evidence on resume",
       data: { kind: "tool", call: { id: "orphan", name: "write", input: { path: "a" } } },
     },
   ];
-  const model = new CapturingModel([{ kind: "complete", answer: "recovered" }]);
+  const model = new CapturingModel([
+    { kind: "tools", calls: [{ id: "check", name: "project.check", input: {} }] },
+    { kind: "complete", answer: "recovered" },
+  ]);
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "checked uncertain state" }; },
+  };
   const kernel = new AgentKernel({
     model,
-    tools: [],
+    tools: [check],
     verifiers: [passingVerifier],
     journal: new MemoryJournal(),
   });
   assert.equal((await kernel.run("recover orphan", new AbortController().signal, prior)).status, "completed");
   assert.equal(model.requests[0]?.transcript.some((entry) => entry.role === "observation"
     && JSON.stringify(entry.content).includes("interrupted")), true);
+});
+
+test("an execute tool that changes reviewable files cannot satisfy its own post-change gates", async () => {
+  let fingerprint = "before";
+  let checks = 0;
+  let reviews = 0;
+  const mutatingProcess: ToolPort = {
+    name: "process.run",
+    definition: { ...toolDefinition("process.run"), effect: "execute" },
+    async execute() {
+      fingerprint = "after";
+      return { ok: true, output: { exitCode: 0 } };
+    },
+  };
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { checks += 1; return { ok: true, output: { exitCode: 0 } }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes",
+    definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { reviews += 1; return { ok: true, output: { changedFiles: ["changed.txt"] } }; },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tools", calls: [{ id: "process", name: "process.run", input: {} }] },
+      { kind: "complete", answer: "premature" },
+      { kind: "tools", calls: [
+        { id: "check", name: "project.check", input: {} },
+        { id: "review", name: "workspace.changes", input: {} },
+      ] },
+      { kind: "complete", answer: "fresh" },
+    ]),
+    tools: [mutatingProcess, check, review],
+    verifiers: [passingVerifier],
+    journal,
+    workspaceState: { async fingerprint() { return fingerprint; } },
+  });
+
+  const outcome = await kernel.run("detect subprocess writes");
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "fresh");
+  assert.equal(checks, 1);
+  assert.equal(reviews, 1);
+  assert.equal(journal.events.filter((event) => event.type === "workspace.changed").length, 1);
+  assert.match(JSON.stringify(journal.events), /successful executable check/);
+});
+
+test("an interrupted mutate call opens a fresh workspace epoch and re-arms check and review", async () => {
+  let writes = 0;
+  let checks = 0;
+  let reviews = 0;
+  const write: ToolPort = {
+    name: "workspace.write",
+    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    async execute() { writes += 1; return { ok: true, output: "must not replay" }; },
+  };
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { checks += 1; return { ok: true, output: "passed" }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes",
+    definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { reviews += 1; return { ok: true, output: "reviewed" }; },
+  };
+  const prior = [
+    { sequence: 1, type: "run.started" as const, data: { task: "recover uncertain write" } },
+    {
+      sequence: 2,
+      type: "model.decided" as const,
+      data: { kind: "tools", calls: [{ id: "orphan-write", name: "workspace.write", input: { path: "a.ts" } }] },
+    },
+  ];
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "complete", answer: "premature" },
+      { kind: "tools", calls: [
+        { id: "check", name: "project.check", input: {} },
+        { id: "review", name: "workspace.changes", input: {} },
+      ] },
+      { kind: "complete", answer: "recovered" },
+    ]),
+    tools: [write, check, review],
+    verifiers: [passingVerifier],
+    journal,
+  });
+
+  const outcome = await kernel.run("recover uncertain write", undefined, prior);
+  assert.equal(outcome.status, "completed");
+  assert.equal(writes, 0);
+  assert.equal(checks, 1);
+  assert.equal(reviews, 1);
+  const changed = journal.events.find((event) => event.type === "workspace.changed");
+  assert.match(JSON.stringify(changed?.data), /interrupted-tool/);
+  assert.equal((changed?.data as { workspaceGeneration?: number }).workspaceGeneration, 1);
+});
+
+test("a sealed verifier that changes reviewable files cannot complete the run", async () => {
+  let fingerprint = "before";
+  let verifierCalls = 0;
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "passed" }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes",
+    definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { return { ok: true, output: "reviewed" }; },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "complete", answer: "verifier-mutated" },
+      { kind: "tools", calls: [
+        { id: "check", name: "project.check", input: {} },
+        { id: "review", name: "workspace.changes", input: {} },
+      ] },
+      { kind: "complete", answer: "stable" },
+    ]),
+    tools: [check, review],
+    verifiers: [{
+      name: "tests",
+      async verify() {
+        verifierCalls += 1;
+        if (verifierCalls === 1) fingerprint = "after-verifier";
+        return { verifier: "tests", passed: true, evidence: "passed" };
+      },
+    }],
+    journal,
+    workspaceState: { async fingerprint() { return fingerprint; } },
+  });
+
+  const outcome = await kernel.run("detect verifier writes");
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "stable");
+  assert.equal(verifierCalls, 2);
+  assert.match(JSON.stringify(journal.events), /workspace mutation monitor/);
+});
+
+test("replay cannot clear a changed batch's gates from suppressed execute and review observations", async () => {
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "fresh check" }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes",
+    definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { return { ok: true, output: "fresh review" }; },
+  };
+  const calls = [
+    { id: "process", name: "process.run", input: {} },
+    { id: "old-check", name: "project.check", input: {} },
+    { id: "old-review", name: "workspace.changes", input: {} },
+  ];
+  const prior = [
+    { sequence: 1, type: "run.started" as const, data: { task: "resume changed batch" } },
+    { sequence: 2, type: "workspace.observed" as const, data: { fingerprint: "before", workspaceGeneration: 0 } },
+    { sequence: 3, type: "model.decided" as const, data: { kind: "tools", calls } },
+    { sequence: 4, type: "workspace.changed" as const, data: { cause: "tool-batch", workspaceGeneration: 1 } },
+    { sequence: 5, type: "workspace.observed" as const, data: { fingerprint: "after", workspaceGeneration: 1 } },
+    { sequence: 6, type: "tool.completed" as const, data: { callId: "process", tool: "process.run", ok: true, workspaceGeneration: 1 } },
+    { sequence: 7, type: "tool.completed" as const, data: { callId: "old-check", tool: "project.check", ok: true, workspaceGeneration: 1 } },
+    { sequence: 8, type: "tool.completed" as const, data: { callId: "old-review", tool: "workspace.changes", ok: true, workspaceGeneration: 1 } },
+  ];
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "complete", answer: "stale replay must fail" },
+      { kind: "tools", calls: [
+        { id: "fresh-check", name: "project.check", input: {} },
+        { id: "fresh-review", name: "workspace.changes", input: {} },
+      ] },
+      { kind: "complete", answer: "fresh evidence" },
+    ]),
+    tools: [check, review],
+    verifiers: [passingVerifier],
+    journal,
+    workspaceState: { async fingerprint() { return "after"; } },
+  });
+
+  const outcome = await kernel.run("resume changed batch", undefined, prior);
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "fresh evidence");
+  assert.match(JSON.stringify(journal.events), /successful executable check/);
+});
+
+test("an observe-labelled tool is still monitored for workspace mutations", async () => {
+  let fingerprint = "before";
+  const observer: ToolPort = {
+    name: "extension.inspect",
+    definition: { ...toolDefinition("extension.inspect"), effect: "observe" },
+    async execute() {
+      fingerprint = "after";
+      return { ok: true, output: "claimed read-only" };
+    },
+  };
+  const check: ToolPort = {
+    name: "project.check", definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "checked" }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes", definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { return { ok: true, output: "reviewed" }; },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tools", calls: [{ id: "observe", name: "extension.inspect", input: {} }] },
+      { kind: "complete", answer: "premature" },
+      { kind: "tools", calls: [
+        { id: "check", name: "project.check", input: {} },
+        { id: "review", name: "workspace.changes", input: {} },
+      ] },
+      { kind: "complete", answer: "safe" },
+    ]),
+    tools: [observer, check, review],
+    verifiers: [passingVerifier],
+    journal,
+    workspaceState: { async fingerprint() { return fingerprint; } },
+  });
+
+  const outcome = await kernel.run("monitor every extension");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "safe");
+  assert.equal(journal.events.some((event) => event.type === "workspace.changed"), true);
+});
+
+test("workspace drift during inference invalidates previously current evidence", async () => {
+  let fingerprint = "before";
+  let decision = 0;
+  const model: ModelPort = {
+    async decide() {
+      decision += 1;
+      if (decision === 1) {
+        fingerprint = "detached-write";
+        return { kind: "complete", answer: "stale" };
+      }
+      if (decision === 2) return {
+        kind: "tools",
+        calls: [
+          { id: "check", name: "project.check", input: {} },
+          { id: "review", name: "workspace.changes", input: {} },
+        ],
+      };
+      return { kind: "complete", answer: "current" };
+    },
+  };
+  const check: ToolPort = {
+    name: "project.check", definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "checked" }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes", definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { return { ok: true, output: "reviewed" }; },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model,
+    tools: [check, review],
+    verifiers: [passingVerifier],
+    journal,
+    workspaceState: { async fingerprint() { return fingerprint; } },
+  });
+
+  const outcome = await kernel.run("catch detached writes");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "current");
+  assert.equal(journal.events.some((event) => event.type === "workspace.changed"
+    && JSON.stringify(event.data).includes("post-inference-boundary")), true);
+});
+
+test("an interrupted sealed verifier opens an uncertain epoch and closes its transaction on resume", async () => {
+  const prior = [
+    { sequence: 1, type: "run.started" as const, data: { task: "recover verifier crash" } },
+    { sequence: 2, type: "workspace.observed" as const, data: { fingerprint: "before", workspaceGeneration: 0 } },
+    { sequence: 3, type: "model.decided" as const, data: { kind: "complete", answer: "interrupted claim" } },
+    { sequence: 4, type: "verification.started" as const, data: { id: "verification:3", fingerprint: "before", workspaceGeneration: 0 } },
+  ];
+  const check: ToolPort = {
+    name: "project.check", definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "checked" }; },
+  };
+  const review: ToolPort = {
+    name: "workspace.changes", definition: trustedReviewDefinition("workspace.changes"),
+    async execute() { return { ok: true, output: "reviewed" }; },
+  };
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "complete", answer: "still stale" },
+      { kind: "tools", calls: [
+        { id: "check", name: "project.check", input: {} },
+        { id: "review", name: "workspace.changes", input: {} },
+      ] },
+      { kind: "complete", answer: "recovered" },
+    ]),
+    tools: [check, review],
+    verifiers: [passingVerifier],
+    journal,
+    workspaceState: { async fingerprint() { return "possibly-mutated"; } },
+  });
+
+  const outcome = await kernel.run("recover verifier crash", undefined, prior);
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "recovered");
+  assert.equal(journal.events.some((event) => event.type === "workspace.changed"
+    && JSON.stringify(event.data).includes("interrupted-verification")), true);
+  assert.equal(journal.events.some((event) => event.type === "verification.finished"
+    && JSON.stringify(event.data).includes("interrupted")), true);
 });

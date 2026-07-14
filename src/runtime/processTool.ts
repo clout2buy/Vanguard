@@ -32,6 +32,11 @@ export class ProcessTool implements ToolPort {
       additionalProperties: false,
     },
     effect: "execute",
+    // The runtime, not the model or an extension, captures the process exit
+    // state. The kernel still suppresses this authority whenever the process
+    // mutates the monitored workspace, so only a successful, non-mutating run
+    // can satisfy the post-change execution-evidence freshness gate.
+    evidenceAuthority: "independent-execution",
   };
   readonly #allowedCommands: ReadonlySet<string>;
   readonly #timeoutMs: number;

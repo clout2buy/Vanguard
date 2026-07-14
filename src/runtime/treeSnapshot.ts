@@ -17,6 +17,10 @@ import path from "node:path";
 
 export const SESSION_EXCLUDED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules"]);
 
+export interface TreeSnapshotOptions {
+  readonly excludedDirectories?: ReadonlySet<string>;
+}
+
 export interface TreeEntry {
   readonly path: string;
   readonly kind: "file" | "symlink";
@@ -33,13 +37,14 @@ export interface TreeSnapshot {
   readonly entries: readonly TreeEntry[];
 }
 
-export async function snapshotTree(root: string): Promise<TreeSnapshot> {
+export async function snapshotTree(root: string, options: TreeSnapshotOptions = {}): Promise<TreeSnapshot> {
   const requestedRoot = path.resolve(root);
   const rootMetadata = await lstat(requestedRoot);
   if (rootMetadata.isSymbolicLink()) throw new Error("Snapshot root cannot be a symbolic link or junction.");
   const absoluteRoot = await realpath(requestedRoot);
   if (!(await stat(absoluteRoot)).isDirectory()) throw new Error("Snapshot root must be a directory.");
   const entries: TreeEntry[] = [];
+  const excludedDirectories = options.excludedDirectories ?? SESSION_EXCLUDED_DIRECTORIES;
   const queue = [absoluteRoot];
   while (queue.length > 0) {
     const directory = queue.shift()!;
@@ -61,7 +66,7 @@ export async function snapshotTree(root: string): Promise<TreeSnapshot> {
           linkTarget: target,
         });
       } else if (details.isDirectory()) {
-        if (!SESSION_EXCLUDED_DIRECTORIES.has(child.name)) queue.push(absolute);
+        if (!excludedDirectories.has(child.name)) queue.push(absolute);
       } else if (details.isFile()) {
         const contents = await readFile(absolute);
         entries.push({

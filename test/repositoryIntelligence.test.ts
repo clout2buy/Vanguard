@@ -6,6 +6,7 @@ import test from "node:test";
 import type { CommandRunner } from "../src/index.js";
 import {
   PostEditSyntaxChecker,
+  RepositoryMapTool,
   WorkspaceBoundary,
   buildRepositoryModel,
   delimiterBalance,
@@ -41,6 +42,33 @@ test("repository model identifies a TypeScript npm project with tests and entry 
     assert.ok(model.instructionFiles.includes("AGENTS.md"));
     // Files under generated directories are not counted as source.
     assert.equal(model.languages.find((language) => language.language === "JavaScript"), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("hermetic repository maps omit extension instruction names and contents", async () => {
+  const root = await scaffold({
+    "package.json": "{}\n",
+    "src/index.ts": "export const value = 1;\n",
+    "AGENTS.md": "TOP-SECRET-INSTRUCTION-PAYLOAD\n",
+    "nested/CLAUDE.md": "SECOND-SECRET-INSTRUCTION-PAYLOAD\n",
+  });
+  try {
+    const tool = new RepositoryMapTool(new WorkspaceBoundary(root), { includeInstructions: false });
+    const result = await tool.execute({}, {
+      task: "inspect",
+      step: 1,
+      signal: new AbortController().signal,
+    });
+    assert.equal(result.ok, true);
+    const payload = JSON.stringify(result.output);
+    assert.equal(payload.includes("AGENTS.md"), false);
+    assert.equal(payload.includes("CLAUDE.md"), false);
+    assert.equal(payload.includes("TOP-SECRET-INSTRUCTION-PAYLOAD"), false);
+    assert.equal(payload.includes("SECOND-SECRET-INSTRUCTION-PAYLOAD"), false);
+    assert.deepEqual((result.output as { instructionFiles: string[] }).instructionFiles, []);
+    assert.deepEqual((result.output as { instructions: string[] }).instructions, []);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

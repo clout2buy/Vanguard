@@ -82,6 +82,8 @@ export interface RepositoryModel {
 
 interface ScanOptions {
   readonly maxFiles?: number;
+  /** Omit extension instruction file names from hermetic repository maps. */
+  readonly includeInstructionFiles?: boolean;
 }
 
 /**
@@ -129,7 +131,8 @@ export async function buildRepositoryModel(root: string, options: ScanOptions = 
 
       const marker = BUILD_SYSTEM_MARKERS.find((candidate) => candidate.file === entry.name);
       if (marker !== undefined && directory === resolved) buildSystems.add(marker.system);
-      if (INSTRUCTION_FILES.some((name) => relative === name || relative.endsWith(`/${name}`))) {
+      if (options.includeInstructionFiles !== false
+        && INSTRUCTION_FILES.some((name) => relative === name || relative.endsWith(`/${name}`))) {
         instructionFiles.push(relative);
       }
 
@@ -197,16 +200,22 @@ export class RepositoryMapTool implements ToolPort {
   readonly name = "repository.map";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Return a structured map of the repository: languages and their support tier, build systems, entry points, test topology, generated directories, git presence, and repository instruction files. Use this first on an unfamiliar project instead of listing directories by hand.",
+    description: "Return a structured map of the repository: languages and their support tier, build systems, entry points, test topology, generated directories, and git presence. Use this first on an unfamiliar project instead of listing directories by hand.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     effect: "observe",
   };
 
-  constructor(private readonly workspace: WorkspaceBoundary) {}
+  constructor(
+    private readonly workspace: WorkspaceBoundary,
+    private readonly options: { readonly includeInstructions?: boolean } = {},
+  ) {}
 
   async execute(_input: JsonValue, _context: ToolContext): Promise<ToolResult> {
-    const model = await buildRepositoryModel(this.workspace.root);
-    const instructions = await readRepositoryInstructions(this.workspace.root, model.instructionFiles);
+    const includeInstructions = this.options.includeInstructions !== false;
+    const model = await buildRepositoryModel(this.workspace.root, { includeInstructionFiles: includeInstructions });
+    const instructions = includeInstructions
+      ? await readRepositoryInstructions(this.workspace.root, model.instructionFiles)
+      : [];
     return {
       ok: true,
       output: {

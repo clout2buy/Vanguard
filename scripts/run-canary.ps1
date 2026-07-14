@@ -58,7 +58,7 @@ catch {
 
 $RunDirectory = Join-Path $ResolvedResultsRoot "canary-runs\$SafePhase-$RunId"
 $AggregateFile = Join-Path $RunDirectory "aggregate.json"
-$CanaryFile = Join-Path $ResolvedResultsRoot "canary-$SafePhase-$RunId.json"
+$CanaryFile = Join-Path $ResolvedResultsRoot "visible-diagnostic-canary-$SafePhase-$RunId.json"
 $WorktreeBase = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $Worktree = Join-Path $WorktreeBase "vanguard-canary-$RunId"
 $HarnessPaths = @(
@@ -77,6 +77,12 @@ $HarnessGitStart = $null
 $HarnessGitEnd = $null
 $ArtifactStart = $null
 $ArtifactEnd = $null
+$CaseManifestBeforeBuild = $null
+$CaseManifestAfterBuild = $null
+$CaseManifestAfterRun = $null
+$CaseGitBeforeBuild = $null
+$CaseGitAfterBuild = $null
+$CaseGitAfterRun = $null
 $DependencyLock = $null
 $RuntimeVersions = $null
 $StartCommit = $null
@@ -107,10 +113,6 @@ try {
   if ($HarnessStart.aggregateSha256 -ne $HarnessSourceStart.aggregateSha256) {
     throw "Evaluator harness snapshot does not match its committed source bytes."
   }
-  if (-not $InfrastructureProbe) {
-    Import-VanguardCredential -Provider $Provider -Root $Root
-  }
-
   # Mark cleanup responsibility before invoking git: worktree creation can
   # succeed and a subsequent validation can still throw.
   $WorktreeCreated = $true
@@ -123,15 +125,60 @@ try {
     throw "Pinned worktree began at $StartCommit instead of $PinnedCommit."
   }
 
-  Push-Location $Worktree
+  # The detached worktree may inherit neither ordinary untracked nor ignored
+  # files from a prior run. Clean the entire case tree before measuring it,
+  # then bind every byte (not merely git-tracked inputs) before any build or
+  # provider work can execute.
+  $PreviousErrorPreference = $ErrorActionPreference
+  $ErrorActionPreference = "Continue"
   try {
-    npm ci --ignore-scripts --no-audit --no-fund
-    if ($LASTEXITCODE -ne 0) { throw "npm ci failed with exit code $LASTEXITCODE." }
-    npm run build
-    if ($LASTEXITCODE -ne 0) { throw "isolated build failed with exit code $LASTEXITCODE." }
+    $CaseCleanOutput = (& git -C $Worktree clean -ffdx -- gauntlet/cases 2>&1 | Out-String).Trim()
   }
   finally {
-    Pop-Location
+    $ErrorActionPreference = $PreviousErrorPreference
+  }
+  if ($LASTEXITCODE -ne 0) {
+    throw "Unable to clean the disposable gauntlet case tree: $CaseCleanOutput"
+  }
+  $CaseGitBeforeBuild = Get-CanaryGitPathState -RepositoryRoot $Worktree -RelativePaths @("gauntlet/cases")
+  if (@($CaseGitBeforeBuild.changes).Count -gt 0) {
+    throw "Disposable gauntlet case tree is not clean before build: $($CaseGitBeforeBuild.changes -join '; ')"
+  }
+  $CaseManifestBeforeBuild = Get-CanaryFileManifest -Root (Join-Path $Worktree "gauntlet\cases")
+
+  $NodeNpm = Get-CanaryNodeAndNpmEntrypoint
+  $BuildEnvironment = Get-CanaryProcessEnvironment
+  $EmptyNpmConfig = Join-Path $RunDirectory "empty.npmrc"
+  [IO.File]::WriteAllText($EmptyNpmConfig, "", [Text.UTF8Encoding]::new($false))
+  $BuildEnvironment["npm_config_userconfig"] = $EmptyNpmConfig
+  $BuildEnvironment["npm_config_cache"] = Join-Path $RunDirectory "npm-cache"
+  $BuildEnvironment["npm_config_ignore_scripts"] = "true"
+  $BuildEnvironment["npm_config_audit"] = "false"
+  $BuildEnvironment["npm_config_fund"] = "false"
+  $InstallProcess = Invoke-CanaryUtf8Process `
+    -FilePath $NodeNpm.node `
+    -ArgumentList @($NodeNpm.npmCli, "ci", "--ignore-scripts", "--no-audit", "--no-fund") `
+    -Environment $BuildEnvironment `
+    -WorkingDirectory $Worktree `
+    -TimeoutMs 1200000
+  if (-not [string]::IsNullOrWhiteSpace($InstallProcess.stdout)) { Write-Host $InstallProcess.stdout.TrimEnd() }
+  if (-not [string]::IsNullOrWhiteSpace($InstallProcess.stderr)) { Write-Host $InstallProcess.stderr.TrimEnd() }
+  if ($InstallProcess.exitCode -ne 0) { throw "npm ci failed with exit code $($InstallProcess.exitCode)." }
+  $BuildProcess = Invoke-CanaryUtf8Process `
+    -FilePath $NodeNpm.node `
+    -ArgumentList @($NodeNpm.npmCli, "run", "build") `
+    -Environment $BuildEnvironment `
+    -WorkingDirectory $Worktree `
+    -TimeoutMs 600000
+  if (-not [string]::IsNullOrWhiteSpace($BuildProcess.stdout)) { Write-Host $BuildProcess.stdout.TrimEnd() }
+  if (-not [string]::IsNullOrWhiteSpace($BuildProcess.stderr)) { Write-Host $BuildProcess.stderr.TrimEnd() }
+  if ($BuildProcess.exitCode -ne 0) { throw "isolated build failed with exit code $($BuildProcess.exitCode)." }
+
+  $CaseManifestAfterBuild = Get-CanaryFileManifest -Root (Join-Path $Worktree "gauntlet\cases")
+  $CaseGitAfterBuild = Get-CanaryGitPathState -RepositoryRoot $Worktree -RelativePaths @("gauntlet/cases")
+  if ($CaseManifestAfterBuild.aggregateSha256 -ne $CaseManifestBeforeBuild.aggregateSha256 `
+    -or @($CaseGitAfterBuild.changes).Count -gt 0) {
+    throw "Gauntlet case bytes drifted during the isolated build; refusing provider execution."
   }
 
   $ArtifactStart = Get-CanaryFileManifest -Root (Join-Path $Worktree "dist")
@@ -139,15 +186,23 @@ try {
     throw "The isolated build produced no files under '$Worktree\dist'."
   }
   $DependencyLock = Get-CanaryFileManifest -Root $Worktree -RelativePaths @("package-lock.json")
+  $NodeVersionProcess = Invoke-CanaryUtf8Process -FilePath $NodeNpm.node -ArgumentList @("--version") `
+    -Environment $BuildEnvironment -WorkingDirectory $Worktree -TimeoutMs 30000
+  $NpmVersionProcess = Invoke-CanaryUtf8Process -FilePath $NodeNpm.node -ArgumentList @($NodeNpm.npmCli, "--version") `
+    -Environment $BuildEnvironment -WorkingDirectory $Worktree -TimeoutMs 30000
+  if ($NodeVersionProcess.exitCode -ne 0 -or $NpmVersionProcess.exitCode -ne 0) {
+    throw "Unable to capture sanitized Node/npm runtime versions."
+  }
   $RuntimeVersions = [pscustomobject]@{
-    node = (& node --version | Out-String).Trim()
-    npm = (& npm --version | Out-String).Trim()
+    node = $NodeVersionProcess.stdout.Trim()
+    npm = $NpmVersionProcess.stdout.Trim()
   }
 
   if ($InfrastructureProbe) {
     $ProbeAggregate = [pscustomobject]@{
       version = 1
       probe = $true
+      evidenceBoundary = New-CanaryEvidenceBoundary -Purpose "infrastructure-boundary-probe"
       pinnedCommit = $PinnedCommit
       isolatedBuildHash = $ArtifactStart.aggregateSha256
       completedAt = (Get-Date).ToUniversalTime().ToString("o")
@@ -156,6 +211,9 @@ try {
     $GauntletExit = 0
   }
   else {
+    # Provider material enters the process only after install/build/artifact
+    # binding is complete. The pinned build therefore cannot read the key.
+    Import-VanguardCredential -Provider $Provider -Root $Root
     $ShellPath = (Get-Process -Id $PID).Path
     $RunnerArguments = @(
       "-NoProfile",
@@ -176,12 +234,15 @@ try {
     $GauntletExit = $LASTEXITCODE
   }
 
+  $CaseManifestAfterRun = Get-CanaryFileManifest -Root (Join-Path $Worktree "gauntlet\cases")
+  $CaseGitAfterRun = Get-CanaryGitPathState -RepositoryRoot $Worktree -RelativePaths @("gauntlet/cases")
+
   $EndCommit = Resolve-CanaryCommit -RepositoryRoot $Worktree -Commit HEAD
   $ArtifactEnd = Get-CanaryFileManifest -Root (Join-Path $Worktree "dist")
   $HarnessEnd = Get-CanaryFileManifest -Root $HarnessSnapshot -RelativePaths $HarnessPaths
   $HarnessSourceEnd = Get-CanaryFileManifest -Root $PSScriptRoot -RelativePaths $HarnessPaths
   $HarnessGitEnd = Get-CanaryGitPathState -RepositoryRoot $Root -RelativePaths ($HarnessPaths | ForEach-Object { "scripts/$_" })
-  $TrackedChanges = (& git -C $Worktree status --porcelain --untracked-files=no | Out-String).Trim()
+  $TrackedChanges = (& git -C $Worktree status --porcelain --untracked-files=all | Out-String).Trim()
   $Violations = @(Get-CanaryInvariantViolations `
     -ExpectedCommit $PinnedCommit `
     -ActualCommit $EndCommit `
@@ -200,11 +261,23 @@ try {
   if ($HarnessSourceStart.aggregateSha256 -ne $HarnessSourceEnd.aggregateSha256) {
     $Violations += "evaluator harness source byte drift: expected $($HarnessSourceStart.aggregateSha256), observed $($HarnessSourceEnd.aggregateSha256)"
   }
+  if ($CaseManifestBeforeBuild.aggregateSha256 -ne $CaseManifestAfterBuild.aggregateSha256) {
+    $Violations += "gauntlet case byte drift during build: expected $($CaseManifestBeforeBuild.aggregateSha256), observed $($CaseManifestAfterBuild.aggregateSha256)"
+  }
+  if ($CaseManifestBeforeBuild.aggregateSha256 -ne $CaseManifestAfterRun.aggregateSha256) {
+    $Violations += "gauntlet case byte drift during run: expected $($CaseManifestBeforeBuild.aggregateSha256), observed $($CaseManifestAfterRun.aggregateSha256)"
+  }
+  if (@($CaseGitAfterBuild.changes).Count -gt 0) {
+    $Violations += "gauntlet case tree gained changes during build: $($CaseGitAfterBuild.changes -join '; ')"
+  }
+  if (@($CaseGitAfterRun.changes).Count -gt 0) {
+    $Violations += "gauntlet case tree gained changes during run: $($CaseGitAfterRun.changes -join '; ')"
+  }
 
   if (Test-Path -LiteralPath $AggregateFile -PathType Leaf) {
     $AggregateParseAttempted = $true
     try {
-      $Aggregate = Get-Content -Raw -LiteralPath $AggregateFile | ConvertFrom-Json
+      $Aggregate = Read-CanaryUtf8Text -Path $AggregateFile | ConvertFrom-Json
       $AggregateHash = (Get-FileHash -LiteralPath $AggregateFile -Algorithm SHA256).Hash.ToLowerInvariant()
       $Violations += @(Get-CanaryAggregateViolations `
         -Aggregate $Aggregate `
@@ -234,6 +307,22 @@ catch {
   $GauntletExit = 3
 }
 finally {
+  if ($WorktreeCreated -and (Test-Path -LiteralPath (Join-Path $Worktree "gauntlet\cases") -PathType Container) `
+    -and $null -ne $CaseManifestBeforeBuild -and $null -eq $CaseManifestAfterRun) {
+    try {
+      $CaseManifestAfterRun = Get-CanaryFileManifest -Root (Join-Path $Worktree "gauntlet\cases")
+      $CaseGitAfterRun = Get-CanaryGitPathState -RepositoryRoot $Worktree -RelativePaths @("gauntlet/cases")
+      if ($CaseManifestBeforeBuild.aggregateSha256 -ne $CaseManifestAfterRun.aggregateSha256) {
+        $Violations += "gauntlet case byte drift before aborted run cleanup: expected $($CaseManifestBeforeBuild.aggregateSha256), observed $($CaseManifestAfterRun.aggregateSha256)"
+      }
+      if (@($CaseGitAfterRun.changes).Count -gt 0) {
+        $Violations += "gauntlet case tree gained changes before aborted run cleanup: $($CaseGitAfterRun.changes -join '; ')"
+      }
+    }
+    catch {
+      $Violations += "unable to bind gauntlet case bytes before cleanup: $($_.Exception.Message)"
+    }
+  }
   if ($WorktreeCreated) {
     try {
       Remove-IsolatedCanaryWorktree `
@@ -252,7 +341,7 @@ finally {
     if (-not $AggregateParseAttempted -and (Test-Path -LiteralPath $AggregateFile -PathType Leaf)) {
       $AggregateParseAttempted = $true
       try {
-        $Aggregate = Get-Content -Raw -LiteralPath $AggregateFile | ConvertFrom-Json
+        $Aggregate = Read-CanaryUtf8Text -Path $AggregateFile | ConvertFrom-Json
         $AggregateHash = (Get-FileHash -LiteralPath $AggregateFile -Algorithm SHA256).Hash.ToLowerInvariant()
       }
       catch {
@@ -267,9 +356,11 @@ finally {
     $HarnessChangesEnd = [object[]]@()
     if ($null -ne $HarnessGitStart) { $HarnessChangesStart = [object[]]@($HarnessGitStart.changes) }
     if ($null -ne $HarnessGitEnd) { $HarnessChangesEnd = [object[]]@($HarnessGitEnd.changes) }
+    $EvidencePurpose = if ($InfrastructureProbe) { "infrastructure-boundary-probe" } else { "regression-diagnostic" }
     $Wrapped = [pscustomobject]@{
-      schemaVersion = 3
+      schemaVersion = 4
       layer = "development-canary"
+      evidenceBoundary = New-CanaryEvidenceBoundary -Purpose $EvidencePurpose
       status = $Status
       phase = $Phase
       runId = $RunId
@@ -307,6 +398,14 @@ finally {
       evaluatorHarnessEnd = $HarnessEnd
       builtArtifactsStart = $ArtifactStart
       builtArtifactsEnd = $ArtifactEnd
+      caseBinding = [pscustomobject]@{
+        gitBeforeBuild = $CaseGitBeforeBuild
+        gitAfterBuild = $CaseGitAfterBuild
+        gitAfterRun = $CaseGitAfterRun
+        manifestBeforeBuild = $CaseManifestBeforeBuild
+        manifestAfterBuild = $CaseManifestAfterBuild
+        manifestAfterRun = $CaseManifestAfterRun
+      }
       result = $Aggregate
     }
     New-Item -ItemType Directory -Force -Path $ResolvedResultsRoot | Out-Null
@@ -318,13 +417,13 @@ finally {
 }
 
 if ($Status -eq "invalidated") {
-  Write-Host "Canary INVALIDATED: $CanaryFile" -ForegroundColor Red
+  Write-Host "Visible development diagnostic INVALIDATED - not Phase 13 certification evidence: $CanaryFile" -ForegroundColor Red
   foreach ($Violation in $Violations) { Write-Host "  - $Violation" -ForegroundColor Red }
 }
 elseif ($Status -eq "infrastructure_probe") {
-  Write-Host "Canary isolation probe passed: $CanaryFile" -ForegroundColor Green
+  Write-Host "Visible development infrastructure probe passed - not Phase 13 certification evidence: $CanaryFile" -ForegroundColor Green
 }
 else {
-  Write-Host "Canary result recorded from pinned commit $PinnedCommit`: $CanaryFile" -ForegroundColor Green
+  Write-Host "Visible development diagnostic recorded from pinned commit $PinnedCommit - not Phase 13 certification evidence: $CanaryFile" -ForegroundColor Green
 }
 exit $GauntletExit

@@ -6,6 +6,17 @@ unit tests, canary tasks, or a dry-run of this harness. Until the external
 holdout is supplied and all runs and reviews finish, the only valid status is
 **not certified**.
 
+Gate Zero outputs are deliberately a different, non-promotable artifact
+class. A `status: valid` visible-development-canary wrapper means only that
+its local pinned-run boundary held. Its closed `evidenceBoundary` declares
+developer visibility and sets competitive and Phase-13 eligibility to false;
+the same boundary is embedded in the detachable aggregate. These artifacts
+cannot enter the certification ledger: assignments are generated only for
+never-run `holdout` tasks, reviewed results and execution proofs use closed
+schemas, and both require `executionMode: externally-isolated` plus the frozen
+evaluator and host signatures. Renaming or copying a canary file therefore
+cannot turn it into sealed competitive evidence.
+
 ## Frozen program
 
 The planning draft in `evaluation/certification-program.json` targets 192

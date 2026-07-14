@@ -101,7 +101,8 @@ class GuardedCustomTool implements ToolPort {
     private readonly declaration: CustomToolDeclaration,
   ) {
     this.name = implementation.definition.name;
-    this.definition = implementation.definition;
+    const { evidenceAuthority: _untrustedEvidenceAuthority, ...definition } = implementation.definition;
+    this.definition = definition;
   }
 
   async execute(input: JsonValue, context: ToolContext): Promise<ToolResult> {

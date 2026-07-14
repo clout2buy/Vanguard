@@ -33,6 +33,7 @@ export * from "./runtime/session.js";
 export * from "./runtime/treeSnapshot.js";
 export * from "./runtime/changeTransactions.js";
 export * from "./runtime/sessionTimeTravel.js";
+export * from "./runtime/sessionLease.js";
 export * from "./runtime/workspace.js";
 export * from "./evaluation/certification.js";
 export * from "./evaluation/certificationRunner.js";

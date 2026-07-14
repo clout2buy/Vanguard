@@ -1,4 +1,4 @@
-# Vanguard private gauntlet
+# Vanguard developer-visible canary gauntlet
 
 The gauntlet is an evaluation product, not a demo folder. Tasks remain separate from the agent implementation and are scored from observable final state.
 
@@ -22,7 +22,7 @@ The gauntlet is an evaluation product, not a demo folder. Tasks remain separate 
 
 The corpus is derived from sanitized Ares failure shapes, not proprietary competitor code.
 
-## Private sealed suite v2
+## Developer-visible suite v2
 
 The suite currently contains six independent cases:
 
@@ -33,19 +33,21 @@ The suite currently contains six independent cases:
 5. `async-pool` tests greenfield asynchronous concurrency, ordering, failure, and abort behavior.
 6. `ward-mod` tests long-horizon Java 8 mod work across claims, persistence, concurrency, permissions, commands, resources, and integration wiring under forced context compaction.
 
-Each case exposes only its behavioral task and starter workspace. Its grader remains outside the disposable agent workspace, verifier output is summarized without privileged paths, the agent's Node subprocess is filesystem-confined to the disposable workspace, and the integrity verifier protects manifests and restricts edits to declared source roots.
+The case corpus is visible to Vanguard developers. During a candidate run, each grader remains outside the disposable agent workspace, verifier output is summarized without privileged paths, the agent's Node subprocess is filesystem-confined to the disposable workspace, and the integrity verifier protects manifests and restricts edits to declared source roots. This is candidate-hidden/developer-visible regression evidence, not an externally sealed or blinded competitive benchmark.
 
-Run all cases with:
+From a clean source checkout, run the canonical detached, commit-pinned wrapper:
 
 ```powershell
-.\scripts\run-private-gauntlet.ps1 -Provider deepseek -Model deepseek-v4-pro
+.\scripts\run-canary.ps1 -Phase local-regression -Provider deepseek -Model deepseek-v4-pro
 ```
 
 Run one or more selected cases without paying to repeat completed work:
 
 ```powershell
-.\scripts\run-private-gauntlet.ps1 -Provider deepseek -Model deepseek-v4-pro -CaseId atomic-ledger
+.\scripts\run-canary.ps1 -Phase local-regression -Provider deepseek -Model deepseek-v4-pro -CaseId atomic-ledger
 ```
+
+`run-private-gauntlet.ps1` is the inner harness used by the wrapper. Direct invocation is for harness debugging only: it is not commit-pinned Gate Zero evidence and never supports a parity/superiority claim. Canary scripts and the full case corpus are source-checkout development assets, not part of the installable engine package.
 
 The runner writes per-case scorecards plus a versioned aggregate under `gauntlet/results/`. A case scores only when both its sealed behavioral grader and workspace-integrity verifier pass. Scorecards retain trajectory quality (tool failures, failed verification attempts, policy blocks, completion claims, recovery decisions/delay/exhaustion by stable failure class, and a transparent execution-quality score) and patch scope (changed files, line totals, and expansion ratio) so a green result can still be audited for wasteful or suspicious behavior. Execution quality measures run hygiene; it never overrides behavioral correctness.
 

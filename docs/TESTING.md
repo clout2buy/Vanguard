@@ -97,5 +97,5 @@ When verification can be auto-detected, the same fixed command is automatically 
 If an invocation is interrupted, continue the same disposable session without replaying completed tool actions:
 
 ```powershell
-node dist/src/cli.js resume --session "C:\Users\Clout\AppData\Local\Temp\vanguard-session-XXXXXX"
+node dist/src/cli.js resume --session "%TEMP%\vanguard-session-XXXXXX"
 ```

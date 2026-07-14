@@ -29,9 +29,9 @@ test("a 500-turn journal stays within the context budget", () => {
   const selected = policy.select("long-horizon task", transcript, budget);
   assert.ok(Buffer.byteLength(JSON.stringify(selected)) <= budget,
     `selected context ${Buffer.byteLength(JSON.stringify(selected))} exceeded ${budget}`);
-  // The task and an elided-history marker both survive.
+  // The task and an inert runtime-history digest both survive.
   assert.ok(selected.some((entry) => entry.role === "task"));
-  assert.ok(selected.some((entry) => entry.role === "user"
+  assert.ok(selected.some((entry) => entry.role === "history"
     && String(entry.content).includes("bounded history digest")));
 });
 
@@ -44,7 +44,7 @@ test("the cacheable task prefix stays stable while bounded digest generations re
     const encoded = codec.encode({
       task: "t", mode: "execution", transcript: selected, tools: [], remainingSteps: 1, workingState: null,
     }) as { messages: { role: string; content: JsonValue }[] };
-    const digestMessage = encoded.messages.find((message) => message.role === "user"
+    const digestMessage = encoded.messages.find((message) => message.role === "assistant"
       && String(message.content).includes("bounded history digest"));
     return {
       system: JSON.stringify(encoded.messages[0]),
@@ -92,12 +92,123 @@ test("thousands of huge events can never overflow the selected byte budget", () 
   assert.ok(Buffer.byteLength(JSON.stringify(selectedTools)) <= 25_000);
 });
 
+test("sticky compaction turns an oversized tool exchange into inert forensic text", () => {
+  const policy = new StickyContextPolicy();
+  const selected = policy.select("repair", [
+    { role: "task", content: "repair" },
+    {
+      role: "decision",
+      content: {
+        kind: "tools",
+        calls: [{ id: "old-plan", name: "plan.update", input: { summary: "x".repeat(40_000) } }],
+        continuation: {
+          role: "assistant",
+          tool_calls: [{
+            id: "old-plan",
+            type: "function",
+            function: { name: "plan_update", arguments: "should-never-replay" },
+          }],
+        },
+      },
+    },
+    {
+      role: "observation",
+      content: { callId: "old-plan", tool: "plan.update", ok: false, error: "missing summary" },
+    },
+  ], 5_000);
+
+  const serialized = JSON.stringify(selected);
+  const summary = selected.find((entry) => typeof entry.content === "string"
+    && entry.content.includes("Vanguard inert historical tool exchange"));
+  assert.equal(summary?.role, "history");
+  assert.match(String(summary?.content), /calls=1/);
+  assert.match(String(summary?.content), /observations=1/);
+  assert.match(String(summary?.content), /failures=1/);
+  assert.match(String(summary?.content), /bytes=\d+/);
+  assert.match(String(summary?.content), /sha256=[a-f0-9]{64}/);
+  assert.match(String(summary?.content), /tool=plan\.update; category=state; status=failed/);
+  assert.doesNotMatch(String(summary?.content), /old-plan|missing summary|preview/);
+  assert.equal(selected.some((entry) => entry.role === "decision"
+    && JSON.stringify(entry.content).includes("old-plan")), false,
+  "the compacted exchange must not occupy an executable decision slot");
+  assert.doesNotMatch(serialized, /vanguardElided/);
+  assert.doesNotMatch(serialized, /should-never-replay/);
+});
+
 test("an irreducible latest correction fails explicitly instead of violating the budget", () => {
   const policy = new StickyContextPolicy();
   assert.throws(() => policy.select("t", [
     { role: "task", content: "t" },
     { role: "user", content: "x".repeat(20_000) },
   ], 10_000), /Irreducible context requires/);
+});
+
+test("sticky context anchors a missing task inside its hard byte budget", () => {
+  const policy = new StickyContextPolicy();
+  const selected = policy.select("durable task", [{ role: "user", content: "inspect first" }], 1_000);
+  assert.equal(selected.some((entry) => entry.role === "task" && entry.content === "durable task"), true);
+  assert.throws(
+    () => policy.select("x".repeat(2_000), [], 500),
+    /Irreducible context requires/,
+  );
+});
+
+test("sticky boundaries never split user.ask from its human answer", () => {
+  const policy = new StickyContextPolicy();
+  const ask: TranscriptEntry = {
+    role: "decision",
+    content: {
+      kind: "ask_user",
+      question: "May I change the API?",
+      continuation: {
+        role: "assistant",
+        reasoning_content: "x".repeat(8_000),
+        tool_calls: [{ id: "permission", type: "function", function: { name: "user_ask", arguments: "{}" } }],
+      },
+    },
+  };
+  const selected = policy.select("repair", [
+    { role: "task", content: "repair" },
+    ask,
+    { role: "user", content: "No." },
+    ...toolChunk(1),
+    ...toolChunk(2),
+    { role: "user", content: "Keep working within the existing API." },
+  ], 6_000);
+  const retainedAsk = selected.some((entry) => entry === ask);
+  const retainedAnswer = selected.some((entry) => entry.role === "user" && entry.content === "No.");
+  assert.equal(retainedAsk, retainedAnswer);
+  assert.equal(retainedAsk, false, "the oversized causal pair must be omitted together");
+});
+
+test("sticky boundaries never split completion from its verification results", () => {
+  const policy = new StickyContextPolicy();
+  const completion: TranscriptEntry = {
+    role: "decision",
+    content: {
+      kind: "complete",
+      answer: "done",
+      continuation: {
+        role: "assistant",
+        reasoning_content: "x".repeat(8_000),
+        tool_calls: [{ id: "finish", type: "function", function: { name: "task_complete", arguments: "{}" } }],
+      },
+    },
+  };
+  const verification: TranscriptEntry = {
+    role: "verification",
+    content: { verifier: "required command", passed: true },
+  };
+  const selected = policy.select("repair", [
+    { role: "task", content: "repair" },
+    completion,
+    verification,
+    ...toolChunk(1),
+    ...toolChunk(2),
+    { role: "user", content: "Review the latest state." },
+  ], 6_000);
+  assert.equal(selected.includes(completion), selected.includes(verification));
+  assert.equal(selected.includes(completion), false, "the oversized completion certificate must be omitted together");
 });
 
 test("no boundary placement produces an orphan tool call in the codec", () => {
@@ -139,6 +250,41 @@ test("an early user correction survives many turns of compaction verbatim", () =
     "the user correction must be preserved verbatim behind the boundary");
 });
 
+test("trusted runtime notes never replace the latest human correction", () => {
+  const policy = new StickyContextPolicy();
+  const correction = "Never change the public API.";
+  const transcript: TranscriptEntry[] = [
+    { role: "task", content: "evolve the parser" },
+    { role: "user", content: correction },
+  ];
+  for (let index = 1; index <= 100; index += 1) transcript.push(...toolChunk(index));
+  transcript.push({ role: "runtime", content: "Re-ground against unproven milestones." });
+  const selected = policy.select("evolve the parser", transcript, 12_000);
+  assert.equal(selected.some((entry) => entry.role === "user" && entry.content === correction), true);
+});
+
+test("sticky compaction keeps control decisions with adjacent runtime feedback", () => {
+  const policy = new StickyContextPolicy();
+  for (const [kind, tool] of [
+    ["ask_user", "user.ask"],
+    ["execute", "task.execute"],
+    ["complete", "task.complete"],
+  ] as const) {
+    const selected = policy.select("repair", [
+      { role: "task", content: "repair" },
+      { role: "history", content: "old".repeat(10_000) },
+      { role: "decision", content: { kind, answer: "done", question: "input?", contract: { objective: "repair", successCriteria: [] } } },
+      { role: "observation", content: { callId: "synthetic", tool, ok: false, error: "runtime feedback" } },
+    ], 2_000);
+    const retainedDecision = selected.some((entry) => entry.role === "decision");
+    const retainedFeedback = selected.some((entry) => entry.role === "observation"
+      && typeof entry.content === "object" && entry.content !== null && !Array.isArray(entry.content)
+      && entry.content.tool === tool);
+    assert.equal(retainedDecision, retainedFeedback, `${kind} feedback cannot cross a sticky boundary`);
+    assert.equal(retainedDecision, true, `${kind} tail should survive this compacted fixture`);
+  }
+});
+
 test("boundary reconstruction is identical for interrupted and uninterrupted journals", () => {
   const policy = new StickyContextPolicy();
   const full = syntheticJournal(120);
@@ -149,7 +295,7 @@ test("boundary reconstruction is identical for interrupted and uninterrupted jou
   assert.equal(a, b, "resume must reproduce byte-identical selected context");
 });
 
-test("working state is injected as a tail message, never into the stable prefix", () => {
+test("working state is injected as inert assistant-side data, never into the stable prefix", () => {
   const codec = new OpenAIChatCompletionsCodec("m");
   const encoded = codec.encode({
     task: "t",
@@ -162,7 +308,8 @@ test("working state is injected as a tail message, never into the stable prefix"
   const taskMessage = encoded.messages[1];
   assert.equal(taskMessage?.content, "t", "the task message must not carry working state");
   const tail = encoded.messages.at(-1);
-  assert.match(String(tail?.content), /Vanguard runtime state/);
+  assert.equal(tail?.role, "assistant");
+  assert.match(String(tail?.content), /Vanguard inert runtime-state data/);
   assert.match(String(tail?.content), /phase two/);
 });
 

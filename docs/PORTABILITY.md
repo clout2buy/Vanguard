@@ -21,8 +21,11 @@ The npm package exposes the `vanguard` bin, whose shebang launches the compiled
 CLI. Two explicit launchers are also included:
 
 - `scripts/vanguard.ps1` for Windows PowerShell/PowerShell;
-- `scripts/vanguard` for POSIX shells. It uses `exec`, so terminal signals are
-  delivered to the Node process rather than trapped by a shell wrapper.
+- `scripts/vanguard` for POSIX shells, invoked as `sh scripts/vanguard` when a
+  tarball was produced on Windows (portable tar creation does not preserve an
+  executable bit). It uses `exec`, so terminal signals are delivered to the
+  Node process rather than trapped by a shell wrapper. Normal installs should
+  prefer the executable npm `vanguard` bin.
 
 Both resolve the package root from their own location, quote paths, forward
 arguments exactly, and work when the current directory contains spaces or
@@ -49,7 +52,8 @@ The smoke script creates a temporary destination, runs `npm pack --json`,
 asserts the required engine/provider/launcher files are present, installs the
 tarball into a clean project whose path contains spaces, imports the public
 TypeScript/ESM surface, strict-compiles a consuming TypeScript project, invokes
-the installed npm bin and platform launcher, loads/renders the packed TUI
+the installed npm bin and the platform launcher without changing its packed
+permissions (the POSIX script is passed explicitly to `sh`), loads/renders the packed TUI
 module, and removes all temporary files. On Windows it also verifies all three
 credential helpers using process-local fixture values; values are compared in
 memory and are never logged. It never publishes and never contacts a model

@@ -453,6 +453,37 @@ test("the result ledger rejects duplicates and detects tampering", () => {
   assert.throws(() => appendCertificationResult(crossManifest, [], first), /not bound|signature/);
 });
 
+test("visible development canaries and local results cannot enter certification evidence", () => {
+  const frozen = manifest();
+  const bundle = createBlindedAssignments(frozen, "visible-canary-boundary".repeat(2));
+  const valid = result(frozen, bundle.privateArtifact.assignments[0]!, true);
+  const wrapper = {
+    schemaVersion: 4,
+    layer: "development-canary",
+    evidenceBoundary: {
+      layer: "development-canary",
+      visibility: "developer-visible",
+      graderBoundary: "candidate-hidden-developer-visible",
+      purpose: "regression-diagnostic",
+      competitiveClaimEligible: false,
+      phase13CertificationEligible: false,
+    },
+    status: "valid",
+    result: { version: 9, passed: 6, total: 6 },
+  } as unknown as BlindRunResult;
+  assert.throws(
+    () => appendCertificationResult(frozen, [], wrapper),
+    /Unexpected field|malformed evidence binding/u,
+  );
+  assert.throws(
+    () => appendCertificationResult(frozen, [], {
+      ...valid,
+      executionMode: "local-development-canary",
+    } as unknown as BlindRunResult),
+    /Dry\/local execution evidence cannot enter/u,
+  );
+});
+
 test("a certificate refuses missing, mismatched, or critical-incident results", () => {
   const frozen = manifest();
   const bundle = createBlindedAssignments(frozen, "z".repeat(32));

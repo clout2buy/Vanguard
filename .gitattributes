@@ -3,3 +3,19 @@ scripts/vanguard text eol=lf
 *.sh text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+gauntlet/cases/**/*.json text eol=lf
+gauntlet/cases/**/*.md text eol=lf
+gauntlet/cases/**/*.mjs text eol=lf
+gauntlet/cases/**/*.java text eol=lf
+gauntlet/cases/**/*.gradle text eol=lf
+gauntlet/cases/**/*.png -text
+gauntlet/cases/**/*.jpg -text
+gauntlet/cases/**/*.jpeg -text
+gauntlet/cases/**/*.gif -text
+gauntlet/cases/**/*.webp -text
+gauntlet/cases/**/*.ico -text
+gauntlet/cases/**/*.zip -text
+gauntlet/cases/**/*.jar -text
+gauntlet/cases/**/*.class -text
+gauntlet/cases/**/*.pdf -text
+gauntlet/cases/**/*.wasm -text

@@ -50,8 +50,10 @@ foreach ($Command in $AllowCommand) { $Arguments += @("--allow-command", $Comman
 
 Push-Location $Root
 try {
-  npm run build
-  if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  if (Test-Path -LiteralPath (Join-Path $Root "src") -PathType Container) {
+    npm run build
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+  }
   node @Arguments
   exit $LASTEXITCODE
 }

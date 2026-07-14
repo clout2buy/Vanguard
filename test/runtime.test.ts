@@ -183,6 +183,7 @@ test("process tool enforces its command allowlist", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-process-"));
   try {
     const tool = new ProcessTool(new WorkspaceBoundary(root), { allowedCommands: [process.execPath] });
+    assert.equal(tool.definition.evidenceAuthority, "independent-execution");
     const denied = await tool.execute({ command: "definitely-not-allowed", args: [] }, context);
     assert.equal(denied.ok, false);
 

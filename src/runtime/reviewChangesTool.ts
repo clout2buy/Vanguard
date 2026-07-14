@@ -8,6 +8,7 @@ export class ReviewChangesTool implements ToolPort {
     description: "Review final changed-file scope and aggregate code growth before completion.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
     effect: "review",
+    evidenceAuthority: "independent-review",
   };
 
   constructor(

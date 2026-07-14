@@ -250,7 +250,7 @@ test("all public wire codecs preserve parallel calls and private continuation re
     { type: "thinking", thinking: "ANTHROPIC_PRIVATE", signature: "signature" },
     { type: "tool_use", id: "a", name: "workspace.read", input: { path: "a.ts" } },
     { type: "tool_use", id: "b", name: "workspace.read", input: { path: "b.ts" } },
-  ] });
+  ], stop_reason: "tool_use" });
   assert.deepEqual(anthropicDecision.kind === "tools" ? anthropicDecision.calls.map((call) => call.id) : [], ["a", "b"]);
 
   const chat = new OpenAIChatCompletionsCodec("m");

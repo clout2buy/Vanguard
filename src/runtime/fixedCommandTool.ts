@@ -21,6 +21,7 @@ export class FixedCommandTool implements ToolPort {
       description,
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
       effect: "execute",
+      evidenceAuthority: "independent-execution",
     };
   }
 

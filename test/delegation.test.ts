@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -41,6 +41,7 @@ test("delegate runner refuses endpoint credentials instead of serializing them",
     commandTimeoutMs: 1_000,
     maxContextBytes: 100_000,
     maxFailedVerificationAttempts: 1,
+    disableExtensions: false,
   };
   assert.throws(() => new CliDelegateRunner({ ...base, endpoint: "https://user:password@example.test/infer" }),
     /credentials are forbidden/);
@@ -355,8 +356,13 @@ test("compiled parent delegates a real child, streams its identity, hash-merges,
   const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-delegation-cli-"));
   await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 41;\n");
   await writeFile(path.join(source, "test.mjs"), "import {answer} from './answer.mjs'; if(answer()!==42) process.exit(1);\n");
+  await writeFile(path.join(source, "AGENTS.md"), "initial workspace instruction\n");
+  await mkdir(path.join(source, ".vanguard"));
+  await writeFile(path.join(source, ".vanguard", "config.json"), '{"version":1,"surprise":true}\n');
   let sawDelegateSurface = false;
   let childCouldRecurse = false;
+  let parentRepositoryMapPayload = "";
+  let childRepositoryMapPayload = "";
   const inheritedSecret = "delegation-e2e-secret-value";
 
   const server = createServer((request, response) => {
@@ -375,54 +381,72 @@ test("compiled parent delegates a real child, streams its identity, hash-merges,
       let decision: unknown;
       if (payload.task.includes("CHILD FIX")) {
         childCouldRecurse ||= payload.tools.some((candidate) => candidate.name === "delegate.start");
+        const repositoryMap = observations.find((observation) => observation.callId === "child-repository-map");
+        if (repositoryMap?.output !== undefined) childRepositoryMapPayload = JSON.stringify(repositoryMap.output);
         const read = observations.find((observation) => observation.callId === "child-read");
         decision = decisionCount === 0
-          ? tool("child-read", "workspace.read", { path: "answer.mjs" })
+          ? tool("child-repository-map", "repository.map", {})
           : decisionCount === 1
-            ? tool("child-edit", "workspace.replace", {
+            ? tool("child-read", "workspace.read", { path: "answer.mjs" })
+            : decisionCount === 2
+              ? tool("child-edit", "workspace.replace", {
                 path: "answer.mjs",
                 expectedSha256: read?.output?.sha256,
                 before: "41",
                 after: "42",
               })
-            : decisionCount === 2
-              ? tool("child-check", "project.check", {})
               : decisionCount === 3
-                ? tool("child-review", "workspace.changes", {})
-                : { kind: "complete", answer: "Child changed answer.mjs and verified it." };
+                ? tool("child-check", "project.check", {})
+                : decisionCount === 4
+                  ? tool("child-review", "workspace.changes", {})
+                  : { kind: "complete", answer: "Child changed answer.mjs and verified it." };
       } else {
         sawDelegateSurface ||= payload.tools.some((candidate) => candidate.name === "delegate.start")
           && payload.tools.some((candidate) => candidate.name === "delegate.merge");
         const started = observations.find((observation) => observation.callId === "parent-start")?.output;
         const waited = observations.find((observation) => observation.callId === "parent-wait")?.output;
+        const agentsRead = observations.find((observation) => observation.callId === "parent-agents-read")?.output;
+        const repositoryMap = observations.find((observation) => observation.callId === "parent-repository-map");
+        if (repositoryMap?.output !== undefined) parentRepositoryMapPayload = JSON.stringify(repositoryMap.output);
         const milestone = (status: "active" | "proven", evidence: unknown[] = []) => ({
           id: "delegated-fix",
-          title: "Delegate and merge the verified fix",
-          acceptanceCriteria: ["answer.mjs is fixed and the test passes"],
+          title: "Refresh instructions, then delegate and merge the verified fix",
+          acceptanceCriteria: ["AGENTS.md is refreshed", "answer.mjs is fixed and the test passes"],
           dependsOn: [],
           covers: [],
           status,
           evidence,
-          scope: ["answer.mjs"],
+          scope: ["answer.mjs", "AGENTS.md"],
         });
         decision = decisionCount === 0
-          ? tool("parent-plan", "plan.update", { summary: "Delegate the isolated fix", milestones: [milestone("active")] })
+          ? tool("parent-repository-map", "repository.map", {})
           : decisionCount === 1
-            ? tool("parent-start", "delegate.start", { task: "CHILD FIX: change answer() from 41 to 42 and prove test.mjs passes.", scopes: ["answer.mjs"], maxSteps: 10 })
+            ? tool("parent-plan", "plan.update", { summary: "Delegate the isolated fix", milestones: [milestone("active")] })
             : decisionCount === 2
-              ? tool("parent-wait", "delegate.wait", { id: started?.id, timeoutMs: 120_000 })
+              ? tool("parent-agents-read", "workspace.read", { path: "AGENTS.md" })
               : decisionCount === 3
-                ? tool("parent-merge", "delegate.merge", { id: waited?.id, manifestHash: (waited?.review as { manifestHash?: string } | undefined)?.manifestHash })
+                ? tool("parent-agents-edit", "workspace.replace", {
+                  path: "AGENTS.md",
+                  expectedSha256: agentsRead?.sha256,
+                  before: "initial workspace instruction",
+                  after: "mutated workspace instruction",
+                })
                 : decisionCount === 4
-                  ? tool("parent-check", "project.check", {})
+                  ? tool("parent-start", "delegate.start", { task: "CHILD FIX: change answer() from 41 to 42 and prove test.mjs passes.", scopes: ["answer.mjs"], maxSteps: 10 })
                   : decisionCount === 5
-                    ? tool("parent-review", "workspace.changes", {})
+                    ? tool("parent-wait", "delegate.wait", { id: started?.id, timeoutMs: 120_000 })
                     : decisionCount === 6
-                      ? tool("parent-prove", "plan.update", {
+                      ? tool("parent-merge", "delegate.merge", { id: waited?.id, manifestHash: (waited?.review as { manifestHash?: string } | undefined)?.manifestHash })
+                      : decisionCount === 7
+                        ? tool("parent-check", "project.check", {})
+                        : decisionCount === 8
+                          ? tool("parent-review", "workspace.changes", {})
+                          : decisionCount === 9
+                            ? tool("parent-prove", "plan.update", {
                           summary: "Delegated patch merged and verified",
                           milestones: [milestone("proven", [{ kind: "tool", callId: "parent-check", tool: "project.check" }])],
                         })
-                      : { kind: "complete", answer: "Merged the child's reviewed patch and verified the parent." };
+                          : { kind: "complete", answer: "Merged the child's reviewed patch and verified the parent." };
       }
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
@@ -439,15 +463,17 @@ test("compiled parent delegates a real child, streams its identity, hash-merges,
     const { stdout, stderr } = await executeFile(process.execPath, [
       cli, "run",
       "--workspace", source,
-      "--task", "PARENT ORCHESTRATE: delegate the answer.mjs repair, merge it, and verify it.",
+      "--task", "PARENT ORCHESTRATE: refresh AGENTS.md, delegate the answer.mjs repair, merge it, and verify it.",
       "--provider", "http",
       "--model", "delegation-mock",
       "--endpoint", `http://127.0.0.1:${address.port}`,
+      "--disable-extensions", "true",
       "--verify-command", "node",
       "--verify-arg", "test.mjs",
       "--check-command", "node",
       "--check-arg", "test.mjs",
       "--editable-root", "answer.mjs",
+      "--editable-root", "AGENTS.md",
       "--max-steps", "20",
       "--max-duration-ms", "120000",
     ], {
@@ -466,8 +492,21 @@ test("compiled parent delegates a real child, streams its identity, hash-merges,
     assert.deepEqual(scorecard.delegation.children.map((child) => child.state), ["merged"]);
     assert.equal(sawDelegateSurface, true);
     assert.equal(childCouldRecurse, false, "depth-one children must not be offered recursive delegation");
+    const repositoryMapPayloads: readonly (readonly [string, string])[] = [
+      ["parent", parentRepositoryMapPayload],
+      ["child", childRepositoryMapPayload],
+    ];
+    for (const [label, mapPayload] of repositoryMapPayloads) {
+      assert.notEqual(mapPayload, "", `${label} did not return an actual repository.map payload`);
+      assert.equal(mapPayload.includes("AGENTS.md"), false, `${label} repository.map leaked an instruction filename`);
+      assert.equal(mapPayload.includes("workspace instruction"), false, `${label} repository.map leaked instruction content`);
+      assert.match(mapPayload, /"instructionFiles":\[\]/u);
+      assert.match(mapPayload, /"instructions":\[\]/u);
+    }
     assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
+    assert.match(await readFile(path.join(scorecard.workspaceRoot, "AGENTS.md"), "utf8"), /mutated workspace instruction/);
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
+    assert.match(await readFile(path.join(source, "AGENTS.md"), "utf8"), /initial workspace instruction/);
     const stored = JSON.parse(await readFile(path.join(parentSessionRoot, "delegations.json"), "utf8")) as {
       records: Array<{ id: string; state: string; sessionRoot?: string; review?: { manifestHash?: string } }>;
     };
@@ -482,6 +521,19 @@ test("compiled parent delegates a real child, streams its identity, hash-merges,
       readFile(path.join(childSessionRoot, "run.jsonl"), "utf8"),
       readFile(path.join(childSessionRoot, "scorecard.json"), "utf8"),
     ]);
+    const childConfiguration = JSON.parse(durableChildArtifacts[1]!) as {
+      options: {
+        disableExtensions?: boolean;
+        extensions?: { provenance?: unknown[]; instructionBytes?: number };
+      };
+    };
+    assert.equal(childConfiguration.options.disableExtensions, true,
+      "delegated children must preserve hermetic extension isolation");
+    assert.deepEqual(childConfiguration.options.extensions?.provenance, [],
+      "a delegated child must not resolve mutated workspace instructions as extensions");
+    assert.equal(childConfiguration.options.extensions?.instructionBytes, 0);
+    assert.match(await readFile(path.join(childSessionRoot, "workspace", "AGENTS.md"), "utf8"),
+      /mutated workspace instruction/);
     assert.equal(durableChildArtifacts.some((artifact) => artifact.includes(inheritedSecret)), false,
       "inherited credentials must never be serialized into delegation artifacts");
     const parentJournal = await readFile(scorecard.journalFile, "utf8");

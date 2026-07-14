@@ -78,6 +78,8 @@ export interface ResolveExtensionOptions {
   readonly workspaceRoot: string;
   readonly workingDirectory?: string;
   readonly userHome?: string;
+  /** Skip every user and workspace extension layer for hermetic evaluation. */
+  readonly disableExtensions?: boolean;
   readonly maxInstructionBytes?: number;
 }
 
@@ -115,8 +117,8 @@ export async function resolveExtensions(options: ResolveExtensionOptions): Promi
   const maxInstructionBytes = bounded(options.maxInstructionBytes ?? 256 * 1024, 1, 4 * 1024 * 1024, "maxInstructionBytes");
 
   let effective = SAFE_DEFAULTS;
-  const userHome = await realpath(path.resolve(options.userHome ?? os.homedir()));
-  {
+  if (options.disableExtensions !== true) {
+    const userHome = await realpath(path.resolve(options.userHome ?? os.homedir()));
     const userAgents = path.join(userHome, ".vanguard", "AGENTS.md");
     await readInstructionFile(userAgents, "user", maxInstructionBytes, instructionParts, provenance, false);
     const userConfig = path.join(userHome, ".vanguard", "config.json");
@@ -124,20 +126,19 @@ export async function resolveExtensions(options: ResolveExtensionOptions): Promi
     if (layer !== undefined) {
       effective = mergeLayer(effective, layer);
     }
-  }
-
-  const directories = hierarchicalDirectories(root, working);
-  for (const directory of directories) {
-    const relativeDirectory = path.relative(root, directory);
-    const agentsRelative = path.join(relativeDirectory, "AGENTS.md");
-    const configRelative = path.join(relativeDirectory, ".vanguard", "config.json");
-    await readWorkspaceInstruction(workspace, agentsRelative, maxInstructionBytes, instructionParts, provenance);
-    const layer = await readWorkspaceConfig(workspace, configRelative, provenance);
-    if (layer !== undefined) {
-      // Every workspace layer is monotonic: a deeper directory may narrow
-      // its parent, but it cannot re-enable a capability removed above it.
-      assertDoesNotWiden(layer.permissions, effective.permissions, configRelative);
-      effective = mergeLayer(effective, layer, effective.permissions);
+    const directories = hierarchicalDirectories(root, working);
+    for (const directory of directories) {
+      const relativeDirectory = path.relative(root, directory);
+      const agentsRelative = path.join(relativeDirectory, "AGENTS.md");
+      const configRelative = path.join(relativeDirectory, ".vanguard", "config.json");
+      await readWorkspaceInstruction(workspace, agentsRelative, maxInstructionBytes, instructionParts, provenance);
+      const workspaceLayer = await readWorkspaceConfig(workspace, configRelative, provenance);
+      if (workspaceLayer !== undefined) {
+        // Every workspace layer is monotonic: a deeper directory may narrow
+        // its parent, but it cannot re-enable a capability removed above it.
+        assertDoesNotWiden(workspaceLayer.permissions, effective.permissions, configRelative);
+        effective = mergeLayer(effective, workspaceLayer, effective.permissions);
+      }
     }
   }
 

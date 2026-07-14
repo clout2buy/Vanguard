@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -60,8 +60,13 @@ try {
     "scripts/credential.ps1",
     "scripts/export-credential.ps1",
     "scripts/set-project-secret.ps1",
+    "scripts/install-cli.ps1",
+    "scripts/run-preview.ps1",
+    "scripts/run-project.ps1",
     "scripts/vanguard",
     "scripts/vanguard.ps1",
+    "gauntlet/fixtures/repair-cart/TASK.md",
+    "gauntlet/fixtures/repair-cart/src/cart.mjs",
   ]) {
     assert.equal(names.has(required), true, `packed artifact is missing ${required}`);
   }
@@ -89,10 +94,14 @@ try {
   run(process.execPath, [
     path.join(root, "node_modules", "typescript", "bin", "tsc"),
     "--noEmit", "--strict", "--target", "ES2022", "--module", "NodeNext",
-    "--moduleResolution", "NodeNext", "--types", "node",
-    "--typeRoots", path.join(root, "node_modules", "@types"), "consumer.ts",
+    "--moduleResolution", "NodeNext", "--types", "node", "consumer.ts",
   ], consumer);
   const installedRoot = path.join(consumer, "node_modules", "vanguard");
+  assert.equal(
+    await readFile(path.join(consumer, "node_modules", "@types", "node", "package.json"), "utf8").then(() => true),
+    true,
+    "the packed public declarations require the declared @types/node runtime dependency",
+  );
   if (process.platform === "win32") {
     const credentialHelper = path.join(installedRoot, "scripts", "export-credential.ps1");
     for (const [provider, variable] of [
@@ -123,8 +132,7 @@ try {
     assert.match(launcherResult.stdout, /Vanguard expert coding agent/u);
   } else {
     const packedLauncher = path.join(installedRoot, "scripts", "vanguard");
-    await chmod(packedLauncher, 0o755);
-    assert.match(run(packedLauncher, ["--help"], consumer), /Vanguard expert coding agent/u);
+    assert.match(run("sh", [packedLauncher, "--help"], consumer), /Vanguard expert coding agent/u);
   }
   const cli = path.join(installedRoot, "dist", "src", "cli.js");
   const help = run(process.execPath, [cli, "--help"], consumer);

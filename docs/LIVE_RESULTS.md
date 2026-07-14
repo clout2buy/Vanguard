@@ -2,6 +2,13 @@
 
 Live results are retained with an audit status. A passing verifier is necessary but not sufficient: trajectory integrity must also survive review.
 
+## 2026-07-13 — visible Gate Zero v3 diagnostic
+
+- Wrapper `canary-elite-engine-local-final-v3-20260713-214253-381-2a056a3de3e44d03bf5af0c039b822b5.json` held its then-current pinned local boundary and recorded 2/6 same-host evaluator-accepted cases (`async-pool` and `atomic-ledger`), for a total-case score of `0.3333`.
+- `dependency-planner` and `ttl-cache` reached grader-accepted code but stopped after malformed provider tool arguments. `plugin-lifecycle` and `ward-mod` passed their developer-visible runtime-sealed graders but failed exact task/config binding because of the old PowerShell text transport. Those defects drove provider-decision recovery, strict UTF-8 task-file transport, and closed run-configuration work; the result is not silently rescored.
+- This is a **visible development diagnostic**, not a passed baseline. The six cases and graders are repository-visible, all work ran on the development host, no competitor was paired or blinded, and there are no externally signed isolation/outcome attestations or independent human reviews. It is ineligible for Phase-13 certification and provides no Claude Code, Codex, or OpenCode parity/superiority evidence.
+- Aggregate schema v9 and wrapper schema v4 now preserve that distinction in a closed `evidenceBoundary`, remove the ambiguous `capabilityEligible` / `externalEvaluation` names, and label future filenames and terminal output as visible diagnostics. A fresh post-fix run is still required.
+
 ## 2026-07-13 — controlled native 3D sandbox head-to-head
 
 - Both agents received the same dependency-free C++17 starter, task, protected acceptance files, `npm test` command, two-hour ceiling, and DeepSeek `deepseek-v4-pro` backend. The task required a standalone Win32/OpenGL medieval sandbox executable, procedural terrain/town, moving villagers and birds, a dragon/fire system, day/night, camera/collision, HUD, deterministic self-test JSON, and a real 1280×720 renderer capture.

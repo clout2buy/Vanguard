@@ -18,8 +18,12 @@ export interface SerializableModelRequest {
 export interface StreamAccumulator {
   /** Feeds one SSE data payload (the JSON text after "data:"). */
   feed(data: string): void;
+  /** Records an out-of-band SSE terminal marker such as `data: [DONE]`. */
+  terminal?(marker: "[DONE]"): void;
   /** Returns the reconstructed canonical response object. */
   finish(): JsonValue;
+  /** Usage observed before a stream failed to reach a canonical response. */
+  partialUsage?(): JsonValue | undefined;
 }
 
 export interface ModelWireCodec {
@@ -56,7 +60,7 @@ export interface StreamObserver {
   committed?(): void;
   /** The decision failed after all retries; provisional text is void. */
   failed?(reason: string): void;
-  /** Provider-reported usage metadata for the successful attempt. */
+  /** Provider-reported usage metadata for every completed, billable attempt. */
   usage?(usage: JsonValue): void;
 }
 
@@ -226,8 +230,12 @@ export class HttpModelAdapter implements ModelPort {
           try {
             await consumeServerSentEvents(response, accumulator, attemptSignal);
           } catch (error) {
-            if (error instanceof SyntaxError) {
-              throw new InferenceError("protocol", "Provider stream contained malformed JSON.", response.status, true);
+            reportPartialUsage(accumulator, observer);
+            if (error instanceof SyntaxError || error instanceof StreamProtocolError) {
+              const detail = error instanceof StreamProtocolError
+                ? error.message
+                : "Provider stream contained malformed JSON.";
+              throw new InferenceError("protocol", detail, response.status, true);
             }
             throw error;
           }
@@ -235,11 +243,12 @@ export class HttpModelAdapter implements ModelPort {
           try {
             canonical = accumulator.finish();
           } catch (error) {
+            reportPartialUsage(accumulator, observer);
             const detail = error instanceof Error ? error.message : String(error);
             throw new InferenceError("protocol", detail, response.status, true);
           }
-          const decision = this.#decode(canonical, response.status);
           reportUsage(canonical, observer);
+          const decision = this.#decode(canonical, response.status);
           observer?.committed?.();
           return decision;
         }
@@ -251,8 +260,8 @@ export class HttpModelAdapter implements ModelPort {
         } catch {
           throw new InferenceError("protocol", "Provider returned malformed JSON.", response.status, true);
         }
-        const decision = this.#decode(canonical, response.status);
         reportUsage(canonical, observer);
+        const decision = this.#decode(canonical, response.status);
         observer?.committed?.();
         return decision;
       } catch (error) {
@@ -461,19 +470,39 @@ async function consumeServerSentEvents(
   const decoder = new TextDecoder();
   let buffer = "";
   let dataLines: string[] = [];
+  let terminated = false;
   const dispatch = (): void => {
     if (dataLines.length === 0) return;
     const data = dataLines.join("\n");
     dataLines = [];
-    if (data.trim() === "[DONE]") return;
-    accumulator.feed(data);
+    if (data.trim() === "[DONE]") {
+      if (terminated) throw new StreamProtocolError("Provider stream repeated its terminal [DONE] marker.");
+      try {
+        accumulator.terminal?.("[DONE]");
+      } catch (error) {
+        throw asStreamProtocolError(error);
+      }
+      terminated = true;
+      return;
+    }
+    if (terminated) throw new StreamProtocolError("Provider stream contained data after its terminal [DONE] marker.");
+    try {
+      accumulator.feed(data);
+    } catch (error) {
+      throw asStreamProtocolError(error);
+    }
   };
   const processLine = (line: string): void => {
     if (line.length === 0) {
       dispatch();
       return;
     }
-    if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+    if (terminated) {
+      throw new StreamProtocolError("Provider stream contained data after its terminal [DONE] marker.");
+    }
+    if (line.startsWith("data:")) {
+      dataLines.push(line.slice(5).replace(/^ /, ""));
+    }
     // event:/id:/retry:/comment lines carry no payload we need.
   };
   for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
@@ -485,10 +514,33 @@ async function consumeServerSentEvents(
       buffer = buffer.slice(boundary + 1);
       boundary = buffer.indexOf("\n");
     }
+    if (terminated) {
+      // Flush the decoder before accepting the marker. A split or otherwise
+      // incomplete multibyte sequence after [DONE] is still trailing data,
+      // even if TextDecoder buffered it instead of returning a character.
+      buffer += decoder.decode();
+      if (buffer.trim().length > 0) {
+        throw new StreamProtocolError("Provider stream contained trailing bytes after its terminal [DONE] marker.");
+      }
+      return;
+    }
   }
   buffer += decoder.decode();
   if (buffer.length > 0) processLine(buffer.replace(/\r$/, ""));
   dispatch();
+}
+
+class StreamProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StreamProtocolError";
+  }
+}
+
+function asStreamProtocolError(error: unknown): StreamProtocolError {
+  if (error instanceof StreamProtocolError) return error;
+  if (error instanceof SyntaxError) return new StreamProtocolError("Provider stream contained malformed JSON.");
+  return new StreamProtocolError(error instanceof Error ? error.message : String(error));
 }
 
 class RecoveryHandledError extends Error {
@@ -503,6 +555,13 @@ class RecoveryHandledError extends Error {
 
 function markRecoveryHandled(error: unknown): Error {
   return error instanceof RecoveryHandledError ? error : new RecoveryHandledError(error);
+}
+
+/** Reports provider usage retained by an accumulator whose stream failed. */
+function reportPartialUsage(accumulator: StreamAccumulator, observer: StreamObserver | undefined): void {
+  if (observer?.usage === undefined) return;
+  const usage = accumulator.partialUsage?.();
+  if (usage !== undefined) observer.usage(usage);
 }
 
 export function parseRetryAfter(headers: Headers, maximumMs = 60_000): number | undefined {

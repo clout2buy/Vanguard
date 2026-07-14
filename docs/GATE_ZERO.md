@@ -11,7 +11,7 @@ eventually certify it. It uses three strictly separated layers.
 - **Visibility:** fully visible to development. These tasks are *expected* to
   become saturated over time; their job is regression detection and
   step/cost/quality trend measurement, not capability proof.
-- **Results:** `gauntlet/results/canary-<phase>-<timestamp>.json`, summarized
+- **Results:** `gauntlet/results/visible-diagnostic-canary-<phase>-<timestamp>.json`, summarized
   in `docs/MASTER_REPORT.md` with a before/after diff against the previous
   phase.
 - **Isolation rule:** `run-canary.ps1` resolves `-Commit` exactly once, holds
@@ -23,8 +23,11 @@ eventually certify it. It uses three strictly separated layers.
   call; its source commit and bytes are recorded, copied into a per-run frozen
   snapshot, and checked again afterward. The source commit, dependency-lock
   object, and complete built-artifact manifest are also captured before
-  execution and checked again afterward. Any drift makes the wrapper
-  `invalidated`.
+  execution and checked again afterward. The complete `gauntlet/cases` tree
+  is forcibly cleaned in the disposable worktree and byte-manifested before
+  build, after build, and after execution; ignored and untracked additions
+  are included. Any drift makes the wrapper `invalidated` before its result
+  can be used as a development diagnostic.
 - **Output rule:** every invocation owns a GUID-qualified run directory and
   passes its exact `aggregate.json` path to the gauntlet. Selecting the
   newest file in a shared directory is forbidden. Cleanup runs in `finally`;
@@ -39,6 +42,26 @@ eventually certify it. It uses three strictly separated layers.
   denominator. A canonically bound provider/transport failure is diagnosed as
   infrastructure, but still contributes zero to the headline total-case score
   and makes the aggregate incomplete/non-comparable.
+- **Claim boundary:** aggregate schema v9 and wrapper schema v4 carry the same
+  closed `evidenceBoundary`: `layer: development-canary`,
+  `visibility: developer-visible`, `purpose: regression-diagnostic`, and both
+  `competitiveClaimEligible` and `phase13CertificationEligible` set to
+  `false`. The grader is hidden from the candidate while a case runs, but is
+  visible to developers; this is not the sealed shadow set or never-run
+  certification holdout. Missing, widened, or unknown boundary fields
+  invalidate the wrapper. The output filename and terminal message likewise
+  identify the artifact as a visible diagnostic.
+- **Deadline rule:** preflight, every candidate, and the independent evaluator
+  run under separate mandatory harness deadlines. On Windows PowerShell 5.1,
+  timeout handling terminates the complete native process tree before reading
+  redirected output. A candidate timeout is an `engine_error` in the score
+  denominator; a preflight/evaluator timeout invalidates the infrastructure.
+- **Containment limit:** this development canary is a reproducibility and
+  scoring boundary, not an OS security sandbox. It cannot satisfy competitive
+  certification's hostile-code containment requirement. Certification stays
+  fail-closed until an external evaluator supplies the independently signed
+  disposable-container/VM attestation required by `docs/CERTIFICATION.md`;
+  local success never waives that blocker.
 
 ## Layer 2 — Shadow regression set (sealed, run at milestones)
 
@@ -74,9 +97,13 @@ eventually certify it. It uses three strictly separated layers.
    affected runs (`docs/LIVE_RESULTS.md` discipline applies to all layers).
 4. Canary saturation (repeated 6/6 passes) is expected and is *not* evidence
    of competitive capability; only the holdout supports capability claims.
-5. A wrapper is evidence only when `status` is `valid`. Infrastructure probes
-   exercise the isolation boundary without model spend but are never scored;
-   wrappers marked `invalidated` remain in the ledger and cannot be promoted.
+5. A wrapper may be used as a **visible regression diagnostic** only when
+   `status` is `valid`. Here, `valid` means the pinned provenance and scoring
+   boundary held; it does not mean every case passed, and never means parity,
+   superiority, shadow evidence, or Phase-13 certification. Infrastructure
+   probes exercise the isolation boundary without model spend but are never
+   scored; wrappers marked `invalidated` remain in the ledger and cannot be
+   promoted.
 
 ## Reproducible invocation
 

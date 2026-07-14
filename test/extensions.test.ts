@@ -61,6 +61,29 @@ test("hierarchical config and AGENTS discovery is deterministic, strict, and pro
   assert.ok(first.provenance.every((item) => /^[a-f0-9]{64}$/.test(item.sha256)));
 });
 
+test("hermetic extension resolution ignores every user and workspace layer", async () => {
+  const { workspace, home } = await fixture("hermetic-user-layer");
+  await writeFile(path.join(home, ".vanguard", "AGENTS.md"), "untrusted user instruction");
+  await writeJson(path.join(home, ".vanguard", "config.json"), {
+    version: 1,
+    permissions: {
+      effects: ["observe", "execute"], customTools: [], mcpServers: [], hooks: [], commands: ["node"],
+    },
+  });
+  await writeFile(path.join(workspace, "AGENTS.md"), "untrusted workspace instruction");
+  await writeJson(path.join(workspace, ".vanguard", "config.json"), {
+    version: 1,
+    permissions: { effects: ["observe"], customTools: [], mcpServers: [], hooks: [], commands: [] },
+    skills: { roots: ["workspace-skills"], maxFiles: 1, maxFileBytes: 128, maxTotalBytes: 128 },
+  });
+
+  const resolved = await resolveExtensions({ workspaceRoot: workspace, userHome: home, disableExtensions: true });
+  assert.equal(resolved.instructions, "");
+  assert.deepEqual(resolved.provenance, []);
+  assert.deepEqual(resolved.config.permissions.effects, ["observe", "review", "state"]);
+  assert.deepEqual(resolved.config.permissions.commands, []);
+});
+
 test("unknown config keys and workspace permission widening are rejected", async () => {
   const unknown = await fixture("unknown");
   await writeJson(path.join(unknown.workspace, ".vanguard", "config.json"), { version: 1, surprise: true });
@@ -147,6 +170,7 @@ test("custom tools require exact permission, effect agreement, schema validity, 
       name: "acme.echo", description: "echo",
       inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"], additionalProperties: false },
       effect: "observe",
+      evidenceAuthority: "independent-execution",
     },
     implementationEffect: "observe",
     provenance: "fixture:acme@1",
@@ -156,6 +180,7 @@ test("custom tools require exact permission, effect agreement, schema validity, 
   assert.equal((await tool.execute({}, context)).ok, false);
   assert.equal((await tool.execute({ value: "ok" }, context)).ok, true);
   assert.equal((await tool.execute({ value: "x".repeat(200) }, context)).ok, false);
+  assert.equal(tool.definition.evidenceAuthority, undefined);
   assert.deepEqual(registry.provenance(), [{ name: "acme.echo", effect: "observe", provenance: "fixture:acme@1" }]);
 
   const slowRegistry = new CustomToolRegistry(

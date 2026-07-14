@@ -1,5 +1,6 @@
 import { readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
+import { SESSION_EXCLUDED_DIRECTORIES } from "../runtime/treeSnapshot.js";
 
 export interface PatchMetrics {
   readonly changedFiles: readonly string[];
@@ -11,8 +12,6 @@ export interface PatchMetrics {
   readonly beforeLines: number;
   readonly afterLines: number;
 }
-
-const IGNORED = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
 
 export async function analyzePatch(sourceRoot: string, workspaceRoot: string): Promise<PatchMetrics> {
   const [before, after] = await Promise.all([files(sourceRoot), files(workspaceRoot)]);
@@ -38,7 +37,7 @@ async function files(root: string): Promise<Map<string, Buffer>> {
     const directory = queue.shift()!;
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const absolute = path.join(directory, entry.name);
-      if (entry.isDirectory()) { if (!IGNORED.has(entry.name)) queue.push(absolute); continue; }
+      if (entry.isDirectory()) { if (!SESSION_EXCLUDED_DIRECTORIES.has(entry.name)) queue.push(absolute); continue; }
       if (entry.isFile()) result.set(path.relative(resolved, absolute).replaceAll("\\", "/"), await readFile(absolute));
     }
   }

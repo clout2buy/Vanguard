@@ -18,6 +18,254 @@ function Get-CanaryOptionalProperty {
   return $Property.Value
 }
 
+function New-CanaryEvidenceBoundary {
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("regression-diagnostic", "infrastructure-boundary-probe")]
+    [string]$Purpose
+  )
+
+  return [pscustomobject]@{
+    layer = "development-canary"
+    visibility = "developer-visible"
+    graderBoundary = "candidate-hidden-developer-visible"
+    purpose = $Purpose
+    competitiveClaimEligible = $false
+    phase13CertificationEligible = $false
+  }
+}
+
+function Get-CanaryEvidenceBoundaryViolations {
+  param(
+    $EvidenceBoundary,
+
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("regression-diagnostic", "infrastructure-boundary-probe")]
+    [string]$ExpectedPurpose
+  )
+
+  $Violations = @()
+  if ($null -eq $EvidenceBoundary -or $EvidenceBoundary -is [string] -or $EvidenceBoundary -is [ValueType]) {
+    return @("canary evidence boundary is missing or malformed")
+  }
+  $ExpectedKeys = @(
+    "competitiveClaimEligible",
+    "graderBoundary",
+    "layer",
+    "phase13CertificationEligible",
+    "purpose",
+    "visibility"
+  )
+  $ActualKeys = @($EvidenceBoundary.PSObject.Properties.Name | Sort-Object)
+  if (($ActualKeys -join "`n") -cne ($ExpectedKeys -join "`n")) {
+    $Violations += "canary evidence boundary does not use the closed schema"
+  }
+  if ((Get-CanaryOptionalProperty -InputObject $EvidenceBoundary -Name "layer") -cne "development-canary" `
+    -or (Get-CanaryOptionalProperty -InputObject $EvidenceBoundary -Name "visibility") -cne "developer-visible" `
+    -or (Get-CanaryOptionalProperty -InputObject $EvidenceBoundary -Name "graderBoundary") -cne "candidate-hidden-developer-visible" `
+    -or (Get-CanaryOptionalProperty -InputObject $EvidenceBoundary -Name "purpose") -cne $ExpectedPurpose) {
+    $Violations += "canary evidence boundary classification is invalid"
+  }
+  $Competitive = Get-CanaryOptionalProperty -InputObject $EvidenceBoundary -Name "competitiveClaimEligible"
+  $Phase13 = Get-CanaryOptionalProperty -InputObject $EvidenceBoundary -Name "phase13CertificationEligible"
+  if ($Competitive -isnot [bool] -or $Competitive -ne $false `
+    -or $Phase13 -isnot [bool] -or $Phase13 -ne $false) {
+    $Violations += "visible development diagnostics cannot be competitive or Phase-13 certification evidence"
+  }
+  return $Violations
+}
+
+function Read-CanaryUtf8Text {
+  param([Parameter(Mandatory = $true)][string]$Path)
+
+  $ResolvedPath = [IO.Path]::GetFullPath($Path)
+  if (-not (Test-Path -LiteralPath $ResolvedPath -PathType Leaf)) {
+    throw "Canary UTF-8 input is not a file: $ResolvedPath"
+  }
+  try {
+    # Windows PowerShell 5.1's Get-Content default is the active ANSI code
+    # page. Sealed task bytes are UTF-8 and must reach the engine and the
+    # independent evaluator as the same Unicode text.
+    return [IO.File]::ReadAllText($ResolvedPath, [Text.UTF8Encoding]::new($false, $true))
+  }
+  catch [Text.DecoderFallbackException] {
+    throw "Canary input is not valid UTF-8: $ResolvedPath"
+  }
+}
+
+function Get-CanaryProcessEnvironment {
+  param([string]$CredentialVariable = "")
+
+  # Start from a deliberately small build/runtime surface. In particular, no
+  # inherited NODE_* preload/cache knobs or VANGUARD_* feature switches can
+  # change the candidate or evaluator behind the recorded run configuration.
+  $Result = @{}
+  $PathValue = [Environment]::GetEnvironmentVariable("PATH", "Process")
+  if ([string]::IsNullOrEmpty($PathValue)) {
+    $PathValue = [Environment]::GetEnvironmentVariable("Path", "Process")
+  }
+  if (-not [string]::IsNullOrEmpty($PathValue)) { $Result["PATH"] = $PathValue }
+  $SystemRootValue = [Environment]::GetEnvironmentVariable("SystemRoot", "Process")
+  if ([string]::IsNullOrEmpty($SystemRootValue)) {
+    $SystemRootValue = [Environment]::GetEnvironmentVariable("SYSTEMROOT", "Process")
+  }
+  if (-not [string]::IsNullOrEmpty($SystemRootValue)) { $Result["SystemRoot"] = $SystemRootValue }
+  foreach ($Name in @("PATHEXT", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "JAVA_HOME")) {
+    $Value = [Environment]::GetEnvironmentVariable($Name, "Process")
+    if (-not [string]::IsNullOrEmpty($Value)) { $Result[$Name] = $Value }
+  }
+  if (-not [string]::IsNullOrWhiteSpace($CredentialVariable)) {
+    if ($CredentialVariable -notmatch "^[A-Z][A-Z0-9_]*$") {
+      throw "Canary credential variable name is invalid: $CredentialVariable"
+    }
+    $Credential = [Environment]::GetEnvironmentVariable($CredentialVariable, "Process")
+    if ([string]::IsNullOrWhiteSpace($Credential)) {
+      throw "Canary credential is unavailable in the process environment: $CredentialVariable"
+    }
+    $Result[$CredentialVariable] = $Credential
+  }
+  $Result["VANGUARD_DELEGATION_DEPTH"] = "0"
+  $Result["VANGUARD_DELEGATION_MAX_DEPTH"] = "1"
+  $Result["VANGUARD_DELEGATION_CONCURRENCY"] = "2"
+  $Result["VANGUARD_DELEGATION_MAX_CHILDREN"] = "6"
+  return $Result
+}
+
+function Get-CanaryNodeAndNpmEntrypoint {
+  $NodeCommand = Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1
+  $NodePath = [IO.Path]::GetFullPath($NodeCommand.Source)
+  $Candidates = @(
+    (Join-Path (Split-Path -Parent $NodePath) "node_modules\npm\bin\npm-cli.js"),
+    (Join-Path (Split-Path -Parent (Split-Path -Parent $NodePath)) "lib\node_modules\npm\bin\npm-cli.js")
+  )
+  $NpmCommand = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -ne $NpmCommand) {
+    $Candidates += Join-Path (Split-Path -Parent $NpmCommand.Source) "node_modules\npm\bin\npm-cli.js"
+  }
+  $NpmCli = $Candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+  if ([string]::IsNullOrWhiteSpace($NpmCli)) {
+    throw "Unable to resolve npm-cli.js beside the selected Node runtime."
+  }
+  return [pscustomobject]@{
+    node = $NodePath
+    npmCli = [IO.Path]::GetFullPath($NpmCli)
+  }
+}
+
+function ConvertTo-CanaryWindowsArgument {
+  param([AllowEmptyString()][Parameter(Mandatory = $true)][string]$Argument)
+
+  if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+  $Builder = [Text.StringBuilder]::new()
+  [void]$Builder.Append([char]34)
+  $Backslashes = 0
+  foreach ($Character in $Argument.ToCharArray()) {
+    if ([int]$Character -eq 92) {
+      $Backslashes += 1
+      continue
+    }
+    if ([int]$Character -eq 34) {
+      if ($Backslashes -gt 0) { [void]$Builder.Append([char]92, ($Backslashes * 2)) }
+      [void]$Builder.Append([char]92)
+      [void]$Builder.Append([char]34)
+      $Backslashes = 0
+      continue
+    }
+    if ($Backslashes -gt 0) { [void]$Builder.Append([char]92, $Backslashes) }
+    [void]$Builder.Append($Character)
+    $Backslashes = 0
+  }
+  if ($Backslashes -gt 0) { [void]$Builder.Append([char]92, ($Backslashes * 2)) }
+  [void]$Builder.Append([char]34)
+  return $Builder.ToString()
+}
+
+function Invoke-CanaryUtf8Process {
+  param(
+    [Parameter(Mandatory = $true)][string]$FilePath,
+    [string[]]$ArgumentList = @(),
+    [Parameter(Mandatory = $true)][hashtable]$Environment,
+    [string]$WorkingDirectory = (Get-Location).Path,
+    [Parameter(Mandatory = $true)]
+    [ValidateRange(1, 604800000)]
+    [int]$TimeoutMs
+  )
+
+  $StartInfo = [Diagnostics.ProcessStartInfo]::new()
+  $StartInfo.FileName = $FilePath
+  $StartInfo.WorkingDirectory = [IO.Path]::GetFullPath($WorkingDirectory)
+  $StartInfo.UseShellExecute = $false
+  $StartInfo.CreateNoWindow = $true
+  $StartInfo.RedirectStandardOutput = $true
+  $StartInfo.RedirectStandardError = $true
+  $Utf8 = [Text.UTF8Encoding]::new($false, $true)
+  $StartInfo.StandardOutputEncoding = $Utf8
+  $StartInfo.StandardErrorEncoding = $Utf8
+  $StartInfo.EnvironmentVariables.Clear()
+  foreach ($Name in $Environment.Keys) {
+    $StartInfo.EnvironmentVariables[[string]$Name] = [string]$Environment[$Name]
+  }
+
+  if ($null -ne $StartInfo.PSObject.Properties["ArgumentList"]) {
+    foreach ($Argument in $ArgumentList) { [void]$StartInfo.ArgumentList.Add($Argument) }
+  }
+  elseif ($PSVersionTable.PSEdition -eq "Desktop" -or [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $StartInfo.Arguments = (($ArgumentList | ForEach-Object { ConvertTo-CanaryWindowsArgument -Argument $_ }) -join " ")
+  }
+  else {
+    throw "This PowerShell runtime cannot pass an exact native argument vector."
+  }
+
+  $Process = [Diagnostics.Process]::new()
+  $Process.StartInfo = $StartInfo
+  try {
+    if (-not $Process.Start()) { throw "Process failed to start: $FilePath" }
+    $StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+    $StderrTask = $Process.StandardError.ReadToEndAsync()
+    $TimedOut = -not $Process.WaitForExit($TimeoutMs)
+    if ($TimedOut) {
+      # Process.Kill(entireProcessTree) is unavailable on the .NET Framework
+      # hosted by Windows PowerShell 5.1. taskkill /T binds termination to the
+      # still-live root PID and closes descendants that may hold redirected
+      # stdout/stderr handles; using Kill() alone can leave this call hung.
+      if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        $TaskKill = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::System)) "taskkill.exe"
+        if (-not (Test-Path -LiteralPath $TaskKill -PathType Leaf)) {
+          throw "Cannot terminate timed-out canary process tree because taskkill.exe is unavailable."
+        }
+        $PreviousErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+          & $TaskKill /PID ([string]$Process.Id) /T /F 2>&1 | Out-Null
+        }
+        finally {
+          $ErrorActionPreference = $PreviousErrorPreference
+        }
+      }
+      elseif (-not $Process.HasExited) {
+        $Process.Kill()
+      }
+      if (-not $Process.WaitForExit(10000)) {
+        throw "Timed-out canary process tree did not terminate within the fixed shutdown grace period."
+      }
+    }
+    # The parameterless wait flushes asynchronous redirected-stream events
+    # after the bounded/termination wait; it returns immediately after exit.
+    $Process.WaitForExit()
+    $Stdout = $StdoutTask.GetAwaiter().GetResult()
+    $Stderr = $StderrTask.GetAwaiter().GetResult()
+    return [pscustomobject]@{
+      exitCode = if ($TimedOut) { 124 } else { $Process.ExitCode }
+      stdout = $Stdout
+      stderr = $Stderr
+      timedOut = $TimedOut
+    }
+  }
+  finally {
+    $Process.Dispose()
+  }
+}
+
 function Write-CanaryJson {
   param(
     [Parameter(Mandatory = $true)]$InputObject,
@@ -61,7 +309,7 @@ function Get-CanaryGitPathState {
   $Commit = Resolve-CanaryCommit -RepositoryRoot $RepositoryRoot -Commit HEAD
   $Arguments = @(
     "-C", [IO.Path]::GetFullPath($RepositoryRoot),
-    "status", "--porcelain=v1", "--untracked-files=all", "--"
+    "status", "--porcelain=v1", "--untracked-files=all", "--ignored=matching", "--"
   ) + $RelativePaths
   $PreviousErrorPreference = $ErrorActionPreference
   $ErrorActionPreference = "Continue"
@@ -74,9 +322,16 @@ function Get-CanaryGitPathState {
   if ($LASTEXITCODE -ne 0) {
     throw "Unable to inspect evaluator harness source state: $Output"
   }
+  $Changes = [object[]]@()
+  if (-not [string]::IsNullOrWhiteSpace($Output)) {
+    $Changes = [object[]]@($Output -split "`r?`n")
+  }
   return [pscustomobject]@{
     commit = $Commit
-    changes = if ([string]::IsNullOrWhiteSpace($Output)) { @() } else { @($Output -split "`r?`n") }
+    # Assign a typed array instead of an inline empty pipeline expression.
+    # Windows PowerShell 5.1 otherwise serializes AutomationNull as `{}` in
+    # the evidence wrapper, violating the closed array schema.
+    changes = $Changes
   }
 }
 
@@ -94,11 +349,11 @@ function Get-CanaryFileManifest {
       if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
         throw "Manifest input is missing: $Candidate"
       }
-      $Files += Get-Item -LiteralPath $Candidate
+      $Files += Get-Item -Force -LiteralPath $Candidate
     }
   }
   elseif (Test-Path -LiteralPath $ResolvedRoot -PathType Container) {
-    $Files = @(Get-ChildItem -LiteralPath $ResolvedRoot -File -Recurse | Sort-Object FullName)
+    $Files = @(Get-ChildItem -Force -LiteralPath $ResolvedRoot -File -Recurse | Sort-Object FullName)
   }
 
   $Entries = @()
@@ -263,6 +518,11 @@ function Get-CanaryAggregateViolations {
 
   $Violations = @()
   try {
+    $ExpectedPurpose = if ($InfrastructureProbe) { "infrastructure-boundary-probe" } else { "regression-diagnostic" }
+    $EvidenceBoundary = Get-CanaryOptionalProperty -InputObject $Aggregate -Name "evidenceBoundary"
+    $Violations += @(Get-CanaryEvidenceBoundaryViolations `
+      -EvidenceBoundary $EvidenceBoundary `
+      -ExpectedPurpose $ExpectedPurpose)
     if ($InfrastructureProbe) {
       if ($Aggregate.version -ne 1 -or $Aggregate.probe -ne $true) {
         $Violations += "infrastructure probe aggregate has the wrong schema"
@@ -276,7 +536,10 @@ function Get-CanaryAggregateViolations {
       return $Violations
     }
 
-    if ($Aggregate.version -ne 8) { $Violations += "gauntlet aggregate version is not 8" }
+    if ($Aggregate.version -ne 9) { $Violations += "gauntlet aggregate version is not 9" }
+    if ($null -ne $Aggregate.PSObject.Properties["externalEvaluation"]) {
+      $Violations += "gauntlet aggregate uses the retired ambiguous externalEvaluation field"
+    }
     if ($Aggregate.provider -ne $Provider -or $Aggregate.model -ne $Model) {
       $Violations += "gauntlet aggregate provider/model does not match the request"
     }
@@ -314,7 +577,10 @@ function Get-CanaryAggregateViolations {
     }
 
     foreach ($Case in $Cases) {
-      if ($Case.verified -isnot [bool] -or $Case.capabilityEligible -isnot [bool]) {
+      if ($null -ne $Case.PSObject.Properties["capabilityEligible"]) {
+        $Violations += "case '$($Case.id)' uses the retired ambiguous capabilityEligible field"
+      }
+      if ($Case.verified -isnot [bool] -or $Case.canaryDenominatorEligible -isnot [bool]) {
         $Violations += "case '$($Case.id)' has non-boolean verification fields"
         continue
       }
@@ -322,7 +588,7 @@ function Get-CanaryAggregateViolations {
         $Violations += "case '$($Case.id)' has an unknown classification"
       }
       if ($Case.verified) {
-        if ($Case.score -ne 1 -or $Case.classification -ne "verified" -or $Case.capabilityEligible -ne $true `
+        if ($Case.score -ne 1 -or $Case.classification -ne "verified" -or $Case.canaryDenominatorEligible -ne $true `
           -or $Case.exitCode -ne 0 -or $Case.evaluator.bindingPassed -ne $true `
           -or $Case.evaluator.integrityPassed -ne $true -or $Case.evaluator.graderPassed -ne $true `
           -or (@($Case.evaluator.violations).Count -ne 0)) {
@@ -333,7 +599,7 @@ function Get-CanaryAggregateViolations {
         if ($Case.score -ne 0 -or $Case.classification -eq "verified") {
           $Violations += "non-verified case '$($Case.id)' does not score zero"
         }
-        if (($Case.classification -eq "infrastructure_error") -ne ($Case.capabilityEligible -eq $false)) {
+        if (($Case.classification -eq "infrastructure_error") -ne ($Case.canaryDenominatorEligible -eq $false)) {
           $Violations += "case '$($Case.id)' has inconsistent infrastructure eligibility"
         }
       }
@@ -342,10 +608,10 @@ function Get-CanaryAggregateViolations {
     $BindingFailures = @($Cases | Where-Object { $_.evaluator.bindingPassed -ne $true }).Count
     $IntegrityFailures = @($Cases | Where-Object { $_.evaluator.integrityPassed -ne $true }).Count
     $GraderFailures = @($Cases | Where-Object { $_.evaluator.graderPassed -ne $true }).Count
-    if ($Aggregate.externalEvaluation.bindingFailures -ne $BindingFailures `
-      -or $Aggregate.externalEvaluation.integrityFailures -ne $IntegrityFailures `
-      -or $Aggregate.externalEvaluation.graderFailures -ne $GraderFailures) {
-      $Violations += "gauntlet external-evaluation summary does not match its case evidence"
+    if ($Aggregate.hostCaseEvaluation.bindingFailures -ne $BindingFailures `
+      -or $Aggregate.hostCaseEvaluation.integrityFailures -ne $IntegrityFailures `
+      -or $Aggregate.hostCaseEvaluation.graderFailures -ne $GraderFailures) {
+      $Violations += "gauntlet host-case evaluation summary does not match its case evidence"
     }
 
     $ExpectedExitCode = if ($InfrastructureErrors -gt 0) { 2 } elseif ($Passed -ne $Cases.Count) { 1 } else { 0 }

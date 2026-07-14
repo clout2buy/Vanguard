@@ -24,9 +24,12 @@ test("compiled CLI reports setup failures without a stack trace", async () => {
 
 test("compiled CLI repairs an isolated copy and writes a scorecard", async () => {
   const source = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-source-"));
+  const exactTask = "Preserve \"registered\" and \"started\" while repairing the résumé cache → café…\nFinish with evidence.\n";
   await writeFile(path.join(source, "answer.mjs"), "export const answer = () => 41;\n");
   await writeFile(path.join(source, "test.mjs"), "import {answer} from './answer.mjs'; if(answer()!==42) process.exit(1);\n");
   await writeFile(path.join(source, "package.json"), JSON.stringify({ scripts: { test: "node test.mjs" } }));
+  const taskFile = path.join(source, "TASK.md");
+  await writeFile(taskFile, exactTask, "utf8");
 
   const server = createServer((request, response) => {
     let body = "";
@@ -69,10 +72,11 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
       cli,
       "run",
       "--workspace", source,
-      "--task", "Make answer() return 42.",
+      "--task-file", taskFile,
       "--provider", "http",
       "--model", "mock",
       "--endpoint", `http://127.0.0.1:${address.port}`,
+      "--disable-extensions", "true",
       "--max-steps", "10",
       "--protect", "package.json",
       "--editable-root", "answer.mjs",
@@ -85,6 +89,8 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
       patch: { changedFiles: string[]; filesModified: number };
       workspaceRoot: string;
       scorecardFile: string;
+      configurationFile: string;
+      task: string;
       extensions: { config: { version: number }; provenance: unknown[] };
     };
     isolatedRoot = path.dirname(scorecard.workspaceRoot);
@@ -96,6 +102,12 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     assert.equal(scorecard.grade.executionQuality.score, 1);
     assert.equal(scorecard.extensions.config.version, 1);
     assert.ok(Array.isArray(scorecard.extensions.provenance));
+    assert.equal(scorecard.task, exactTask, "strict task-file text must survive Unicode, quotes, and trailing LF exactly");
+    const configuration = JSON.parse(await readFile(scorecard.configurationFile, "utf8")) as {
+      options: { task: string; disableExtensions: boolean };
+    };
+    assert.equal(configuration.options.task, exactTask);
+    assert.equal(configuration.options.disableExtensions, true);
     assert.match(await readFile(path.join(scorecard.workspaceRoot, "answer.mjs"), "utf8"), /42/);
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
     assert.equal(JSON.parse(await readFile(scorecard.scorecardFile, "utf8")).outcome.status, "completed");

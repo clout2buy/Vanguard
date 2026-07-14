@@ -56,13 +56,16 @@ export class FileJournal implements JournalPort {
 
   async readValidated(): Promise<readonly RunEvent[]> {
     await this.#writeChain;
-    return (await readValidatedJournal(this.file, this.genesisHash)).map((envelope) => envelope.event);
+    const envelopes = await readValidatedJournal(this.file, this.genesisHash);
+    this.#lastHash = envelopes.at(-1)?.hash ?? this.genesisHash;
+    return envelopes.map((envelope) => envelope.event);
   }
 
   async tip(): Promise<JournalTip> {
     await this.#writeChain;
     const envelopes = await readValidatedJournal(this.file, this.genesisHash);
     const last = envelopes.at(-1);
+    this.#lastHash = last?.hash ?? this.genesisHash;
     return { hash: last?.hash ?? this.genesisHash, sequence: last?.event.sequence ?? 0 };
   }
 }
