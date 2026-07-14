@@ -16,6 +16,24 @@ $Created = $false
 
 try {
   New-Item -ItemType Directory -Force -Path $TemporaryRoot | Out-Null
+  $OptionalFixture = [pscustomobject]@{
+    present = 42
+    explicitNull = $null
+  }
+  Assert-CanaryTest `
+    ((Get-CanaryOptionalProperty -InputObject $OptionalFixture -Name "missing" -Default 600000) -eq 600000) `
+    "A missing optional property did not receive its default under strict mode."
+  Assert-CanaryTest `
+    ((Get-CanaryOptionalProperty -InputObject $OptionalFixture -Name "present" -Default 1) -eq 42) `
+    "A present optional property was replaced by its default."
+  Assert-CanaryTest `
+    ($null -eq (Get-CanaryOptionalProperty -InputObject $OptionalFixture -Name "explicitNull" -Default 1)) `
+    "An explicit null optional property was not preserved."
+  $PrivateRunnerSource = Get-Content -Raw -LiteralPath (Join-Path $Root "scripts\run-private-gauntlet.ps1")
+  Assert-CanaryTest `
+    ($PrivateRunnerSource -notmatch '\$(?:Case|CandidateCase)\.(?:version|maxDurationMs|maxContextBytes|rawProcess)\b') `
+    "The private gauntlet runner directly reads an optional case property under strict mode."
+
   $Pinned = Resolve-CanaryCommit -RepositoryRoot $Root -Commit "HEAD~1"
   $Active = Resolve-CanaryCommit -RepositoryRoot $Root -Commit "HEAD"
   Assert-CanaryTest ($Pinned -ne $Active) "The pinning fixture requires HEAD~1 to differ from HEAD."

@@ -62,6 +62,10 @@ try {
   $CaseCatalog = @{}
   foreach ($CaseFile in $CaseFiles) {
     $CandidateCase = Get-Content -Raw -LiteralPath $CaseFile.FullName | ConvertFrom-Json
+    $CandidateVersion = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "version" -Default 1
+    $CandidateMaxDurationMs = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "maxDurationMs" -Default 600000
+    $CandidateMaxContextBytes = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "maxContextBytes"
+    $CandidateRawProcess = Get-CanaryOptionalProperty -InputObject $CandidateCase -Name "rawProcess"
     if ([string]$CandidateCase.id -notmatch "^[a-z0-9][a-z0-9_-]*$") {
       throw "Gauntlet case has an invalid id: $($CaseFile.FullName)"
     }
@@ -74,7 +78,13 @@ try {
       -or [string]::IsNullOrWhiteSpace([string]$CandidateCase.publicCheck.command) `
       -or $CandidateCase.publicCheck.args -isnot [array] `
       -or $CandidateCase.editableRoots -isnot [array] `
-      -or $CandidateCase.protected -isnot [array]) {
+      -or $CandidateCase.protected -isnot [array] `
+      -or $CandidateVersion -isnot [int] -or $CandidateVersion -lt 1 -or $CandidateVersion -gt 1000000 `
+      -or $CandidateMaxDurationMs -isnot [int] -or $CandidateMaxDurationMs -lt 1 -or $CandidateMaxDurationMs -gt 604800000 `
+      -or ($null -ne $CandidateMaxContextBytes -and (
+        $CandidateMaxContextBytes -isnot [int] -or $CandidateMaxContextBytes -lt 1024 -or $CandidateMaxContextBytes -gt 100000000
+      )) `
+      -or ($null -ne $CandidateRawProcess -and $CandidateRawProcess -isnot [bool])) {
       throw "Gauntlet case schema is invalid: $($CaseFile.FullName)"
     }
     if ($CaseCatalog.ContainsKey([string]$CandidateCase.id)) {
@@ -83,6 +93,12 @@ try {
     $CaseCatalog[[string]$CandidateCase.id] = [pscustomobject]@{
       file = $CaseFile
       case = $CandidateCase
+      options = [pscustomobject]@{
+        version = [int]$CandidateVersion
+        maxDurationMs = [int]$CandidateMaxDurationMs
+        maxContextBytes = $CandidateMaxContextBytes
+        rawProcess = $CandidateRawProcess
+      }
     }
   }
   if ($CaseId.Count -gt 0) {
@@ -101,6 +117,7 @@ try {
     $CaseFile = $CatalogEntry.file
     $CaseRoot = Split-Path -Parent $CaseFile.FullName
     $Case = $CatalogEntry.case
+    $CaseOptions = $CatalogEntry.options
     if ($CaseId.Count -gt 0 -and $Case.id -notin $CaseId) { continue }
     $Workspace = Join-Path $CaseRoot $Case.workspace
     $Task = Get-Content -Raw -LiteralPath (Join-Path $CaseRoot $Case.task)
@@ -117,16 +134,16 @@ try {
       "--security-profile", "guarded",
       "--restrict-process", "true",
       "--verifier-evidence", "summary",
-      "--max-duration-ms", $(if ($null -eq $Case.maxDurationMs) { "600000" } else { [string]$Case.maxDurationMs }),
+      "--max-duration-ms", [string]$CaseOptions.maxDurationMs,
       "--max-verification-attempts", "3",
       "--max-steps", [string]$Case.maxSteps
     )
-    if ($null -ne $Case.maxContextBytes) { $Arguments += @("--max-context-bytes", [string]$Case.maxContextBytes) }
+    if ($null -ne $CaseOptions.maxContextBytes) { $Arguments += @("--max-context-bytes", [string]$CaseOptions.maxContextBytes) }
     if ($null -ne $Case.publicCheck) {
       $Arguments += @("--check-command", [string]$Case.publicCheck.command)
       foreach ($CheckArgument in $Case.publicCheck.args) { $Arguments += @("--check-arg", [string]$CheckArgument) }
     }
-    if ($null -ne $Case.rawProcess) { $Arguments += @("--expose-raw-process", ([string]$Case.rawProcess).ToLowerInvariant()) }
+    if ($null -ne $CaseOptions.rawProcess) { $Arguments += @("--expose-raw-process", ([string]$CaseOptions.rawProcess).ToLowerInvariant()) }
     foreach ($Protected in $Case.protected) { $Arguments += @("--protect", [string]$Protected) }
     foreach ($EditableRoot in $Case.editableRoots) { $Arguments += @("--editable-root", [string]$EditableRoot) }
 
@@ -137,7 +154,7 @@ try {
     [IO.File]::WriteAllText($EngineOutputFile, $Raw, [Text.UTF8Encoding]::new($false))
     $EvaluationRequest = [pscustomobject]@{
       caseId = [string]$Case.id
-      caseVersion = if ($null -eq $Case.version) { 1 } else { [int]$Case.version }
+      caseVersion = [int]$CaseOptions.version
       track = [string]$Case.track
       candidateOutputFile = $EngineOutputFile
       engineExitCode = [int]$ExitCode

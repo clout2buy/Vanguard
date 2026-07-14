@@ -1,5 +1,23 @@
 Set-StrictMode -Version Latest
 
+function Get-CanaryOptionalProperty {
+  param(
+    [Parameter(Mandatory = $true)]$InputObject,
+    [Parameter(Mandatory = $true)][string]$Name,
+    $Default = $null
+  )
+
+  if ($null -eq $InputObject) {
+    throw "Cannot read optional property '$Name' from a null object."
+  }
+  if ($Name -notmatch "^[A-Za-z_][A-Za-z0-9_]*$") {
+    throw "Optional property name is invalid: $Name"
+  }
+  $Property = $InputObject.PSObject.Properties[$Name]
+  if ($null -eq $Property) { return $Default }
+  return $Property.Value
+}
+
 function Write-CanaryJson {
   param(
     [Parameter(Mandatory = $true)]$InputObject,
