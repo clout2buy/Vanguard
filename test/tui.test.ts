@@ -15,7 +15,7 @@ test("terminal product flow has one engine-backed execution path", async () => {
 
 test("default terminal launch opens a single conversational prompt", () => {
   const welcome = renderWelcomeForTest().replace(/\x1b\[[0-9;]*m/g, "");
-  assert.match(welcome, /VANGUARD/);
+  assert.match(welcome, /V A N G U A R D/);
   assert.match(welcome, /Expert coding/);
   assert.match(welcome, /What should we work on\?/);
   assert.match(welcome, /Coding starts only when you ask for it/);
