@@ -73,20 +73,33 @@ There is not yet a native single-file executable or OS installer. Node and npm
 remain runtime/distribution prerequisites, and CI success is implementation
 evidence rather than proof of behavior on every terminal emulator.
 
-## Executed local Windows matrix (2026-07-13)
+## Executed final local Windows matrix (2026-07-13)
 
-This is local compatibility evidence, not the unexecuted nine-cell CI result:
+This is local compatibility evidence for implementation checkpoint `499d668`,
+not the unexecuted nine-cell CI result. Credentials were removed for every
+provider and package run, and the runtimes were exercised serially:
 
 | Runtime | Full suite | Provider fixtures | Packed consumer |
 |---|---:|---:|---:|
-| Node 20.19.0 | 259 passed, 1 intentional Windows skip | 12/12 | passed |
-| Node 22.22.2 / npm 10.9.7 | 259 passed, 1 intentional Windows skip | 12/12 | passed |
-| Node 24.4.1 | 259 passed, 1 intentional Windows skip | 12/12 | passed |
+| Node 20.19.0 | 377 passed, 0 failed, 2 Windows skips (379 total) | 12/12 | passed; 462,105 bytes |
+| Node 22.22.2 | 377 passed, 0 failed, 2 Windows skips (379 total) | 12/12 | passed; 462,105 bytes |
+| Node 24.4.1 | 377 passed, 0 failed, 2 Windows skips (379 total) | 12/12 | passed; 462,105 bytes |
 
-The one skip is the POSIX mode-bit apply test, which is inapplicable on
-Windows. Windows PowerShell 5.1.26100.8737 parsed all 10 project `.ps1` files
-with zero errors; process-environment credential loading passed for DeepSeek,
-OpenAI, and Anthropic without reading the user/DPAPI stores. The packed TUI
-check proves import and rendering from the installed artifact, not interactive
-terminal ergonomics. macOS/Linux and PowerShell 7 cells remain unexecuted
-locally and must not be inferred from this table.
+The two skips are platform-specific mode-bit assertions that are inapplicable
+on Windows. Windows PowerShell 5.1 parsed all 11 project `.ps1` files with zero
+errors. `npm audit --omit=dev` reported zero production vulnerabilities.
+Process-environment credential loading passed for DeepSeek, OpenAI, and
+Anthropic without reading the user/DPAPI stores. The packed TUI check proves
+import and rendering from the installed artifact, not interactive terminal
+ergonomics. macOS/Linux and PowerShell 7 cells remain unexecuted locally and
+must not be inferred from this table.
+
+### Invalidated predecessor
+
+An earlier Node 20.19.0 / npm 10.9.7 run at `7902a88` completed 375 tests in
+64.167 seconds (373 passed, 0 failed, 2 skipped), but it was invalidated before
+the rest of the matrix ran. Post-run adversarial review found that the Ares
+adapter could infer worker exit from terminal task state and release without
+`stopAndWait` while `workerActive` remained true. Commit `499d668` fixed that
+containment seam. No Node 22/24, provider, or package result was collected on
+the invalid checkpoint, and none of its numbers are used as final evidence.

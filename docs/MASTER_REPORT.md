@@ -27,13 +27,32 @@ sealed regression corpus, external competitive evaluation, or human beta.
 | 5 — review/apply/time travel | `cc0b85d` | Locally implemented and transaction-fault tested. |
 | 6 — adaptive recovery | `a89a9fd` | Locally implemented; live provider chaos remains external evidence. |
 | 7 — delegation | `d07ae76`, `d2c18e9` | Locally implemented; children are forced into guarded, summary-evidence mode. |
-| 8 — engine protocol | `9df3847` | Locally implemented and exported. |
+| 8 — engine protocol | `9df3847`, `d736d08`, `45c7255` | Locally implemented and exported; durable create/ownership, bounded protocol/replay, containment poisoning, and source-snapshot seams are adversarially hardened. |
 | 9 — extensibility | `3f62902` | Locally implemented within the documented trust boundary. |
 | 10 — product flow | `8c00d49`, `79d9a91` | TUI dogfoods the public engine; terminal/user study evidence pending. |
-| 11 — providers/portability | `df1d16a` + final portability audit | Offline conformance and Node 20/22/24 local Windows package smoke complete; nine-cell CI run pending. |
-| 12 — security | `c811295` | Local boundary implemented; no OS-sandbox or penetration-test claim. |
-| 13 — certification | `0737521` | External-evaluator drivetrain locally complete; no holdout runs or certificate exist. |
-| 14 — Ares integration | `5c68915`, `c0aac44` | Off-by-default adapter locally complete; 20-user/200-attempt beta pending. |
+| 11 — providers/portability | `df1d16a`, `d40a317` + final audit at `499d668` | Offline conformance, full Node 20/22/24 local Windows suites, and clean package smokes complete; nine-cell CI run pending. |
+| 12 — security | `c811295`, `d736d08` | Local boundary and fail-closed containment-uncertainty path implemented; no OS-sandbox, whole-process-tree, or penetration-test claim. |
+| 13 — certification | `0737521`, `3700b56` | External-evaluator drivetrain locally complete; no holdout executions, blinded reviews, or competitive certificate exist. |
+| 14 — Ares integration | `8efe5c5`, `7902a88`, `499d668` | Standalone, off-by-default adapter package locally complete; activation is intentionally blocked without independently attested execution-tree fencing, and the 20-user/200-attempt beta is pending. |
+
+### Final local implementation checkpoint (2026-07-13)
+
+The validated implementation checkpoint is `499d668`, containing the engine
+and session hardening in `d736d08` / `45c7255` and the final guarded Phase-14
+work in `7902a88` / `499d668`. The integrated Windows suite contained 379
+tests: **377 passed, 0 failed, and 2 platform-specific tests were skipped**.
+The same 377/0/2 result was reproduced on Node 20.19.0, 22.22.2, and 24.4.1.
+Under each runtime, the credential-free provider conformance harness passed
+12/12 and the clean packed-consumer smoke passed with a 462,105-byte tarball.
+Windows PowerShell 5.1 parsed all 11 project `.ps1` files with zero errors, and
+`npm audit --omit=dev` reported zero production vulnerabilities.
+
+This is local implementation, regression, portability, and packaging evidence.
+It is **not** a Phase-13 competitive certificate and **not** Phase-14 beta
+evidence. No 20-user/200-attempt beta has occurred. The built-in runner does
+not attest whole execution-tree containment, so the Ares adapter refuses
+activation. No file in Ares was edited and no integration was activated;
+Vanguard remains a standalone engine candidate.
 
 ## Phase ledger
 
@@ -229,6 +248,20 @@ Phase 5–6 in this historical execution record.
   validated journal; and `vanguard serve --stdio` with partial-chunk + CRLF
   NDJSON framing, UTF-8 validation, 1 MiB frame limits, bounded/backpressured
   output, request IDs, structured errors, and disconnect cancellation.
+- **Final lifecycle/protocol hardening (`d736d08`):** an optional absolute
+  create-operation store provides content-bound idempotent create, immutable
+  owner epochs, exact worker-generation stop receipts, and restart-safe
+  ownership fencing. Lifecycle dispatch, per-session execution, admitted
+  input, replay count/bytes, serialized output, and response frames are all
+  independently bounded. Replay pages are fitted to the actual wire limit,
+  gaps remain explicit after byte eviction, blocked output cannot hold a
+  session control lane, and shutdown reports unresolved operations instead of
+  implying EOF proved termination. Process containment uncertainty is
+  durably journaled and poisons later tools, verification, and resume.
+- **Materialization hardening (`45c7255`):** session creation fingerprints the
+  source before and after copying and verifies the disposable snapshot, so a
+  concurrent source mutation cannot publish a mixed workspace as a valid
+  materialization.
 - **Isolation:** stdout is protocol-only. The established CLI runtime executes
   behind the engine worker seam; worker stdout and raw provider payloads are
   never forwarded. Public events are property-allowlisted and credential-
@@ -241,7 +274,9 @@ Phase 5–6 in this historical execution record.
   bounded replay gaps, secret/raw/reasoning stripping, and restart/resume
   replay from a hash-chained journal. Public embedding and stdio client
   examples live under `examples/`.
-- **Tests:** 146/146 (134 inherited + 12 Phase-8 protocol/engine cases).
+- **Tests:** the original Phase-8 checkpoint was 146/146 (134 inherited + 12
+  protocol/engine cases). The final integrated checkpoint is the 379-test
+  377/0/2 Windows result recorded above.
 - **Honest remaining work:** restart replay includes durable journal events,
   not provisional SSE deltas that were never committed. The terminal now
   consumes this same engine contract (Phase 10), but that product integration
@@ -435,12 +470,14 @@ Phase 5–6 in this historical execution record.
   values. npm/npx resolution no longer assumes they are adjacent to
   `process.execPath`; the Node permission flag is selected for Node 20 versus
   Node 22/24 without allowing a model to disable it.
-- **Local proof (2026-07-13):** on Windows, Node 20.19.0, 22.22.2, and 24.4.1
-  each ran 260 tests: 259 passed and the POSIX mode-bit test was intentionally
-  skipped. Provider harness 12/12 and the clean packed consumer passed on all
-  three. Windows PowerShell 5.1 parsed 10/10 scripts and process-local
-  credential-helper checks passed for all three native providers. Exact local
-  evidence and its limits are in `docs/PORTABILITY.md`.
+- **Final local proof (2026-07-13, implementation `499d668`):** on Windows,
+  Node 20.19.0, 22.22.2, and 24.4.1 each ran 379 tests: 377 passed, zero
+  failed, and two platform-specific tests were intentionally skipped. Under
+  each runtime the provider harness passed 12/12 and the clean packed consumer
+  passed with a 462,105-byte tarball. Windows PowerShell 5.1 parsed all 11
+  project scripts with zero errors. The production dependency audit reported
+  zero vulnerabilities. Exact local evidence and its limits are in
+  `docs/PORTABILITY.md`.
 - **Honest limits:** the nine-cell CI matrix is authored but has not run in
   this local checkpoint. Live-provider conformance/cache-hit measurement is
   deliberately separate and paid; no such claim is inferred from mocks. The
@@ -472,6 +509,14 @@ Phase 5–6 in this historical execution record.
 
 ## Invalidated results ledger
 
+- **2026-07-13 Node-20 run at `7902a88`: INVALID as final evidence.** Node
+  20.19.0 / npm 10.9.7 completed 375 tests in 64.167 seconds: 373 passed, zero
+  failed, and two platform-specific tests were skipped. Immediate post-run
+  adversarial review then found that the adapter could infer worker exit from
+  terminal task state and release without `stopAndWait` while `workerActive`
+  remained true. Commit `499d668` closes that containment/certificate seam.
+  Node 22/24, provider, and package checks were deliberately not run on the
+  invalid checkpoint; the later three-runtime matrix above supersedes it.
 - **2026-07-13 canary `baseline` run: INVALID as a baseline.** Development
   builds (`npm test` → `tsc`) rewrote the shared `dist/` while the canary was
   mid-run, so cases may have executed different engine builds. The run is
@@ -541,9 +586,11 @@ Phase 5–6 in this historical execution record.
   unnecessary adjudication, incomplete cost/usage, track collapse, controlled
   fairness drift, budget overrun, and repetition-pseudoreplication tests fail
   closed. This spends no provider credit and proves no competitive capability.
-- **Verification:** full Windows suite passes: 249 cases, 248 passed, one
-  intentional dependency-sensitive skip, zero failures. The Phase 13 focused
-  red-team subset passes 20/20. No provider calls were made.
+- **Verification:** the Phase-13 implementation checkpoint passed 248/249 with
+  one intentional platform/dependency skip, and its focused red-team subset
+  passed 20/20 without provider calls. The final integrated checkpoint is the
+  379-test 377/0/2 Windows result recorded above. These local tests validate
+  the evaluator mechanics, not any competitor outcome.
 - **External gate remains:** the never-run holdout, evaluator trust roots,
   real competitor adapters, 2,304 planned isolated executions, independent
   human reviews, and resulting clustered confidence intervals do not exist in
@@ -582,6 +629,14 @@ Phase 5–6 in this historical execution record.
   broken-clock/sink isolation, and the public engine adapter seam. `79d9a91`
   additionally closes an engine double-advance race and contains queued
   steering callback failures.
+- **Final hardening (`7902a88`, `499d668`):** durable route claims precede
+  both core dispatches and pin retries to one upstream identity. Any claimed
+  or resumed worker must cross an exact `stopAndWait` generation/owner receipt
+  before the adapter releases liveness; terminal task state is not treated as
+  worker-exit proof. Beta certificate verification is bound to the frozen
+  candidate epoch and canonical, role-separated Ed25519 trust material. The
+  final integrated 379-test suite passed 377 with zero failures and the two
+  documented Windows skips.
 - **Host boundary:** the adapter replay and route state are deliberately
   bounded and process-local. The external beta operator must freeze and
   persist the complete 20-user/200-attempt roster, route/event/incident ledger,
@@ -612,7 +667,10 @@ Phase 5–6 in this historical execution record.
   20 consenting users, 200 task attempts, four held waves, independent patch
   review, incident gates, and a final seven-day observation period. None of
   those user attempts or elapsed-time records has occurred. Status is
-  **integration-ready, beta pending**, not approved for default-on replacement.
+  **standalone integration package complete, activation blocked, beta
+  pending**, not approved for default-on replacement. Vanguard's repository
+  contains the adapter, but Ares itself was not edited and no route was
+  activated.
 
 ## Remaining release evidence
 
