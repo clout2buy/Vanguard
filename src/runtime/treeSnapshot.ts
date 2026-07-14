@@ -142,9 +142,9 @@ export async function snapshotTree(root: string, options: TreeSnapshotOptions = 
       } else if (details.isDirectory()) {
         if (!excludedDirectories.has(child.name)) queue.push(absolute);
       } else if (details.isFile()) {
-        seenFiles.add(absolute);
         const cached = cache?.lookup(absolute, details);
         if (cached !== undefined) {
+          seenFiles.add(absolute);
           entries.push({
             path: relative,
             kind: "file",
@@ -154,7 +154,17 @@ export async function snapshotTree(root: string, options: TreeSnapshotOptions = 
             binary: cached.binary,
           });
         } else {
-          const contents = await readFile(absolute);
+          let contents: Buffer;
+          try {
+            contents = await readFile(absolute);
+          } catch (error) {
+            // OS-locked files (registry hives, running executables) are
+            // invisible to the session model; a lock-state change surfaces
+            // as an ordinary tree change once the file becomes readable.
+            if (isLockedError(error)) continue;
+            throw error;
+          }
+          seenFiles.add(absolute);
           const digest = sha256(contents);
           const binary = contents.subarray(0, 8_192).includes(0);
           entries.push({
@@ -301,6 +311,11 @@ function normalizeRelative(value: string): string {
 
 function isMissing(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function isLockedError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  return error.code === "EBUSY" || error.code === "EPERM" || error.code === "EACCES";
 }
 
 function compareText(left: string, right: string): number {

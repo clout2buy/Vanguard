@@ -76,6 +76,12 @@ interface UiState {
   composerHistoryIndex: number;
   /** Model text streaming in before the decision lands. */
   liveDelta: string;
+  /** Accumulated conversation-mode streamed text for this turn. */
+  conversationStreamed: string;
+  /** True while the streamed conversation line is still open (no newline). */
+  streamLineOpen: boolean;
+  /** Start timestamps for in-flight tools, queued per tool name. */
+  toolStartedAt: Map<string, number[]>;
   /** Engine-derived turn outcome; never inferred from child stdout. */
   outcome?: TurnOutcome;
 }
@@ -187,6 +193,7 @@ export async function runTui(startDirectory: string): Promise<void> {
         continue;
       }
       prompt.pause();
+      try {
       if (sessionId === undefined) {
         const created = await engine.create({
           workspace: config.workspace,
@@ -223,6 +230,14 @@ export async function runTui(startDirectory: string): Promise<void> {
       }
       if (turn.outcome?.status === "failed") {
         process.stdout.write(`${ansi.dim}You can keep talking to steer this session, or type exit to leave.${ansi.reset}\n`);
+        continue;
+      }
+      } catch (error) {
+        // One broken turn (network, locked file, provider hiccup) must never
+        // end the conversation; report it and keep the prompt alive.
+        const message = error instanceof Error ? error.message : String(error);
+        process.stdout.write(`\r\x1b[2K${ansi.red}×${ansi.reset} ${ansi.dim}${bounded(message, 240)}${ansi.reset}\n${ansi.dim}Session kept alive — try again, rephrase, or type exit.${ansi.reset}\n`);
+        prompt.resume();
         continue;
       }
     }
@@ -271,6 +286,9 @@ async function runEngineTurn(
     composerHistory: [],
     composerHistoryIndex: -1,
     liveDelta: "",
+    conversationStreamed: "",
+    streamLineOpen: false,
+    toolStartedAt: new Map(),
   };
 
   let cancelled = false;
@@ -380,8 +398,9 @@ async function runEngineTurn(
   const animation = setInterval(() => {
     state.frame += 1;
     if (state.screenActive) render(state, config);
-    else if (!state.contracted && state.outcome === undefined) {
-      // One-line thinking indicator while the conversational turn runs.
+    else if (!state.contracted && state.outcome === undefined && !state.streamLineOpen) {
+      // One-line thinking indicator while the conversational turn runs; it
+      // yields entirely while reply text is streaming onto the line.
       process.stdout.write(`\r\x1b[2K${ansi.cyan}${spinner[state.frame % spinner.length]!}${ansi.reset} ${ansi.dim}${bounded(state.quietDetail, 100)}${ansi.reset}`);
     }
     if (!state.contracted && state.phase === "starting") state.phase = "running";
@@ -504,29 +523,56 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     enterExecutionScreen();
     state.quietDetail = "Task contract accepted; isolated workspace prepared";
   }
+  const conversationInline = !state.screenActive && !state.contracted;
   if (event.type === "agent.delta" && event.message !== undefined) {
     state.liveDelta = `${state.liveDelta}${event.message}`.slice(-600);
+    if (conversationInline) {
+      // Stream the reply into the terminal as it is generated.
+      if (state.conversationStreamed.length === 0) {
+        process.stdout.write(`\r\x1b[2K\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} `);
+      }
+      process.stdout.write(event.message);
+      state.conversationStreamed += event.message;
+      state.streamLineOpen = true;
+    }
     return;
   }
   if (event.type === "agent.stream_started" || event.type === "agent.stream_reset") {
     // A fresh or replayed attempt owns the provisional line from here on.
     state.liveDelta = "";
+    if (conversationInline && state.conversationStreamed.length > 0) {
+      process.stdout.write(`\n${ansi.dim}(stream reset — retrying)${ansi.reset}\n`);
+      state.conversationStreamed = "";
+      state.streamLineOpen = false;
+    }
     return;
   }
   if (event.type === "agent.stream_committed") return;
   if (event.type === "agent.stream_failed") {
     state.liveDelta = "";
     if (event.detail !== undefined) state.quietDetail = `Model stream failed: ${event.detail}`;
+    if (conversationInline && state.streamLineOpen) {
+      process.stdout.write("\n");
+      state.conversationStreamed = "";
+      state.streamLineOpen = false;
+    }
     return;
   }
   if (event.type === "agent.message" && event.message !== undefined) {
     state.liveDelta = "";
     state.chat.push({ agentId: event.agentId, message: event.message, ...(event.turn === undefined ? {} : { turn: event.turn }) });
     trimTo(state.chat, 30);
-    if (!state.screenActive && !state.contracted) {
-      // During conversation observation, surface narration inline as it streams.
+    if (conversationInline) {
       state.conversationMessages.push(event.message);
-      process.stdout.write(`\r\x1b[2K\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${renderMarkdownLite(event.message)}\n\n`);
+      if (state.conversationStreamed.length > 0 && state.conversationStreamed.trim() === event.message.trim()) {
+        // The reply already streamed live; just settle the line.
+        process.stdout.write("\n\n");
+      } else {
+        if (state.streamLineOpen) process.stdout.write("\n");
+        process.stdout.write(`\r\x1b[2K\n${ansi.violet}${ansi.bold}Vanguard${ansi.reset} ${renderMarkdownLite(event.message)}\n\n`);
+      }
+      state.conversationStreamed = "";
+      state.streamLineOpen = false;
       state.outcome = { status: "responded", message: event.message };
     }
   }
@@ -535,8 +581,19 @@ function consumeEvent(event: PublicRunEvent, state: UiState, enterExecutionScree
     agent.action = event.title;
     agent.status = "active";
     state.quietDetail = event.detail === undefined ? `Running ${event.title}` : `${event.title} · ${event.detail}`;
-    if (!state.screenActive && !state.contracted) {
-      process.stdout.write(`\r\x1b[2K${ansi.dim}  · ${event.title}${event.detail === undefined ? "" : ` ${bounded(event.detail, 60)}`}${ansi.reset}\n`);
+    const startQueue = state.toolStartedAt.get(event.title) ?? [];
+    startQueue.push(Date.now());
+    state.toolStartedAt.set(event.title, startQueue);
+  } else if (event.type === "tool.completed" || event.type === "tool.failed") {
+    const startedAt = state.toolStartedAt.get(event.title)?.shift();
+    if (conversationInline) {
+      // Compact tool card: status glyph, tool, detail, duration.
+      const passed = event.status !== "failed";
+      const glyph = passed ? `${ansi.green}✓${ansi.reset}` : `${ansi.red}×${ansi.reset}`;
+      const duration = startedAt === undefined ? "" : ` ${ansi.faint}${formatToolDuration(Date.now() - startedAt)}${ansi.reset}`;
+      const detail = event.detail === undefined ? "" : ` ${ansi.dim}${bounded(event.detail, 70)}${ansi.reset}`;
+      if (state.streamLineOpen) { process.stdout.write("\n"); state.streamLineOpen = false; }
+      process.stdout.write(`\r\x1b[2K  ${glyph} ${ansi.slate}${event.title}${ansi.reset}${detail}${duration}\n`);
     }
   } else if (event.type === "completion.claimed") {
     agent.action = "verification";
@@ -713,6 +770,9 @@ export function renderTuiPreviewForTest(width = 100, height = 34): string {
     composerHistory: [],
     composerHistoryIndex: -1,
     liveDelta: "",
+    conversationStreamed: "",
+    streamLineOpen: false,
+    toolStartedAt: new Map(),
   };
   const config: TuiConfig = {
     workspace: "C:\\projects\\preview",
@@ -914,6 +974,12 @@ function elapsed(startedAt: number): string {
   return hours > 0
     ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
     : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function formatToolDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${milliseconds}ms`;
+  if (milliseconds < 60_000) return `${(milliseconds / 1_000).toFixed(1)}s`;
+  return `${Math.floor(milliseconds / 60_000)}m${Math.round((milliseconds % 60_000) / 1_000)}s`;
 }
 
 function trimTo<T>(items: T[], limit: number): void {

@@ -38,7 +38,15 @@ async function files(root: string): Promise<Map<string, Buffer>> {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) { if (!SESSION_EXCLUDED_DIRECTORIES.has(entry.name)) queue.push(absolute); continue; }
-      if (entry.isFile()) result.set(path.relative(resolved, absolute).replaceAll("\\", "/"), await readFile(absolute));
+      if (entry.isFile()) {
+        try {
+          result.set(path.relative(resolved, absolute).replaceAll("\\", "/"), await readFile(absolute));
+        } catch (error) {
+          // OS-locked files are invisible to the session model everywhere.
+          const code = (error as { code?: unknown } | null)?.code;
+          if (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES") throw error;
+        }
+      }
     }
   }
   return result;

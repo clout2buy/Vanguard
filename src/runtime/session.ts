@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
-import { copyFile, cp, lstat, mkdir, mkdtemp, open, readlink, readdir, readFile, realpath, rename, rm, stat } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, open, readlink, readdir, readFile, realpath, rename, rm, stat, symlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { asciiLowercase, compareOrdinal } from "../deterministicText.js";
@@ -196,12 +196,38 @@ export async function materializeSessionWorkspace(
   return materialized;
 }
 
+/**
+ * Manual recursive copy that skips OS-locked files exactly as the source
+ * fingerprint marks them, so the copied tree and the fingerprint agree.
+ * fs.cp is unsuitable because one locked file aborts the whole copy.
+ */
 async function copySessionWorkspace(sourceRoot: string, destinationRoot: string): Promise<void> {
-  await cp(sourceRoot, destinationRoot, {
-    recursive: true,
-    verbatimSymlinks: true,
-    filter: shouldCopy,
-  });
+  await mkdir(destinationRoot, { recursive: true });
+  const queue: Array<{ source: string; destination: string }> = [{ source: sourceRoot, destination: destinationRoot }];
+  while (queue.length > 0) {
+    const { source, destination } = queue.shift()!;
+    for (const entry of await readdir(source, { withFileTypes: true })) {
+      const sourcePath = path.join(source, entry.name);
+      if (!shouldCopy(sourcePath)) continue;
+      const destinationPath = path.join(destination, entry.name);
+      const details = await lstat(sourcePath);
+      if (details.isSymbolicLink()) {
+        const target = await readlink(sourcePath);
+        const targetIsDirectory = await stat(sourcePath).then((meta) => meta.isDirectory(), () => false);
+        await symlink(target, destinationPath, targetIsDirectory ? "junction" : "file");
+      } else if (details.isDirectory()) {
+        await mkdir(destinationPath, { recursive: true });
+        queue.push({ source: sourcePath, destination: destinationPath });
+      } else if (details.isFile()) {
+        try {
+          await copyFile(sourcePath, destinationPath);
+        } catch (error) {
+          if (!isLockedFileError(error)) throw error;
+          // Locked at the OS level: excluded from fingerprint and copy alike.
+        }
+      }
+    }
+  }
 }
 
 /** Creates an isolated child at an already captured checkpoint. */
@@ -215,7 +241,7 @@ export async function createForkedCodingSession(
   const baselineFile = path.join(container, "baseline.json");
   const metadataFile = path.join(container, "session.json");
   try {
-    await cp(checkpointWorkspace, workspaceRoot, { recursive: true, verbatimSymlinks: true });
+    await copySessionWorkspace(checkpointWorkspace, workspaceRoot);
     const baseline = await loadSessionBaseline(parent);
     await atomicWriteJson(baselineFile, baseline);
     const session: CodingSession = {
@@ -325,13 +351,15 @@ export async function fingerprintSessionSource(root: string): Promise<string> {
           queue.push(absolute);
         }
       } else if (details.isFile()) {
-        entries.push(JSON.stringify([
-          "file",
-          relative,
-          details.mode & 0o7777,
-          details.size,
-          await hashStableFile(absolute, details),
-        ]));
+        const digest = await hashStableFileOrLocked(absolute, details);
+        // OS-locked files (registry hives, running executables) cannot be
+        // read and are never copied into a session, so they are invisible to
+        // the session model: excluded from fingerprints and copies alike,
+        // exactly like SESSION_EXCLUDED_DIRECTORIES. A file that later
+        // becomes readable enters the fingerprint and reads as source drift.
+        if (digest !== undefined) {
+          entries.push(JSON.stringify(["file", relative, details.mode & 0o7777, details.size, digest]));
+        }
       } else {
         throw new Error(`Source contains unsupported filesystem entry: ${relative}`);
       }
@@ -339,6 +367,20 @@ export async function fingerprintSessionSource(root: string): Promise<string> {
   }
   entries.sort(compareOrdinal);
   return createHash("sha256").update(entries.join("\n")).digest("hex");
+}
+
+export function isLockedFileError(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  return error.code === "EBUSY" || error.code === "EPERM" || error.code === "EACCES";
+}
+
+async function hashStableFileOrLocked(file: string, observed: Stats): Promise<string | undefined> {
+  try {
+    return await hashStableFile(file, observed);
+  } catch (error) {
+    if (isLockedFileError(error)) return undefined;
+    throw error;
+  }
 }
 
 async function hashStableFile(file: string, observed: Stats): Promise<string> {
