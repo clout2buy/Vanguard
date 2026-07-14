@@ -77,26 +77,24 @@ There is not yet a native single-file executable or OS installer. Node and npm
 remain runtime/distribution prerequisites, and CI success is implementation
 evidence rather than proof of behavior on every terminal emulator.
 
-## Executed final local Windows matrix (2026-07-13)
+## Executed final local Windows matrix (2026-07-14)
 
-This is local compatibility evidence for implementation checkpoint `499d668`,
-not the unexecuted nine-cell CI result. Credentials were removed for every
-provider and package run, and the runtimes were exercised serially:
+This is local compatibility evidence for code checkpoint
+`751ed723c766f21993bf502088c1f15529743270`, not the unexecuted nine-cell CI
+result. The runtimes were exercised serially:
 
-| Runtime | Full suite | Provider fixtures | Packed consumer |
-|---|---:|---:|---:|
-| Node 20.19.0 | 377 passed, 0 failed, 2 Windows skips (379 total) | 12/12 | passed; 462,105 bytes |
-| Node 22.22.2 | 377 passed, 0 failed, 2 Windows skips (379 total) | 12/12 | passed; 462,105 bytes |
-| Node 24.4.1 | 377 passed, 0 failed, 2 Windows skips (379 total) | 12/12 | passed; 462,105 bytes |
+| Runtime | Executed suite | Installed packed consumer |
+|---|---:|---:|
+| Node 20.19.0 | non-Gate: 491 passed, 0 failed, 2 Windows skips (493 total) | passed; 511,606-byte tarball |
+| Node 22.22.2 | full: 493 passed, 0 failed, 2 Windows skips (495 total) | passed; 511,606-byte tarball |
+| Node 24.4.1 | non-Gate: 491 passed, 0 failed, 2 Windows skips (493 total) | passed; 511,606-byte tarball |
 
 The two skips are platform-specific mode-bit assertions that are inapplicable
-on Windows. Windows PowerShell 5.1 parsed all 11 project `.ps1` files with zero
-errors. `npm audit --omit=dev` reported zero production vulnerabilities.
-Process-environment credential loading passed for DeepSeek, OpenAI, and
-Anthropic without reading the user/DPAPI stores. The packed TUI check proves
-import and rendering from the installed artifact, not interactive terminal
-ergonomics. macOS/Linux and PowerShell 7 cells remain unexecuted locally and
-must not be inferred from this table.
+on Windows. `npm audit --omit=dev` reported zero production vulnerabilities.
+The installed-consumer smoke proves import, type consumption, launcher/bin,
+and packaged-surface behavior from the artifact; it does not prove interactive
+terminal ergonomics or live-provider behavior. macOS/Linux and PowerShell 7
+cells remain unexecuted locally and must not be inferred from this table.
 
 ### Invalidated predecessor
 

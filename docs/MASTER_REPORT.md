@@ -21,7 +21,7 @@ sealed regression corpus, external competitive evaluation, or human beta.
 
 | Phase | Primary commits | Current status |
 |---|---|---|
-| 0 — Gate Zero | `d8c3e9f`, `a9aeae5` | Reproducible runner implemented; one pinned visible v3 diagnostic recorded at 2/6, with a post-fix diagnostic and sealed shadow set pending. |
+| 0 — Gate Zero | `d8c3e9f`, `a9aeae5`, `751ed72` | Reproducible runner implemented; the current pinned visible diagnostic is valid at 6/6. It is regression evidence only; the sealed shadow set remains pending. |
 | 1 — stream lifecycle | `2a2dcff` | Locally implemented and adversarially tested. |
 | 2 — plan spine | `bd433b7`, `17d5b9a` | Locally implemented and adversarially tested. |
 | 3 — durable context/cost | `8fd8edb` | Locally implemented; paid cache-hit evidence pending. |
@@ -32,22 +32,35 @@ sealed regression corpus, external competitive evaluation, or human beta.
 | 8 — engine protocol | `9df3847`, `d736d08`, `45c7255` | Locally implemented and exported; durable create/ownership, bounded protocol/replay, containment poisoning, and source-snapshot seams are adversarially hardened. |
 | 9 — extensibility | `3f62902` | Locally implemented within the documented trust boundary. |
 | 10 — product flow | `8c00d49`, `79d9a91` | TUI dogfoods the public engine; terminal/user study evidence pending. |
-| 11 — providers/portability | `df1d16a`, `d40a317` + final audit at `499d668` | Offline conformance, full Node 20/22/24 local Windows suites, and clean package smokes complete; nine-cell CI run pending. |
-| 12 — security | `c811295`, `d736d08` | Local boundary and fail-closed containment-uncertainty path implemented; no OS-sandbox, whole-process-tree, or penetration-test claim. |
-| 13 — certification | `0737521`, `3700b56` | External-evaluator drivetrain locally complete; no holdout executions, blinded reviews, or competitive certificate exist. |
-| 14 — Ares integration | `8efe5c5`, `7902a88`, `499d668` | Standalone, off-by-default adapter package locally complete; activation is intentionally blocked without independently attested execution-tree fencing, and the 20-user/200-attempt beta is pending. |
+| 11 — providers/portability | `df1d16a`, `d40a317`, `751ed72` | Windows Node 20/22/24 local suites and clean installed-package smokes pass at the current checkpoint; nine-cell CI remains pending. |
+| 12 — security | `c811295`, `d736d08`, `b0cd341`, `751ed72` | Local schema/evidence boundaries and the fail-closed containment-uncertainty path are adversarially hardened; no OS-sandbox, whole-process-tree, or penetration-test claim. |
+| 13 — certification | `0737521`, `3700b56` | External-evaluator drivetrain locally complete; the 2,304-run holdout, blinded reviews, and competitive certificate do not exist yet. |
+| 14 — Ares integration | `8efe5c5`, `7902a88`, `499d668`, `751ed72` | Standalone, fail-closed, off-by-default adapter package locally complete; activation is blocked and the external 20-user/200-attempt beta is pending. Ares is untouched. |
 
-### Final local implementation checkpoint (2026-07-13)
+### Final local implementation checkpoint (2026-07-14)
 
-The validated implementation checkpoint is `499d668`, containing the engine
-and session hardening in `d736d08` / `45c7255` and the final guarded Phase-14
-work in `7902a88` / `499d668`. The integrated Windows suite contained 379
-tests: **377 passed, 0 failed, and 2 platform-specific tests were skipped**.
-The same 377/0/2 result was reproduced on Node 20.19.0, 22.22.2, and 24.4.1.
-Under each runtime, the credential-free provider conformance harness passed
-12/12 and the clean packed-consumer smoke passed with a 462,105-byte tarball.
-Windows PowerShell 5.1 parsed all 11 project `.ps1` files with zero errors, and
-`npm audit --omit=dev` reported zero production vulnerabilities.
+The validated code checkpoint is
+`751ed723c766f21993bf502088c1f15529743270`, following the long-horizon repair
+at `fcf634d`, evidence/schema hardening at `b0cd341`, and Windows concurrency
+hardening at `751ed72`. On Node 22.22.2 the complete Windows suite contained
+495 tests: **493 passed, 0 failed, and 2 platform-specific tests were
+skipped**. On Node 20.19.0 and Node 24.4.1 the non-Gate suite contained 493
+tests: **491 passed, 0 failed, and the same 2 tests were skipped**. A clean
+installed-package consumer smoke passed under all three runtimes. The packed
+artifact was 511,606 bytes, and `npm audit --omit=dev` reported zero
+production vulnerabilities.
+
+The pinned DeepSeek `deepseek-v4-pro` visible regression diagnostic at this
+checkpoint is `status: valid`, complete, and comparable within its declared
+developer-visible boundary: 6/6 cases, score `1.0`, average execution quality
+`0.84`, 128 steps, 16 tool failures, 4 local-test failures, zero
+verifier failures, 6 completion claims, 4 policy blocks, 19 request-context
+projections, and zero durable compactions. Independent host evaluation found
+zero infrastructure, engine, binding, integrity, or grader failures. Ward
+completed in 30 steps while crossing all 19 request projections with zero
+durable compactions; `ttl-cache` was the weakest efficiency trajectory at
+`0.68`. Correctness passed, but the quality spread is recorded rather than
+rounded into an “elite” claim.
 
 This is local implementation, regression, portability, and packaging evidence.
 It is **not** a Phase-13 competitive certificate and **not** Phase-14 beta
@@ -56,7 +69,7 @@ not attest whole execution-tree containment, so the Ares adapter refuses
 activation. No file in Ares was edited and no integration was activated;
 Vanguard remains a standalone engine candidate.
 
-Gate Zero's six repository-visible cases are now machine-labeled
+Gate Zero's six repository-visible cases are machine-labeled
 `development-canary` / `regression-diagnostic`; both competitive-claim and
 Phase-13 eligibility are permanently false in their closed artifact schema.
 The word `valid` on such a wrapper certifies only its pinned local transport
@@ -93,10 +106,11 @@ Phase 5–6 in this historical execution record.
   zero to the total-case headline and mark the aggregate incomplete and
   non-comparable, preventing a partial 1.0. Probe wrappers are deliberately not
   capability evidence.
-- **Canary baseline:** the pinned v3 run is a validly transported visible
-  diagnostic at 2/6, not a passed baseline or capability certificate. A
-  post-fix replacement must be produced by the hardened runner from an
-  explicitly pinned commit; the external shadow set remains missing.
+- **Current diagnostic:** the post-audit run pinned to `751ed72` is valid at
+  6/6 with a score of `1.0` and average execution quality `0.84`. The wrapper
+  records zero invariant violations and fixes competitive-claim and Phase-13
+  eligibility to false. It replaces the stale 2/6 diagnostic as the current
+  visible regression signal; the external shadow set remains missing.
 - **Commits:** recorded below as they land.
 
 ### Phase 1 — Provisional-stream lifecycle
@@ -118,8 +132,8 @@ Phase 5–6 in this historical execution record.
   commit, and (from the prior phase) reasoning/thinking never reaching
   public deltas.
 - **Tests:** 110/110 (up from 104; no existing test weakened).
-- **Coding non-regression:** canary run pending (recorded under Phase 0/1
-  baseline entry once executed).
+- **Coding non-regression:** the current pinned visible diagnostic passes 6/6;
+  this is same-host regression evidence, not competitive certification.
 - **Unresolved risks:** live SSE retry behavior against real DeepSeek
   disconnections is simulated, not field-observed; usage metadata is captured
   but not yet normalized into scorecards (Phase 3).
@@ -171,8 +185,12 @@ Phase 5–6 in this historical execution record.
   the system prompt and the task/contract message; `UsageLedger` normalizing
   DeepSeek/OpenAI/Anthropic usage into input/cached/output/reasoning tokens
   with a per-model price table (unknown models → null cost, never fabricated);
-  scorecards gain `usage`, `estimatedCost`, and `latency`. Execution runtime
-  now uses the sticky policy; conversation keeps the evidence policy.
+  scorecards gain `usage`, `estimatedCost`, and `latency`. The default
+  `AgentKernel` now uses the sticky policy, and a kernel-level invariant
+  rejects any custom policy that drops or rewrites the newest unconsumed tool
+  exchange. Request projections are counted separately from durable journal
+  compactions, so bounded request shaping is no longer mislabeled as state
+  loss.
 - **Adversarial proof:** 500-turn budget bound; prefix byte-stability across
   appended turns; orphan-free property test across boundary placements ×
   budgets; early-correction survival over 150 turns; resume determinism
@@ -183,6 +201,9 @@ Phase 5–6 in this historical execution record.
   boundary advance still costs one cache miss (by design — one per advance,
   not one per turn). Live cache-hit-rate measurement against real providers
   is deferred to Phase 11 conformance.
+- **Live long-horizon evidence:** Ward crossed 19 request projections in 30
+  steps with zero durable compactions at `751ed72`, retained its newest causal
+  evidence, and passed both the sealed grader and workspace-integrity check.
 
 ### Phase 4 — Repository intelligence + progressive verification
 
@@ -286,8 +307,8 @@ Phase 5–6 in this historical execution record.
   replay from a hash-chained journal. Public embedding and stdio client
   examples live under `examples/`.
 - **Tests:** the original Phase-8 checkpoint was 146/146 (134 inherited + 12
-  protocol/engine cases). The final integrated checkpoint is the 379-test
-  377/0/2 Windows result recorded above.
+  protocol/engine cases). The current Node 22 integrated checkpoint is the
+  495-test, 493/0/2 Windows result recorded above.
 - **Honest remaining work:** restart replay includes durable journal events,
   not provisional SSE deltas that were never committed. The terminal now
   consumes this same engine contract (Phase 10), but that product integration
@@ -481,13 +502,13 @@ Phase 5–6 in this historical execution record.
   values. npm/npx resolution no longer assumes they are adjacent to
   `process.execPath`; the Node permission flag is selected for Node 20 versus
   Node 22/24 without allowing a model to disable it.
-- **Final local proof (2026-07-13, implementation `499d668`):** on Windows,
-  Node 20.19.0, 22.22.2, and 24.4.1 each ran 379 tests: 377 passed, zero
-  failed, and two platform-specific tests were intentionally skipped. Under
-  each runtime the provider harness passed 12/12 and the clean packed consumer
-  passed with a 462,105-byte tarball. Windows PowerShell 5.1 parsed all 11
-  project scripts with zero errors. The production dependency audit reported
-  zero vulnerabilities. Exact local evidence and its limits are in
+- **Final local proof (2026-07-14, implementation `751ed72`):** on Windows,
+  Node 22.22.2 ran the full 495-test suite: 493 passed, zero failed, and two
+  platform-specific tests were intentionally skipped. Node 20.19.0 and
+  24.4.1 each ran the 493-test non-Gate suite: 491 passed, zero failed, and the
+  same two tests were skipped. The clean installed-package consumer passed on
+  every runtime with a 511,606-byte tarball. The production dependency audit
+  reported zero vulnerabilities. Exact local evidence and its limits are in
   `docs/PORTABILITY.md`.
 - **Honest limits:** the nine-cell CI matrix is authored but has not run in
   this local checkpoint. Live-provider conformance/cache-hit measurement is
@@ -520,6 +541,15 @@ Phase 5–6 in this historical execution record.
 
 ## Invalidated results ledger
 
+- **2026-07-14 visible v4 run at `a0ea401`: INVALID/incomplete.** Five engine
+  case outputs reached terminal completion, but Ward never produced a terminal
+  result and no valid wrapper/aggregate was published. The retained Ward
+  journal contained 1,640 events, 226 model decisions, 211 legacy context
+  projections, 3 completion claims, 2 failed sealed required-command attempts,
+  and 1,110 `workspace.read` calls before the run stopped. It is not a 5/6
+  score and is never used as capability evidence. The failure drove the
+  fresh-evidence projection and observation-stagnation repairs later validated
+  at `fcf634d` and `751ed72`.
 - **2026-07-13 Node-20 run at `7902a88`: INVALID as final evidence.** Node
   20.19.0 / npm 10.9.7 completed 375 tests in 64.167 seconds: 373 passed, zero
   failed, and two platform-specific tests were skipped. Immediate post-run
@@ -535,9 +565,9 @@ Phase 5–6 in this historical execution record.
   would be a pinned worktree, but the original script only documented that
   rule—it did not enforce it. Gate Zero now enforces a detached pinned
   worktree, isolated dependency install/build, explicit output path, lock,
-  and start/end manifests. No replacement baseline is claimed until a paid
-  run is actually completed through that boundary. (Historical invalidations
-  remain in `docs/LIVE_RESULTS.md`.)
+  and start/end manifests. At the time no replacement baseline was claimed;
+  valid replacements now exist at `fcf634d` and `751ed72`.
+  (Historical invalidations remain in `docs/LIVE_RESULTS.md`.)
 
 ### Phase 13 — external certification infrastructure (locally complete; no certificate)
 
@@ -599,9 +629,9 @@ Phase 5–6 in this historical execution record.
   closed. This spends no provider credit and proves no competitive capability.
 - **Verification:** the Phase-13 implementation checkpoint passed 248/249 with
   one intentional platform/dependency skip, and its focused red-team subset
-  passed 20/20 without provider calls. The final integrated checkpoint is the
-  379-test 377/0/2 Windows result recorded above. These local tests validate
-  the evaluator mechanics, not any competitor outcome.
+  passed 20/20 without provider calls. The current integrated Node 22
+  checkpoint is the 495-test 493/0/2 Windows result recorded above. These
+  local tests validate the evaluator mechanics, not any competitor outcome.
 - **External gate remains:** the never-run holdout, evaluator trust roots,
   real competitor adapters, 2,304 planned isolated executions, independent
   human reviews, and resulting clustered confidence intervals do not exist in
@@ -640,14 +670,16 @@ Phase 5–6 in this historical execution record.
   broken-clock/sink isolation, and the public engine adapter seam. `79d9a91`
   additionally closes an engine double-advance race and contains queued
   steering callback failures.
-- **Final hardening (`7902a88`, `499d668`):** durable route claims precede
+- **Final hardening (`7902a88`, `499d668`, `751ed72`):** durable route claims precede
   both core dispatches and pin retries to one upstream identity. Any claimed
   or resumed worker must cross an exact `stopAndWait` generation/owner receipt
   before the adapter releases liveness; terminal task state is not treated as
   worker-exit proof. Beta certificate verification is bound to the frozen
   candidate epoch and canonical, role-separated Ed25519 trust material. The
-  final integrated 379-test suite passed 377 with zero failures and the two
-  documented Windows skips.
+  current integrated Node 22 suite passed 493 of 495 with zero failures and
+  the two documented Windows skips. A bounded Windows hard-link cleanup retry
+  closes the Node 20 route-claim race without weakening the persistent-error
+  fail-closed path.
 - **Host boundary:** the adapter replay and route state are deliberately
   bounded and process-local. The external beta operator must freeze and
   persist the complete 20-user/200-attempt roster, route/event/incident ledger,
@@ -685,9 +717,9 @@ Phase 5–6 in this historical execution record.
 
 ## Remaining release evidence
 
-- Produce a `status: valid` canary from the final pinned commit using the
-  hardened Gate Zero runner. This is regression evidence only, not a
-  competitive certificate.
+- Retain the current `status: valid` 6/6 pinned canary as a visible regression
+  diagnostic only. It is explicitly ineligible for a competitive or Phase-13
+  claim.
 - Supply and freeze the missed sealed shadow regression set outside the
   development tree, then run it without exposing task-level contents.
 - Execute the authored Windows/macOS/Linux × Node 20.19/22/24 workflow and
@@ -708,7 +740,8 @@ Phase 5–6 in this historical execution record.
   establish OS isolation or third-party penetration-test assurance.
 
 Until those records exist, the strongest defensible project-level statement
-is: **Vanguard is a locally implemented supervised-alpha coding-engine candidate
-with promising scoped live results; it is not certified as equal or superior
-to Claude Code, Codex, or OpenCode, and it is not approved for default-on Ares
-replacement.**
+is: **Vanguard is a locally implemented supervised-alpha coding-engine
+candidate with a clean 6/6 developer-visible regression diagnostic at its
+current code checkpoint; it is not certified as equal or superior to Claude
+Code, Codex, or OpenCode, and it is not approved for default-on Ares
+replacement. Vanguard remains independent and Ares is untouched.**

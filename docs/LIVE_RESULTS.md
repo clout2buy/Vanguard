@@ -2,12 +2,31 @@
 
 Live results are retained with an audit status. A passing verifier is necessary but not sufficient: trajectory integrity must also survive review.
 
+## 2026-07-14 — post-audit visible regression diagnostic
+
+- Wrapper [`visible-diagnostic-canary-post-audit-evidence-v1-20260714-044130-533-660125c7550341b78af1c0d099c8a471.json`](../gauntlet/results/visible-diagnostic-canary-post-audit-evidence-v1-20260714-044130-533-660125c7550341b78af1c0d099c8a471.json) is `status: valid` at exact pinned commit `751ed723c766f21993bf502088c1f15529743270`, with zero wrapper invariant violations.
+- DeepSeek `deepseek-v4-pro` passed 6/6 repository-visible cases: score `1.0`, average execution quality `0.84`, 128 steps, 16 tool failures, 4 local-test failures, zero verifier failures, 6 completion claims, 4 policy blocks, 19 request-context projections, and zero durable compactions. The aggregate is complete and comparable within its declared boundary; it records zero infrastructure, engine, host-binding, integrity, or grader failures.
+- Ward completed in 30 steps while crossing 19 request projections with zero durable compactions. This is the direct live regression for the fresh-evidence and observation-stagnation repairs. The lowest execution-quality case was `ttl-cache` at `0.68`; that friction remains visible instead of being hidden by the 6/6 correctness score.
+- This is a **developer-visible regression diagnostic**. Its closed evidence boundary says `competitiveClaimEligible: false` and `phase13CertificationEligible: false`. The tasks and graders are repository-visible, no competitor ran, and no blinded external reviewer or isolation authority participated. It cannot support a Claude Code, Codex, or OpenCode parity/superiority claim.
+
+## 2026-07-14 — preceding `fcf634d` fresh-context diagnostics
+
+- The targeted Ward wrapper [`visible-diagnostic-canary-long-horizon-fresh-context-v1-20260714-032924-129-d79006788a234e9ea571c642220c1aa3.json`](../gauntlet/results/visible-diagnostic-canary-long-horizon-fresh-context-v1-20260714-032924-129-d79006788a234e9ea571c642220c1aa3.json), pinned to `fcf634d40d3d1386055cb33714d6250b3043e9a0`, passed 1/1 in 51 steps with execution quality `0.76`, zero verifier failures, and zero durable compactions.
+- The full wrapper [`visible-diagnostic-canary-long-horizon-fresh-context-full-v1-20260714-034057-315-fbe54c2f24c34a41b97548de2b1e3b3f.json`](../gauntlet/results/visible-diagnostic-canary-long-horizon-fresh-context-full-v1-20260714-034057-315-fbe54c2f24c34a41b97548de2b1e3b3f.json) passed 6/6 in 96 steps with average execution quality `0.84`. Ward used 26 model decisions and 13 request projections without returning to the earlier observation loop.
+- Both wrappers are valid developer-visible regression artifacts only. Their evidence boundaries also set competitive-claim and Phase-13 eligibility to false. The newer `751ed72` run supersedes them as the current checkpoint while preserving them as historical repair evidence.
+
+## 2026-07-14 — invalidated `a0ea401` visible v4 run
+
+- The run is **invalid/incomplete**, not 5/6 evidence. Five engine case outputs reached terminal completion, but Ward never produced a terminal result, so no valid aggregate or wrapper was published.
+- The retained Ward journal stopped after 1,640 events, 226 model decisions, 211 legacy context projections, 3 completion claims, 2 failed sealed required-command attempts, and 1,110 `workspace.read` calls. Those symptoms exposed fresh-evidence loss and an unbounded observation loop; they drove the repairs validated by the two pinned runs above.
+- Nothing from this run is silently rescored or included in the current 6/6 result.
+
 ## 2026-07-13 — visible Gate Zero v3 diagnostic
 
 - Wrapper `canary-elite-engine-local-final-v3-20260713-214253-381-2a056a3de3e44d03bf5af0c039b822b5.json` held its then-current pinned local boundary and recorded 2/6 same-host evaluator-accepted cases (`async-pool` and `atomic-ledger`), for a total-case score of `0.3333`.
 - `dependency-planner` and `ttl-cache` reached grader-accepted code but stopped after malformed provider tool arguments. `plugin-lifecycle` and `ward-mod` passed their developer-visible runtime-sealed graders but failed exact task/config binding because of the old PowerShell text transport. Those defects drove provider-decision recovery, strict UTF-8 task-file transport, and closed run-configuration work; the result is not silently rescored.
 - This is a **visible development diagnostic**, not a passed baseline. The six cases and graders are repository-visible, all work ran on the development host, no competitor was paired or blinded, and there are no externally signed isolation/outcome attestations or independent human reviews. It is ineligible for Phase-13 certification and provides no Claude Code, Codex, or OpenCode parity/superiority evidence.
-- Aggregate schema v9 and wrapper schema v4 now preserve that distinction in a closed `evidenceBoundary`, remove the ambiguous `capabilityEligible` / `externalEvaluation` names, and label future filenames and terminal output as visible diagnostics. A fresh post-fix run is still required.
+- Aggregate schema v9 and wrapper schema v4 now preserve that distinction in a closed `evidenceBoundary`, remove the ambiguous `capabilityEligible` / `externalEvaluation` names, and label future filenames and terminal output as visible diagnostics. This 2/6 result is historical; the pinned 6/6 diagnostics above are its post-fix replacements.
 
 ## 2026-07-13 — controlled native 3D sandbox head-to-head
 

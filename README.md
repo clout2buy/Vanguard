@@ -3,15 +3,25 @@
 Vanguard is a clean-room, verification-first coding-agent kernel. Its purpose is not to sound capable; it must repeatedly produce correct, maintainable software under measured conditions.
 
 The repository began with an intentionally small kernel and a private gauntlet.
-Phases 0–12 are implemented locally, the Phase 13 certification drivetrain is
-built, and the Phase 14 Ares adapter is integration-ready. The current status
-is still **not competitively certified** and **external beta pending**: no
-Claude Code, Codex, or OpenCode parity/superiority claim is valid until the
-frozen external experiment in
+Phases 0–12 are implemented locally. The Phase 13 certification drivetrain is
+built, but the externally isolated 2,304-run blinded experiment has not run.
+The Phase 14 Ares adapter exists only as a standalone, fail-closed,
+off-by-default package: activation remains blocked and its 20-user/200-attempt
+beta has not begun. **Vanguard has not been merged into Ares; no Ares file or
+route was changed.** The current status is **not competitively certified** and
+**external beta pending**: no Claude Code, Codex, or OpenCode
+parity/superiority claim is valid until the frozen external experiment in
 [`docs/CERTIFICATION.md`](docs/CERTIFICATION.md) selects one, and Vanguard
 must not replace Ares's coding core by default until the gates in
 [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md) and the external soak in
 [`docs/ARES_INTEGRATION.md`](docs/ARES_INTEGRATION.md) pass.
+
+The latest pinned developer-visible regression diagnostic passed all six
+repository-visible cases at commit
+`751ed723c766f21993bf502088c1f15529743270`. That result is useful engineering
+evidence, but its artifact explicitly sets `competitiveClaimEligible: false`
+and `phase13CertificationEligible: false`. See
+[`docs/LIVE_RESULTS.md`](docs/LIVE_RESULTS.md) for the complete audit record.
 
 It also exposes a versioned engine surface for embedding in other agents:
 
