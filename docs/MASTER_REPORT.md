@@ -560,15 +560,54 @@ Phase 5–6 in this historical execution record.
   cutover. Competitive capability remains a separate Phase-13 question.
 - **Implemented:** an exported `AresVanguardAdapter` that consumes only the
   public `VanguardEngine`; off-by-default deterministic cohorts; explicit
-  opt-in; a live kill switch; safe fallback only before any possible mutation;
+  opt-in; a live kill switch; legacy routing only before Vanguard dispatch;
   terminal `manual_recovery` after a tool boundary, replay gap, uncertain
   transport state, or unacknowledged interrupt; bounded, ordered, gap-aware
   event projection; and HMAC-pseudonymous metadata-only beta telemetry.
+- **Durable create arbitration:** the required `FileAresRouteClaimStore`
+  atomically fixes one core and deterministic adapter identity before either
+  engine is called, validates any prior receipt before dispatch, and binds the
+  returned upstream identity before publication. Matching claims survive
+  rollout drift; a Vanguard claim never becomes a legacy retry. Store
+  corruption causes zero core calls. A claim/read timeout blocks dispatch until
+  its exact promise settles, while a commit timeout additionally requires an
+  exact worker-stop proof; only then can the durable same-core path reopen.
 - **Integration proof:** tests cover rollout selection, non-consenting control
-  users, startup fallback, post-tool no-replay, kill-switch races, uncertain
-  cancellation, cursor gaps/order, telemetry schema rejection/redaction, and
-  the public engine adapter seam. `79d9a91` additionally closes an engine
-  double-advance race and contains queued steering callback failures.
+  users, malformed control-plane fail-closed behavior, startup fallback,
+  lifetime post-tool no-replay, completed-session and kill-switch races,
+  concurrent control serialization, uncertain advance/cancellation, restart
+  resume continuity, foreign/malformed replay pages, bounded push-flood
+  reconciliation (including a push during the final fetch), cursor gaps/order,
+  capacity reservations, shutdown races, runtime telemetry schema rejection,
+  broken-clock/sink isolation, and the public engine adapter seam. `79d9a91`
+  additionally closes an engine double-advance race and contains queued
+  steering callback failures.
+- **Host boundary:** the adapter replay and route state are deliberately
+  bounded and process-local. The external beta operator must freeze and
+  persist the complete 20-user/200-attempt roster, route/event/incident ledger,
+  and worker-stop acknowledgements outside the adapter; telemetry is not an
+  authoritative attempt counter. Runtime capability negotiation requires
+  durable idempotent create, fenced ownership, and `stopAndWait`; kill/shutdown
+  report incomplete unless lifecycle receipts prove the expected worker
+  generation stopped. Duplicate identities and stale/malformed receipts poison
+  the barrier instead of becoming best-effort success.
+- **Activation blocker found by destructive review:** immediate-child process
+  exit does not prove a detached/racing grandchild stopped. The adapter now
+  requires a separate `sessions.executionTreeFenced` attestation from both
+  Vanguard and legacy ports. The default Windows CLI/stdio runner must not
+  advertise it until backed by a real Job Object or independently attested
+  container/VM and a delayed-grandchild marker regression. Therefore the local
+  adapter is implemented but intentionally refuses production activation.
+- **Beta evidence evaluator:** the exported `AresBetaPlan` freezes the exact
+  20 x 10 denominator, task/repository/verifier bindings, two controls per wave,
+  Vanguard and Ares host artifacts, rollout/dependency/verifier/execution
+  policies, and externally pinned, distinct Ed25519 evaluator/authority trust
+  roots. The signed hash-chain and policy-digest-bound final certificate
+  evaluator rejects omitted/duplicate/reassigned attempts, artifact drift,
+  contradictory route/mutation or worker-stop claims, invalidated waves,
+  controls outside their wave, unused reviewer-roster entries, and future-dated
+  hold/rating/release evidence.
+  Synthetic tests prove those rules but are not counted as beta attempts.
 - **External gate remains:** `docs/ARES_INTEGRATION.md` pre-registers exactly
   20 consenting users, 200 task attempts, four held waves, independent patch
   review, incident gates, and a final seven-day observation period. None of
@@ -592,6 +631,9 @@ Phase 5–6 in this historical execution record.
 - Complete the Phase-14 20-user/200-attempt beta, hold periods, incident
   review, and seven-day final observation before enabling Vanguard as Ares's
   default coding core.
+- Implement and externally attest an execution-tree-fenced runner (Windows Job
+  Object or container/VM equivalent), then prove abort, timeout, disconnect,
+  kill-switch, and shutdown against a delayed-writing detached grandchild.
 - For untrusted repositories, provide and attest the external container/VM
   boundary described in `docs/THREAT_MODEL.md`; local security tests do not
   establish OS isolation or third-party penetration-test assurance.

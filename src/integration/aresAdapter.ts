@@ -1,8 +1,27 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createSecretRedactor, sanitizePublicEvent } from "../engine/security.js";
-import type { VanguardEngineEvent, VanguardSessionState } from "../engine/types.js";
+import type {
+  VanguardEngineEvent,
+  VanguardEventPage,
+  VanguardSessionState,
+  VanguardSessionStatus,
+} from "../engine/types.js";
 import type { PublicRunEvent } from "../runtime/publicRunEvents.js";
 import { AresBetaTelemetry } from "./betaTelemetry.js";
+import {
+  ARES_ROUTE_CLAIM_CAPABILITY,
+  aresRouteClaimDigest,
+  aresRouteOperationDigest,
+  aresUpstreamIdentityDigest,
+  validateAresDurableRouteClaim,
+  validateAresDurableRouteReceipt,
+  type AresClaimedCore,
+  type AresDurableRouteClaim,
+  type AresDurableRouteReceipt,
+  type AresRouteClaimResult,
+  type AresRouteClaimStorePort,
+  type AresRouteReceiptResult,
+} from "./aresRouteClaimStore.js";
 import {
   ARES_VANGUARD_ADAPTER_VERSION,
   type AresAdapterCreateInput,
@@ -13,10 +32,13 @@ import {
   type AresFallbackReason,
   type AresLegacyCorePort,
   type AresLegacyCreateInput,
+  type AresLegacyEventPage,
   type AresLegacyResumeInput,
+  type AresLegacySessionStatus,
   type AresTurnEvent,
   type AresTurnEventPage,
   type AresVanguardEnginePort,
+  type AresWorkerStopReceipt,
 } from "./aresTypes.js";
 import {
   DEFAULT_ARES_VANGUARD_ROLLOUT,
@@ -28,11 +50,19 @@ import {
 export interface AresVanguardAdapterOptions {
   readonly vanguard: AresVanguardEnginePort;
   readonly legacy: AresLegacyCorePort;
+  /** Host-owned durable route arbitration. Required before either core may be dispatched. */
+  readonly routeClaims: AresRouteClaimStorePort;
   /** Static config or live provider. The default is strictly off. */
   readonly rollout?: AresVanguardRolloutConfig | AresRolloutConfigProvider;
   readonly telemetry?: AresBetaTelemetry;
   readonly maxReplayEvents?: number;
+  /** Bounds queued push callbacks before they collapse into one replay reconciliation. */
+  readonly maxPendingPushEvents?: number;
   readonly maxSessions?: number;
+  /** Maximum wait for foreign-port work during kill-switch/shutdown barriers. */
+  readonly barrierTimeoutMs?: number;
+  /** Deadline for each async foreign-port operation before fail-closed recovery. */
+  readonly foreignOperationTimeoutMs?: number;
   readonly logger?: (line: string) => void;
   readonly now?: () => number;
 }
@@ -40,6 +70,7 @@ export interface AresVanguardAdapterOptions {
 interface ManagedSession {
   readonly id: string;
   readonly actorId: string;
+  readonly operationId: string | undefined;
   route: AresAdapterRoute;
   state: AresAdapterState;
   readonly events: AresTurnEvent[];
@@ -51,11 +82,19 @@ interface ManagedSession {
   readonly legacyResume?: AresLegacyResumeInput;
   vanguardCursor: number;
   legacyCursor: number;
+  vanguardWorkerGeneration: number | undefined;
+  vanguardOwnerEpoch: number | undefined;
+  legacyWorkerGeneration: number | undefined;
+  legacyOwnerEpoch: number | undefined;
   mutationRisk: boolean;
   pendingMessage: string | undefined;
   turnStartedAt: number | undefined;
   fallbackReason: AresFallbackReason | undefined;
-  tail: Promise<void>;
+  /** Serializes every state transition: host controls and push ingestion. */
+  stateTail: Promise<void>;
+  pendingPushEvents: number;
+  pushReconcileScheduled: boolean;
+  pushGeneration: number;
   recoveryInFlight: Promise<void> | undefined;
 }
 
@@ -65,7 +104,20 @@ const FALLBACK_REASON_TELEMETRY = {
   vanguard_startup_failure: "startup",
   vanguard_protocol_failure: "protocol",
   vanguard_critical_failure: "critical",
+  legacy_protocol_failure: "protocol",
 } as const;
+
+const CLAIMED_VANGUARD_PORTS = new WeakSet<object>();
+const CLAIMED_LEGACY_PORTS = new WeakSet<object>();
+const ROUTE_ARBITRATION_SETTLEMENTS = new WeakMap<object, Promise<void>>();
+const INVALID_ROLLOUT_POLICY_SHA256 = createHash("sha256")
+  .update("VANGUARD_ARES_INVALID_ROLLOUT_POLICY_V1")
+  .digest("hex");
+
+interface AresRolloutSnapshot {
+  readonly decision: ReturnType<typeof decideAresVanguardRollout>;
+  readonly policySha256: string;
+}
 
 /**
  * Additive Ares integration boundary. Vanguard is never selected unless the
@@ -75,192 +127,445 @@ const FALLBACK_REASON_TELEMETRY = {
 export class AresVanguardAdapter {
   readonly #vanguard: AresVanguardEnginePort;
   readonly #legacy: AresLegacyCorePort;
+  readonly #routeClaims: AresRouteClaimStorePort;
   readonly #rollout: AresRolloutConfigProvider;
   readonly #telemetry: AresBetaTelemetry | undefined;
   readonly #maxReplayEvents: number;
+  readonly #maxPendingPushEvents: number;
   readonly #maxSessions: number;
+  readonly #barrierTimeoutMs: number;
+  readonly #foreignOperationTimeoutMs: number;
   readonly #logger: (line: string) => void;
   readonly #now: () => number;
   readonly #sessions = new Map<string, ManagedSession>();
   readonly #byVanguardId = new Map<string, ManagedSession>();
+  readonly #byLegacyId = new Map<string, ManagedSession>();
   readonly #listeners = new Set<(event: AresTurnEvent) => void>();
+  readonly #pendingStarts = new Set<Promise<void>>();
+  readonly #uncertainForeignOperations = new Set<Promise<unknown>>();
+  readonly #createOperations = new Map<string, { fingerprint: string; result: Promise<AresAdapterSessionStatus> }>();
   readonly #unsubscribe: () => void;
+  #sessionReservations = 0;
+  #uncontainedForeignOperations = 0;
   #closed = false;
+  #unsubscribed = false;
+  #portsReleased = false;
+  #shutdownInFlight: Promise<AresAdapterBarrierReport> | undefined;
 
   constructor(options: AresVanguardAdapterOptions) {
     this.#vanguard = options.vanguard;
     this.#legacy = options.legacy;
+    this.#routeClaims = options.routeClaims;
+    assertLifecycleCapabilities(this.#vanguard.capabilities(), "Vanguard");
+    assertLifecycleCapabilities(this.#legacy.capabilities(), "Legacy core");
+    assertRouteClaimCapabilities(this.#routeClaims?.capabilities());
     const rollout = options.rollout;
     this.#rollout = typeof rollout === "function"
       ? rollout
       : () => rollout ?? DEFAULT_ARES_VANGUARD_ROLLOUT;
     this.#telemetry = options.telemetry;
     this.#maxReplayEvents = boundedInteger(options.maxReplayEvents ?? 4_096, 1, 100_000, "maxReplayEvents");
+    this.#maxPendingPushEvents = boundedInteger(
+      options.maxPendingPushEvents ?? 1_024,
+      1,
+      100_000,
+      "maxPendingPushEvents",
+    );
     this.#maxSessions = boundedInteger(options.maxSessions ?? 128, 1, 10_000, "maxSessions");
+    this.#barrierTimeoutMs = boundedInteger(options.barrierTimeoutMs ?? 3_000, 1, 60_000, "barrierTimeoutMs");
+    this.#foreignOperationTimeoutMs = boundedInteger(
+      options.foreignOperationTimeoutMs ?? 30_000,
+      1,
+      300_000,
+      "foreignOperationTimeoutMs",
+    );
+    if (options.logger !== undefined && typeof options.logger !== "function") throw new Error("logger must be a function.");
+    if (options.now !== undefined && typeof options.now !== "function") throw new Error("now must be a function.");
     this.#logger = options.logger ?? (() => {});
     this.#now = options.now ?? Date.now;
-    this.#unsubscribe = this.#vanguard.subscribe((envelope) => this.#acceptVanguardPush(envelope));
+    if (CLAIMED_VANGUARD_PORTS.has(this.#vanguard) || CLAIMED_LEGACY_PORTS.has(this.#legacy)) {
+      throw protocolError("A core port is already owned by another live Ares adapter.");
+    }
+    CLAIMED_VANGUARD_PORTS.add(this.#vanguard);
+    CLAIMED_LEGACY_PORTS.add(this.#legacy);
+    try {
+      const unsubscribe = this.#vanguard.subscribe((envelope) => this.#acceptVanguardPush(envelope));
+      if (typeof unsubscribe !== "function") throw protocolError("Vanguard subscribe did not return an unsubscribe function.");
+      this.#unsubscribe = unsubscribe;
+    } catch (error) {
+      CLAIMED_VANGUARD_PORTS.delete(this.#vanguard);
+      CLAIMED_LEGACY_PORTS.delete(this.#legacy);
+      throw error;
+    }
   }
 
-  async create(input: AresAdapterCreateInput): Promise<AresAdapterSessionStatus> {
+  create(input: AresAdapterCreateInput): Promise<AresAdapterSessionStatus> {
     this.#assertOpen();
-    this.#assertCapacity();
-    validateActor(input.actorId);
-    const decision = decideAresVanguardRollout(this.#rollout(), input.actorId, input.optedIn);
-    const session = this.#newSession(input.actorId, input.legacy, undefined);
-    if (!decision.useVanguard) {
-      session.fallbackReason = decision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
-      await this.#startLegacy(session);
-      this.#emitRoute(session, session.fallbackReason);
-      this.#metric(session, "session_routed", undefined, session.fallbackReason);
-      this.#sessions.set(session.id, session);
-      return this.#snapshot(session);
+    const snapshot = normalizeCreateInput(input);
+    const fingerprint = createHash("sha256").update(stableJson(snapshot)).digest("hex");
+    const existing = this.#createOperations.get(snapshot.operationId);
+    if (existing !== undefined) {
+      if (existing.fingerprint !== fingerprint) {
+        return Promise.reject(new Error("operationId was already consumed by different create input."));
+      }
+      return existing.result;
     }
+    const result = this.#createOnce(snapshot, fingerprint);
+    this.#createOperations.set(snapshot.operationId, { fingerprint, result });
+    // Locally rejected starts (capacity/closed) never reserve an unbounded
+    // operation cache entry. Dispatched uncertainty resolves to an explicit
+    // manual-recovery status and remains cached; the foreign durable store is
+    // still the source of truth across adapter restarts.
+    void result.catch((error: unknown) => {
+      const settlement = routeArbitrationSettlement(error);
+      if (settlement !== undefined) {
+        // A pre-dispatch timeout temporarily pins the rejected result. Once
+        // the exact store call settles, its durable outcome can be read safely
+        // by a same-operation retry.
+        void settlement.then(() => {
+          if (this.#createOperations.get(snapshot.operationId)?.result === result) {
+            this.#createOperations.delete(snapshot.operationId);
+          }
+        }, () => {});
+      } else if (this.#createOperations.get(snapshot.operationId)?.result === result) {
+        this.#createOperations.delete(snapshot.operationId);
+      }
+    });
+    return result;
+  }
+
+  async #createOnce(input: AresAdapterCreateInput, fingerprint: string): Promise<AresAdapterSessionStatus> {
+    this.#reserveCapacity();
+    const finishStart = this.#trackPendingStart();
     try {
-      const status = await this.#vanguard.create(input.vanguard);
-      session.route = "vanguard";
-      session.state = mapVanguardState(status.state);
-      session.vanguardSessionId = status.sessionId;
-      session.vanguardCursor = 0;
-      this.#byVanguardId.set(status.sessionId, session);
-      this.#emitRoute(session);
-      this.#metric(session, "session_routed");
-      this.#sessions.set(session.id, session);
-      return this.#snapshot(session);
-    } catch (error) {
-      if (session.vanguardSessionId !== undefined) this.#byVanguardId.delete(session.vanguardSessionId);
-      this.#diagnostic("Vanguard startup failed", error);
-      session.fallbackReason = classifyThrownFailure(error, "vanguard_startup_failure");
-      await this.#startLegacy(session);
-      this.#emitRoute(session, session.fallbackReason);
-      this.#metric(session, "fallback_completed", "success", session.fallbackReason);
-      this.#sessions.set(session.id, session);
-      return this.#snapshot(session);
+      const policy = this.#rolloutSnapshot(input.actorId, input.optedIn);
+      const proposedCore: AresClaimedCore = policy.decision.useVanguard ? "vanguard" : "legacy";
+      // This immutable claim is the linearization point. No engine method may
+      // run before it succeeds and the matching receipt has been inspected.
+      const claimResult = await this.#routeStoreOperation(
+        this.#routeClaims.claim({
+          operationId: input.operationId,
+          inputFingerprintSha256: fingerprint,
+          proposedCore,
+          policySha256: policy.policySha256,
+        }),
+      );
+      const claim = assertRouteClaimResult(
+        claimResult,
+        input.operationId,
+        fingerprint,
+        proposedCore,
+        policy.policySha256,
+      );
+      const priorReceipt = assertRouteReceipt(
+        await this.#routeStoreOperation(this.#routeClaims.readReceipt(input.operationId)),
+        claim,
+      );
+      this.#assertOpen();
+      const session = this.#newSession(
+        input.actorId,
+        input.operationId,
+        input.legacy,
+        undefined,
+        claim.adapterSessionId,
+        claim.chosenCore,
+      );
+
+      if (claim.chosenCore === "legacy") {
+        if (!policy.decision.useVanguard) {
+          session.fallbackReason = policy.decision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
+        }
+        try {
+          await this.#startLegacy(session);
+          await this.#sealRouteReceipt(session, claim, priorReceipt);
+          await this.#assertOpenAfterStart(session);
+        } catch (error) {
+          if (isAdapterClosedError(error)) throw error;
+          return this.#containCreateFailure(session, "legacy_protocol_failure", "Legacy startup failed", error);
+        }
+        this.#emitRoute(session, session.fallbackReason);
+        this.#metric(session, "session_routed", undefined, session.fallbackReason);
+        this.#sessions.set(session.id, session);
+        return this.#snapshot(session);
+      }
+
+      // A previously claimed Vanguard operation cannot drift to legacy. When
+      // policy is now closed, an existing receipt may be rehydrated only on
+      // the same idempotent engine and then stopped. Without a receipt, a
+      // concurrent/prior dispatch cannot be excluded, so fail closed.
+      const currentBeforeDispatch = this.#rolloutDecision(input.actorId, input.optedIn);
+      if (!currentBeforeDispatch.useVanguard && priorReceipt === undefined) {
+        const reason = currentBeforeDispatch.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
+        this.#uncontainedForeignOperations += 1;
+        this.#requireManualRecovery(session, reason);
+        this.#sessions.set(session.id, session);
+        return this.#snapshot(session);
+      }
+
+      try {
+        const status = await this.#withForeignDeadline(
+          this.#vanguard.create(input.vanguard, input.operationId),
+          (late) => this.#containLateVanguardStart(session, late),
+        );
+        assertVanguardStatus(status, "create");
+        if (!this.#claimVanguardId(session, status.sessionId)) {
+          this.#uncontainedForeignOperations += 1;
+          this.#requireManualRecovery(session, "vanguard_protocol_failure");
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        this.#applyVanguardStatus(session, status, "create");
+        session.vanguardCursor = 0;
+        await this.#sealRouteReceipt(session, claim, priorReceipt);
+        await this.#assertOpenAfterStart(session);
+
+        if (!currentBeforeDispatch.useVanguard) {
+          const reason = currentBeforeDispatch.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
+          if (!await this.#stopRouteAndWait(session, true)) this.#uncontainedForeignOperations += 1;
+          this.#requireManualRecovery(session, reason);
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        if (status.state !== "idle" || status.materialized) {
+          session.mutationRisk = true;
+          if (!await this.#stopRouteAndWait(session, true)) this.#uncontainedForeignOperations += 1;
+          this.#requireManualRecovery(session, "vanguard_protocol_failure");
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        // A foreign engine port could publish immediately before create()
+        // resolves and before the adapter can install its push-ID mapping.
+        await this.#withControl(session, () => this.#reconcileVanguardUntilPushesStable(session));
+        if (session.route !== "vanguard" || session.mutationRisk || session.state !== "idle") {
+          if (!await this.#stopRouteAndWait(session, true)) this.#uncontainedForeignOperations += 1;
+          this.#requireManualRecovery(session, "vanguard_protocol_failure");
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        await this.#assertOpenAfterStart(session);
+        const currentDecision = this.#rolloutDecision(input.actorId, input.optedIn);
+        if (!currentDecision.useVanguard) {
+          const reason = currentDecision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
+          if (!await this.#stopRouteAndWait(session, true)) this.#uncontainedForeignOperations += 1;
+          this.#requireManualRecovery(session, reason);
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        this.#emitRoute(session);
+        this.#metric(session, "session_routed");
+        this.#sessions.set(session.id, session);
+        return this.#snapshot(session);
+      } catch (error) {
+        if (isAdapterClosedError(error)) throw error;
+        const reason = classifyThrownFailure(error, "vanguard_startup_failure");
+        return this.#containCreateFailure(session, reason, "Vanguard startup failed", error);
+      }
+    } finally {
+      finishStart();
+      this.#sessionReservations -= 1;
     }
   }
 
   async resume(input: AresAdapterResumeInput): Promise<AresAdapterSessionStatus> {
     this.#assertOpen();
-    this.#assertCapacity();
-    validateActor(input.actorId);
-    const decision = decideAresVanguardRollout(this.#rollout(), input.actorId, input.optedIn);
-    const session = this.#newSession(input.actorId, undefined, input.legacy);
-    if (!decision.useVanguard) {
-      session.fallbackReason = decision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
-      await this.#startLegacy(session);
-      this.#emitRoute(session, session.fallbackReason);
-      this.#metric(session, "session_routed", undefined, session.fallbackReason);
-      this.#sessions.set(session.id, session);
-      return this.#snapshot(session);
-    }
+    input = normalizeResumeInput(input);
+    this.#reserveCapacity();
+    const finishStart = this.#trackPendingStart();
     try {
-      const status = await this.#vanguard.resume(input.vanguardSessionRoot);
-      session.route = "vanguard";
-      session.state = mapVanguardState(status.state);
-      session.vanguardSessionId = status.sessionId;
-      this.#byVanguardId.set(status.sessionId, session);
-      await this.#reconcileVanguard(session);
-      this.#emitRoute(session);
-      this.#metric(session, "session_routed");
-      this.#sessions.set(session.id, session);
-      return this.#snapshot(session);
-    } catch (error) {
-      if (session.vanguardSessionId !== undefined) this.#byVanguardId.delete(session.vanguardSessionId);
-      this.#diagnostic("Vanguard resume failed", error);
-      session.fallbackReason = classifyThrownFailure(error, "vanguard_startup_failure");
-      await this.#startLegacy(session);
-      this.#emitRoute(session, session.fallbackReason);
-      this.#metric(session, "fallback_completed", "success", session.fallbackReason);
-      this.#sessions.set(session.id, session);
-      return this.#snapshot(session);
+      const decision = this.#rolloutDecision(input.actorId, input.optedIn);
+      const session = this.#newSession(input.actorId, undefined, undefined, input.legacy);
+      if (!decision.useVanguard) {
+        // This API was given an existing Vanguard session root. Its durable
+        // history may contain mutations that are unavailable while rollout is
+        // disabled or the kill switch is active. Never guess that a separate
+        // legacy resume token represents the same workspace state.
+        const reason = decision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
+        this.#requireManualRecovery(session, reason);
+        this.#sessions.set(session.id, session);
+        return this.#snapshot(session);
+      }
+      try {
+        const status = await this.#withForeignDeadline(
+          this.#vanguard.resume(input.vanguardSessionRoot),
+          (late) => this.#containLateVanguardStart(session, late),
+        );
+        if (status !== null && typeof status === "object"
+          && typeof status.sessionId === "string" && status.sessionId.length > 0) {
+          if (!this.#claimVanguardId(session, status.sessionId)) {
+            this.#requireManualRecovery(session, "vanguard_protocol_failure");
+            this.#sessions.set(session.id, session);
+            return this.#snapshot(session);
+          }
+        }
+        await this.#assertOpenAfterStart(session);
+        this.#applyVanguardStatus(session, status, "resume");
+        await this.#withControl(session, () => this.#reconcileVanguardUntilPushesStable(session));
+        if (session.route !== "vanguard") {
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        await this.#assertOpenAfterStart(session);
+        const currentDecision = this.#rolloutDecision(input.actorId, input.optedIn);
+        if (!currentDecision.useVanguard) {
+          const reason = currentDecision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
+          this.#cancelVanguardBestEffort(session);
+          this.#requireManualRecovery(session, reason);
+          this.#sessions.set(session.id, session);
+          return this.#snapshot(session);
+        }
+        this.#emitRoute(session);
+        this.#metric(session, "session_routed");
+        this.#sessions.set(session.id, session);
+        return this.#snapshot(session);
+      } catch (error) {
+        if (isAdapterClosedError(error)) throw error;
+        // A selected resume points at a previously existing Vanguard session.
+        // It may already contain reviewed mutations, so a failed resume/replay
+        // can never be treated like a fresh pre-mutation startup failure.
+        this.#diagnostic("Vanguard resume failed", error);
+        const reason = classifyThrownFailure(error, "vanguard_startup_failure");
+        session.mutationRisk = true;
+        if (session.vanguardSessionId === undefined) this.#uncontainedForeignOperations += 1;
+        this.#cancelVanguardBestEffort(session);
+        this.#requireManualRecovery(session, reason);
+        this.#sessions.set(session.id, session);
+        return this.#snapshot(session);
+      }
+    } finally {
+      finishStart();
+      this.#sessionReservations -= 1;
     }
   }
 
   async send(sessionId: string, message: string): Promise<AresAdapterSessionStatus> {
     this.#assertOpen();
-    validateMessage(message);
+    validateAdvanceMessage(message);
     const session = this.#required(sessionId);
-    await session.tail;
-    await this.#enforceKillSwitchFor(session);
-    if (session.route === "manual_recovery") throw manualRecoveryError();
-    if (session.route === "legacy") {
-      const status = await this.#legacy.send(requiredLegacyId(session), message);
-      this.#applyLegacyStatus(session, status);
-      await this.#reconcileLegacy(session);
+    return this.#withControl(session, async () => {
+      this.#assertOpen();
+      await this.#enforceKillSwitchFor(session);
+      // Close the microtask-sized race between the first policy check and the
+      // synchronous advance call. No user code can change config between this
+      // final synchronous read and advance().
+      if (session.route === "vanguard" && this.#killSwitchActive()) {
+        await this.#enforceKillSwitchFor(session);
+      }
+      if (session.route === "manual_recovery") throw manualRecoveryError();
+      if (session.route === "legacy") {
+        await this.#invokeLegacy(session, "send", () => this.#legacy.send(requiredLegacyId(session), message), true);
+        return this.#snapshot(session);
+      }
+      if (session.state === "completed") {
+        throw new Error("The Vanguard session is completed; create a new session for follow-up work.");
+      }
+      if (session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling") {
+        throw new Error("The Vanguard session already has an active turn; use steer or wait for it to finish.");
+      }
+      session.pendingMessage = message;
+      session.turnStartedAt = this.#now();
+      try {
+        const status = this.#vanguard.advance(requiredVanguardId(session), message);
+        this.#applyVanguardStatus(session, status, "advance");
+        this.#metric(session, "turn_started");
+      } catch (error) {
+        session.pendingMessage = undefined;
+        session.turnStartedAt = undefined;
+        this.#diagnostic("Vanguard advance failed", error);
+        // After invoking a foreign engine port, an unknown throw cannot prove
+        // that execution never started. Silent replay would risk two workers.
+        this.#cancelVanguardBestEffort(session);
+        this.#requireManualRecovery(session, classifyThrownFailure(error, "vanguard_protocol_failure"));
+      }
       return this.#snapshot(session);
-    }
-    session.pendingMessage = message;
-    session.turnStartedAt = this.#now();
-    session.mutationRisk = false;
-    try {
-      const status = this.#vanguard.advance(requiredVanguardId(session), message);
-      session.state = mapVanguardState(status.state);
-      this.#metric(session, "turn_started");
-    } catch (error) {
-      const reason = classifyThrownFailure(error, "vanguard_protocol_failure");
-      await this.#fallback(session, reason, message);
-    }
-    return this.#snapshot(session);
+    });
   }
 
   async steer(sessionId: string, message: string): Promise<AresAdapterSessionStatus> {
     this.#assertOpen();
-    validateMessage(message);
+    validateSteeringMessage(message);
     const session = this.#required(sessionId);
-    await session.tail;
-    await this.#enforceKillSwitchFor(session);
-    if (session.route === "manual_recovery") throw manualRecoveryError();
-    if (session.route === "legacy") {
-      const status = await this.#legacy.steer(requiredLegacyId(session), message);
-      this.#applyLegacyStatus(session, status);
-      await this.#reconcileLegacy(session);
-      return this.#snapshot(session);
-    }
-    try {
-      session.state = mapVanguardState(this.#vanguard.steer(requiredVanguardId(session), message).state);
-    } catch (error) {
-      const reason = classifyThrownFailure(error, "vanguard_protocol_failure");
-      const original = session.pendingMessage;
-      await this.#fallback(session, reason, original);
-      if (session.legacySessionId !== undefined && session.state === "running") {
-        this.#applyLegacyStatus(session, await this.#legacy.steer(requiredLegacyId(session), message));
+    return this.#withControl(session, async () => {
+      this.#assertOpen();
+      await this.#enforceKillSwitchFor(session);
+      if (session.route === "vanguard" && this.#killSwitchActive()) {
+        await this.#enforceKillSwitchFor(session);
       }
-    }
-    return this.#snapshot(session);
+      if (session.route === "manual_recovery") throw manualRecoveryError();
+      if (session.route === "legacy") {
+        await this.#invokeLegacy(session, "steer", () => this.#legacy.steer(requiredLegacyId(session), message), true);
+        return this.#snapshot(session);
+      }
+      if (session.state !== "running" && session.state !== "waiting_for_user") {
+        throw new Error("Steering requires an active Vanguard turn.");
+      }
+      try {
+        const status = this.#vanguard.steer(requiredVanguardId(session), message);
+        this.#applyVanguardStatus(session, status, "steer");
+      } catch (error) {
+        if (isNonFatalVanguardControlError(error)) {
+          try {
+            await this.#reconcileVanguard(session);
+          } catch (replayError) {
+            this.#handleIngestionFailure(session, replayError);
+            throw manualRecoveryError();
+          }
+          throw safeControlError(error);
+        }
+        const reason = classifyThrownFailure(error, "vanguard_protocol_failure");
+        const original = session.pendingMessage;
+        await this.#fallback(session, reason, original);
+      }
+      return this.#snapshot(session);
+    });
   }
 
   async interrupt(sessionId: string): Promise<AresAdapterSessionStatus> {
     this.#assertOpen();
     const session = this.#required(sessionId);
-    await session.tail;
-    if (session.route === "manual_recovery") throw manualRecoveryError();
-    if (session.route === "legacy") {
-      this.#applyLegacyStatus(session, await this.#legacy.interrupt(requiredLegacyId(session)));
-      await this.#reconcileLegacy(session);
+    return this.#withControl(session, async () => {
+      this.#assertOpen();
+      if (session.route === "manual_recovery") throw manualRecoveryError();
+      if (session.route === "legacy") {
+        await this.#invokeLegacy(session, "interrupt", () => this.#legacy.interrupt(requiredLegacyId(session)), true);
+        return this.#snapshot(session);
+      }
+      if (session.state !== "running" && session.state !== "waiting_for_user" && session.state !== "cancelling") {
+        return this.#snapshot(session);
+      }
+      try {
+        const status = this.#vanguard.cancel(requiredVanguardId(session));
+        this.#applyVanguardStatus(session, status, "cancel");
+      } catch (error) {
+        // An unacknowledged interrupt cannot prove the worker stopped. Never
+        // launch the same task on the legacy core under that uncertainty.
+        this.#diagnostic("Vanguard interrupt failed", error);
+        this.#requireManualRecovery(session, classifyThrownFailure(error, "vanguard_protocol_failure"));
+      }
       return this.#snapshot(session);
-    }
-    try {
-      session.state = mapVanguardState(this.#vanguard.cancel(requiredVanguardId(session)).state);
-    } catch (error) {
-      // An unacknowledged interrupt cannot prove the worker stopped. Never
-      // launch the same task on the legacy core under that uncertainty.
-      this.#diagnostic("Vanguard interrupt failed", error);
-      this.#requireManualRecovery(session, classifyThrownFailure(error, "vanguard_protocol_failure"));
-    }
-    return this.#snapshot(session);
+    });
   }
 
   async status(sessionId: string): Promise<AresAdapterSessionStatus> {
     this.#assertOpen();
     const session = this.#required(sessionId);
-    await session.tail;
-    await this.#enforceKillSwitchFor(session);
-    if (session.route === "vanguard") {
-      session.state = mapVanguardState(this.#vanguard.status(requiredVanguardId(session)).state);
-    } else if (session.route === "legacy") {
-      this.#applyLegacyStatus(session, await this.#legacy.status(requiredLegacyId(session)));
-    }
-    return this.#snapshot(session);
+    return this.#withControl(session, async () => {
+      this.#assertOpen();
+      await this.#enforceKillSwitchFor(session);
+      if (session.route === "vanguard") {
+        try {
+          const status = this.#vanguard.status(requiredVanguardId(session));
+          this.#applyVanguardStatus(session, status, "status");
+        } catch (error) {
+          this.#diagnostic("Vanguard status failed", error);
+          session.mutationRisk = true;
+          this.#cancelVanguardBestEffort(session);
+          this.#requireManualRecovery(session, classifyThrownFailure(error, "vanguard_protocol_failure"));
+        }
+      } else if (session.route === "legacy") {
+        await this.#invokeLegacy(session, "status", () => this.#legacy.status(requiredLegacyId(session)), false);
+      }
+      return this.#snapshot(session);
+    });
   }
 
   async events(sessionId: string, afterCursor = 0, limit = 500): Promise<AresTurnEventPage> {
@@ -268,19 +573,31 @@ export class AresVanguardAdapter {
     if (!Number.isSafeInteger(afterCursor) || afterCursor < 0) throw new Error("afterCursor must be non-negative.");
     const boundedLimit = boundedInteger(limit, 1, 2_000, "limit");
     const session = this.#required(sessionId);
-    await session.tail;
-    if (session.route === "vanguard") await this.#reconcileVanguard(session);
-    else if (session.route === "legacy") await this.#reconcileLegacy(session);
-    const available = session.events.filter((event) => event.cursor > afterCursor);
-    return {
-      sessionId,
-      events: available.slice(0, boundedLimit),
-      afterCursor,
-      latestCursor: session.nextCursor - 1,
-      replayFloorCursor: session.replayFloorCursor,
-      gap: afterCursor < session.replayFloorCursor - 1,
-      hasMore: available.length > boundedLimit,
-    };
+    return this.#withControl(session, async () => {
+      this.#assertOpen();
+      await this.#enforceKillSwitchFor(session);
+      try {
+        if (session.route === "vanguard") await this.#reconcileVanguard(session);
+        else if (session.route === "legacy") await this.#reconcileLegacy(session);
+      } catch (error) {
+        if (session.route === "vanguard") {
+          this.#diagnostic("Vanguard replay failed", error);
+          this.#requireManualRecovery(session, classifyThrownFailure(error, "vanguard_protocol_failure"));
+        } else {
+          throw error;
+        }
+      }
+      const available = session.events.filter((event) => event.cursor > afterCursor);
+      return deepFreeze({
+        sessionId,
+        events: available.slice(0, boundedLimit),
+        afterCursor,
+        latestCursor: session.nextCursor - 1,
+        replayFloorCursor: session.replayFloorCursor,
+        gap: afterCursor < session.replayFloorCursor - 1,
+        hasMore: available.length > boundedLimit,
+      });
+    });
   }
 
   subscribe(listener: (event: AresTurnEvent) => void): () => void {
@@ -290,35 +607,251 @@ export class AresVanguardAdapter {
   }
 
   /** Applies a live emergency kill switch to every Vanguard-routed session. */
-  async enforceKillSwitch(): Promise<void> {
+  async enforceKillSwitch(): Promise<AresAdapterBarrierReport> {
     this.#assertOpen();
-    if (!this.#rollout().killSwitch) return;
-    for (const session of this.#sessions.values()) await this.#enforceKillSwitchFor(session);
+    if (!this.#killSwitchActive()) {
+      return { complete: true, unresolvedStarts: 0, unresolvedSessions: 0, unresolvedForeignOperations: 0 };
+    }
+    const unresolvedStarts = await unsettledAfter([...this.#pendingStarts], this.#barrierTimeoutMs);
+    // Cancellation must fan out promptly. Waiting two seconds per active
+    // session would turn a 128-session emergency stop into a multi-minute one.
+    let rejectedBarriers = 0;
+    const barriers = [...this.#sessions.values()].map((session) => (
+      this.#withControl(session, async () => {
+        this.#assertOpen();
+        await this.#enforceKillSwitchFor(session);
+      }).catch(() => { rejectedBarriers += 1; })
+    ));
+    const unresolvedSessions = await unsettledAfter(barriers, this.#barrierTimeoutMs) + rejectedBarriers;
+    const unresolvedForeignOperations = await this.#settleUncertainForeignOperations();
+    return {
+      complete: unresolvedStarts === 0 && unresolvedSessions === 0 && unresolvedForeignOperations === 0,
+      unresolvedStarts,
+      unresolvedSessions,
+      unresolvedForeignOperations,
+    };
   }
 
-  async shutdown(): Promise<void> {
-    if (this.#closed) return;
+  shutdown(): Promise<AresAdapterBarrierReport> {
+    if (this.#shutdownInFlight !== undefined) return this.#shutdownInFlight;
+    const attempt = this.#performShutdown();
+    this.#shutdownInFlight = attempt;
+    void attempt.then((report) => {
+      if (report.complete) this.#releasePortClaims();
+      else if (this.#shutdownInFlight === attempt) this.#shutdownInFlight = undefined;
+    }, () => {
+      if (this.#shutdownInFlight === attempt) this.#shutdownInFlight = undefined;
+    });
+    return attempt;
+  }
+
+  async #performShutdown(): Promise<AresAdapterBarrierReport> {
     this.#closed = true;
-    this.#unsubscribe();
-    await Promise.allSettled([...this.#sessions.values()].map((session) => session.tail));
+    if (!this.#unsubscribed) {
+      this.#unsubscribed = true;
+      try { this.#unsubscribe(); } catch (error) { this.#diagnostic("Vanguard unsubscribe failed", error); }
+    }
+    // A create/resume call can own a worker before its adapter session is
+    // published. Wait for every reserved start to either fail or observe the
+    // closed flag and stop the returned worker before shutdown completes.
+    const unresolvedStarts = await unsettledAfter([...this.#pendingStarts], this.#barrierTimeoutMs);
+    let rejectedStops = 0;
+    const stops = [...this.#sessions.values()].map((session) => (
+      this.#stopSessionForShutdown(session).catch(() => { rejectedStops += 1; })
+    ));
+    const unresolvedSessions = await unsettledAfter(stops, this.#barrierTimeoutMs) + rejectedStops;
+    const unresolvedForeignOperations = await this.#settleUncertainForeignOperations();
     this.#listeners.clear();
+    return {
+      complete: unresolvedStarts === 0 && unresolvedSessions === 0 && unresolvedForeignOperations === 0,
+      unresolvedStarts,
+      unresolvedSessions,
+      unresolvedForeignOperations,
+    };
+  }
+
+  #releasePortClaims(): void {
+    if (this.#portsReleased) return;
+    this.#portsReleased = true;
+    CLAIMED_VANGUARD_PORTS.delete(this.#vanguard);
+    CLAIMED_LEGACY_PORTS.delete(this.#legacy);
+  }
+
+  async #stopSessionForShutdown(session: ManagedSession): Promise<void> {
+    // Cancel once immediately and once after all already-admitted control/event
+    // work settles. The second pass closes a race where shutdown begins while
+    // a serialized send is just about to call advance().
+    const initiallyRequiresStop = session.route === "manual_recovery"
+      ? session.vanguardSessionId !== undefined || session.legacySessionId !== undefined
+      : session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling";
+    const [initial] = await Promise.allSettled([this.#stopRouteAndWait(session), session.stateTail]);
+    if (initiallyRequiresStop && (initial.status === "rejected" || !initial.value)) {
+      throw new Error("Initial shutdown interrupt was not acknowledged.");
+    }
+    // Always inspect and interrupt the final state after already-admitted work.
+    // A successful first interrupt says nothing about a send that was queued
+    // immediately before shutdown and only started after that interrupt.
+    const finallyRequiresStop = session.route === "manual_recovery"
+      ? session.vanguardSessionId !== undefined || session.legacySessionId !== undefined
+      : session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling";
+    const final = await this.#stopRouteAndWait(session);
+    if (finallyRequiresStop && !final) throw new Error("Final shutdown interrupt was not acknowledged.");
+  }
+
+  async #settleUncertainForeignOperations(): Promise<number> {
+    const deadline = Date.now() + this.#barrierTimeoutMs;
+    while (this.#uncertainForeignOperations.size > 0 && Date.now() < deadline) {
+      await unsettledAfter([...this.#uncertainForeignOperations], remainingMs(deadline));
+      await Promise.resolve();
+      if (this.#uncertainForeignOperations.size === 0) return this.#uncontainedForeignOperations;
+    }
+    return this.#uncertainForeignOperations.size + this.#uncontainedForeignOperations;
+  }
+
+  async #awaitStopReceipt(
+    invoke: (timeoutMs: number) => Promise<AresWorkerStopReceipt>,
+    sessionId: string,
+    workerGeneration: number,
+    ownerEpoch: number,
+    deadline: number,
+  ): Promise<void> {
+    if (Date.now() >= deadline) throw new Error("Worker-stop barrier exceeded its total deadline.");
+    const timeoutMs = remainingMs(deadline);
+    const operation = invoke(timeoutMs);
+    const receipt = await this.#withForeignDeadline(
+      operation,
+      (late) => assertWorkerStopReceipt(late, sessionId, workerGeneration, ownerEpoch),
+      timeoutMs,
+    );
+    assertWorkerStopReceipt(receipt, sessionId, workerGeneration, ownerEpoch);
+  }
+
+  #trackLateStopReceipt(
+    invoke: (timeoutMs: number) => Promise<AresWorkerStopReceipt>,
+    sessionId: string,
+    workerGeneration: number,
+    ownerEpoch: number,
+    context: string,
+  ): void {
+    let operation: Promise<AresWorkerStopReceipt>;
+    try {
+      operation = invoke(this.#barrierTimeoutMs);
+    } catch (error) {
+      this.#uncontainedForeignOperations += 1;
+      this.#diagnostic(`${context} stop dispatch failed`, error);
+      return;
+    }
+    this.#uncertainForeignOperations.add(operation);
+    void operation.then(
+      (receipt) => {
+        this.#uncertainForeignOperations.delete(operation);
+        try { assertWorkerStopReceipt(receipt, sessionId, workerGeneration, ownerEpoch); }
+        catch (error) {
+          this.#uncontainedForeignOperations += 1;
+          this.#diagnostic(`${context} did not produce a valid stop receipt`, error);
+        }
+      },
+      (error: unknown) => {
+        this.#uncertainForeignOperations.delete(operation);
+        this.#uncontainedForeignOperations += 1;
+        this.#diagnostic(`${context} stop failed`, error);
+      },
+    );
+  }
+
+  async #stopRouteAndWait(session: ManagedSession, requireLifecycleReceipt = false): Promise<boolean> {
+    const active = session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling";
+    const deadline = Date.now() + this.#barrierTimeoutMs;
+    if (session.route === "manual_recovery") {
+      const stops: Promise<void>[] = [];
+      if (session.vanguardSessionId !== undefined) {
+        const fence = this.#requiredVanguardFence(session);
+        stops.push(this.#awaitStopReceipt(
+          (timeoutMs) => this.#vanguard.stopAndWait(session.vanguardSessionId!, timeoutMs),
+          session.vanguardSessionId,
+          fence.workerGeneration,
+          fence.ownerEpoch,
+          deadline,
+        ));
+      }
+      if (session.legacySessionId !== undefined) {
+        const fence = this.#requiredLegacyFence(session);
+        stops.push(this.#awaitStopReceipt(
+          (timeoutMs) => this.#legacy.stopAndWait(session.legacySessionId!, timeoutMs),
+          session.legacySessionId,
+          fence.workerGeneration,
+          fence.ownerEpoch,
+          deadline,
+        ));
+      }
+      if (stops.length === 0) return false;
+      const settled = await Promise.allSettled(stops);
+      return settled.every((result) => result.status === "fulfilled");
+    }
+    if (!active && !requireLifecycleReceipt) return false;
+    if (session.route === "vanguard") {
+      try {
+        const sessionId = requiredVanguardId(session);
+        const fence = this.#requiredVanguardFence(session);
+        await this.#awaitStopReceipt(
+          (timeoutMs) => this.#vanguard.stopAndWait(sessionId, timeoutMs),
+          sessionId,
+          fence.workerGeneration,
+          fence.ownerEpoch,
+          deadline,
+        );
+        return true;
+      } catch { return false; /* engine shutdown remains host-owned */ }
+    } else if (session.route === "legacy") {
+      try {
+        const sessionId = requiredLegacyId(session);
+        const fence = this.#requiredLegacyFence(session);
+        await this.#awaitStopReceipt(
+          (timeoutMs) => this.#legacy.stopAndWait(sessionId, timeoutMs),
+          sessionId,
+          fence.workerGeneration,
+          fence.ownerEpoch,
+          deadline,
+        );
+        return true;
+      } catch { return false; /* host shutdown remains authoritative */ }
+    }
+    return false;
   }
 
   #acceptVanguardPush(envelope: VanguardEngineEvent): void {
+    if (envelope === null || typeof envelope !== "object" || typeof envelope.sessionId !== "string") {
+      this.#diagnostic("Vanguard pushed an invalid envelope", protocolError("invalid envelope"));
+      return;
+    }
     const session = this.#byVanguardId.get(envelope.sessionId);
     if (session === undefined || this.#closed) return;
-    session.tail = session.tail
+    session.pushGeneration += 1;
+    if (session.pendingPushEvents >= this.#maxPendingPushEvents) {
+      if (!session.pushReconcileScheduled) {
+        session.pushReconcileScheduled = true;
+        session.stateTail = session.stateTail
+          .then(() => this.#reconcileVanguardUntilPushesStable(session))
+          .catch((error: unknown) => this.#handleIngestionFailure(session, error))
+          .finally(() => { session.pushReconcileScheduled = false; });
+      }
+      return;
+    }
+    session.pendingPushEvents += 1;
+    session.stateTail = session.stateTail
       .then(() => this.#ingestVanguardEnvelope(session, envelope))
-      .catch((error: unknown) => this.#diagnostic("Vanguard event ingestion failed", error));
+      .catch((error: unknown) => this.#handleIngestionFailure(session, error))
+      .finally(() => { session.pendingPushEvents -= 1; });
   }
 
   async #ingestVanguardEnvelope(session: ManagedSession, envelope: VanguardEngineEvent): Promise<void> {
+    assertVanguardEnvelope(envelope, requiredVanguardId(session));
     if (envelope.cursor <= session.vanguardCursor) return;
     if (envelope.cursor > session.vanguardCursor + 1) await this.#reconcileVanguard(session);
     if (envelope.cursor <= session.vanguardCursor) return;
     if (envelope.cursor > session.vanguardCursor + 1) {
       this.#emitReplayGap(session, session.vanguardCursor, envelope.cursor);
-      session.vanguardCursor = envelope.cursor - 1;
+      throw protocolError("Vanguard push history contains a cursor gap.");
     }
     await this.#ingestOneVanguard(session, envelope);
   }
@@ -328,22 +861,41 @@ export class AresVanguardAdapter {
     let pages = 0;
     while (pages < 100) {
       const page = this.#vanguard.events(vanguardId, session.vanguardCursor, 500);
+      assertVanguardPage(page, vanguardId, session.vanguardCursor);
       if (page.gap) {
         this.#emitReplayGap(session, session.vanguardCursor, page.replayFloorCursor);
-        session.vanguardCursor = Math.max(session.vanguardCursor, page.replayFloorCursor - 1);
+        throw protocolError("Vanguard replay history contains a gap.");
       }
-      const ordered = [...page.events].sort((left, right) => left.cursor - right.cursor);
-      for (const envelope of ordered) {
+      for (const envelope of page.events) {
         if (envelope.cursor <= session.vanguardCursor) continue;
         if (envelope.cursor > session.vanguardCursor + 1) {
           this.#emitReplayGap(session, session.vanguardCursor, envelope.cursor);
-          session.vanguardCursor = envelope.cursor - 1;
+          throw protocolError("Vanguard replay history contains a cursor gap.");
         }
         await this.#ingestOneVanguard(session, envelope);
       }
       pages += 1;
       if (!page.hasMore) break;
     }
+    if (pages === 100) {
+      const page = this.#vanguard.events(vanguardId, session.vanguardCursor, 1);
+      assertVanguardPage(page, vanguardId, session.vanguardCursor);
+      if (page.hasMore || page.events.length > 0) {
+        throw protocolError("Vanguard replay exceeded the bounded 100-page reconciliation window.");
+      }
+    }
+  }
+
+  async #reconcileVanguardUntilPushesStable(session: ManagedSession): Promise<void> {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const generation = session.pushGeneration;
+      await this.#reconcileVanguard(session);
+      // Let synchronous/batched producer callbacks already queued for this
+      // turn declare themselves before deciding the replay is stable.
+      await Promise.resolve();
+      if (session.pushGeneration === generation) return;
+    }
+    throw protocolError("Vanguard push ingress remained unstable during bounded replay reconciliation.");
   }
 
   async #ingestOneVanguard(session: ManagedSession, envelope: VanguardEngineEvent): Promise<void> {
@@ -369,19 +921,38 @@ export class AresVanguardAdapter {
   }
 
   async #reconcileLegacy(session: ManagedSession): Promise<void> {
+    try {
+      await this.#reconcileLegacyUnchecked(session);
+    } catch (error) {
+      if (session.route === "legacy") {
+        this.#requireManualRecovery(session, "legacy_protocol_failure");
+      }
+      throw error;
+    }
+  }
+
+  async #reconcileLegacyUnchecked(session: ManagedSession): Promise<void> {
     const redact = createSecretRedactor();
+    const deadline = Date.now() + this.#foreignOperationTimeoutMs;
     let pages = 0;
     while (pages < 100) {
-      const page = await this.#legacy.events(requiredLegacyId(session), session.legacyCursor, 500);
+      if (Date.now() >= deadline) throw protocolError("Legacy replay exceeded its total deadline.");
+      const page = await this.#withForeignDeadline(
+        this.#legacy.events(requiredLegacyId(session), session.legacyCursor, 500),
+        undefined,
+        remainingMs(deadline),
+        false,
+      );
+      assertLegacyPage(page, session.legacyCursor);
       if (page.gap) {
         this.#emitReplayGap(session, session.legacyCursor, page.replayFloorCursor);
-        session.legacyCursor = Math.max(session.legacyCursor, page.replayFloorCursor - 1);
+        throw protocolError("Legacy replay history contains a gap.");
       }
-      for (const event of [...page.events].sort((left, right) => left.cursor - right.cursor)) {
+      for (const event of page.events) {
         if (event.cursor <= session.legacyCursor) continue;
         if (event.cursor > session.legacyCursor + 1) {
           this.#emitReplayGap(session, session.legacyCursor, event.cursor);
-          session.legacyCursor = event.cursor - 1;
+          throw protocolError("Legacy replay history contains a cursor gap.");
         }
         session.legacyCursor = event.cursor;
         this.#record(session, {
@@ -401,6 +972,19 @@ export class AresVanguardAdapter {
       pages += 1;
       if (!page.hasMore) break;
     }
+    if (pages === 100) {
+      if (Date.now() >= deadline) throw protocolError("Legacy replay exceeded its total deadline.");
+      const page = await this.#withForeignDeadline(
+        this.#legacy.events(requiredLegacyId(session), session.legacyCursor, 1),
+        undefined,
+        remainingMs(deadline),
+        false,
+      );
+      assertLegacyPage(page, session.legacyCursor);
+      if (page.hasMore || page.events.length > 0) {
+        throw protocolError("Legacy replay exceeded the bounded 100-page reconciliation window.");
+      }
+    }
   }
 
   async #fallback(session: ManagedSession, reason: AresFallbackReason, message?: string): Promise<void> {
@@ -413,32 +997,20 @@ export class AresVanguardAdapter {
 
   async #performFallback(session: ManagedSession, reason: AresFallbackReason, message?: string): Promise<void> {
     session.fallbackReason = reason;
-    if (session.mutationRisk) {
+    // Once Vanguard has allocated a session, this adapter has no engine-signed
+    // proof that a late event, worker, or isolated-workspace mutation cannot
+    // still exist. Never replay the same task into a second core. Automatic
+    // legacy routing is reserved for rollout rejection or an explicitly
+    // classified pre-dispatch create failure with no Vanguard session ID.
+    if (session.vanguardSessionId !== undefined || session.mutationRisk) {
       this.#cancelVanguardBestEffort(session);
       this.#requireManualRecovery(session, reason);
       return;
     }
     this.#metric(session, "fallback_started", undefined, reason);
     try {
-      if (session.vanguardSessionId !== undefined) {
-        try {
-          const state = this.#vanguard.status(session.vanguardSessionId).state;
-          if (state === "running" || state === "waiting_for_user" || state === "cancelling") {
-            this.#vanguard.cancel(session.vanguardSessionId);
-            // Event delivery and cancellation can race. Without an engine-
-            // signed no-mutation checkpoint, a stopped active worker is still
-            // not proof that it never mutated its isolated workspace.
-            await this.#waitForVanguardStop(session.vanguardSessionId);
-            this.#requireManualRecovery(session, reason);
-            return;
-          }
-        } catch {
-          // Failure to prove the worker stopped is not a safe rollback point.
-          this.#requireManualRecovery(session, reason);
-          return;
-        }
-      }
       await this.#startLegacy(session);
+      await this.#assertOpenAfterStart(session);
       this.#emitRoute(session, reason);
       if (message !== undefined) {
         const status = await this.#legacy.send(requiredLegacyId(session), message);
@@ -454,41 +1026,141 @@ export class AresVanguardAdapter {
   }
 
   async #enforceKillSwitchFor(session: ManagedSession): Promise<void> {
-    const config = this.#rollout();
-    if (!config.killSwitch || session.route !== "vanguard") return;
-    if (session.state === "completed" || session.state === "cancelled") return;
+    if (!this.#killSwitchActive()) return;
+    if (session.route === "manual_recovery") {
+      if ((session.vanguardSessionId !== undefined || session.legacySessionId !== undefined)
+        && !await this.#stopRouteAndWait(session)) {
+        throw new Error("Kill-switch worker stop was not proven.");
+      }
+      return;
+    }
+    if (session.route !== "vanguard") return;
+    const requiresStop = session.vanguardSessionId !== undefined;
     session.fallbackReason = "kill_switch";
     this.#metric(session, "kill_switch_applied", undefined, "kill_switch");
     await this.#fallback(session, "kill_switch", session.pendingMessage);
-  }
-
-  async #waitForVanguardStop(vanguardId: string): Promise<boolean> {
-    const deadline = Date.now() + 2_000;
-    while (Date.now() < deadline) {
-      const state = this.#vanguard.status(vanguardId).state;
-      if (state !== "running" && state !== "waiting_for_user" && state !== "cancelling") return true;
-      await new Promise((resolve) => setTimeout(resolve, 20));
+    if (requiresStop && !await this.#stopRouteAndWait(session)) {
+      throw new Error("Kill-switch worker stop was not proven.");
     }
-    return false;
   }
 
   async #startLegacy(session: ManagedSession): Promise<void> {
-    const status = session.legacyResume !== undefined
-      ? await this.#legacy.resume(session.legacyResume)
-      : await this.#legacy.create(requiredLegacyCreate(session));
+    const operation = session.legacyResume !== undefined
+      ? this.#legacy.resume(session.legacyResume)
+      : this.#legacy.create(requiredLegacyCreate(session), requiredOperationId(session));
+    const status = await this.#withForeignDeadline(
+      operation,
+      (late) => this.#containLateLegacyStart(session, late),
+    );
+    assertLegacyStatus(status);
+    const existing = this.#byLegacyId.get(status.sessionId);
+    if (existing !== undefined && existing !== session) {
+      this.#poisonIdentityCollision(
+        existing,
+        "legacy",
+        status.sessionId,
+        "Legacy core returned a duplicate session identity",
+      );
+      throw protocolError("Legacy core returned a session ID already owned by another adapter session.");
+    }
     session.route = "legacy";
     session.legacySessionId = status.sessionId;
+    this.#byLegacyId.set(status.sessionId, session);
     session.state = status.state;
+    session.legacyWorkerGeneration = status.workerGeneration;
+    session.legacyOwnerEpoch = status.ownerEpoch;
     session.legacyCursor = 0;
+  }
+
+  async #sealRouteReceipt(
+    session: ManagedSession,
+    claim: AresDurableRouteClaim,
+    priorReceipt: AresDurableRouteReceipt | undefined,
+  ): Promise<void> {
+    const source = claim.chosenCore;
+    const upstreamSessionId = source === "vanguard"
+      ? requiredVanguardId(session)
+      : requiredLegacyId(session);
+    if (priorReceipt !== undefined && priorReceipt.upstreamSessionId !== upstreamSessionId) {
+      // The keyed core returned a different identity than the immutable
+      // receipt. We can stop the newly returned worker, but cannot prove what
+      // happened to the previously receipted identity.
+      this.#uncontainedForeignOperations += 1;
+      throw protocolError("A durable route receipt conflicts with the keyed core response.");
+    }
+    const commitOperation = this.#routeClaims.commitReceipt({
+      operationId: requiredOperationId(session),
+      source,
+      upstreamSessionId,
+    });
+    let committed: AresRouteReceiptResult;
+    try {
+      committed = await this.#routeStoreOperation(commitOperation);
+    } catch (error) {
+      if (isDurableIdentityConflict(error)) {
+        this.#uncontainedForeignOperations += 1;
+      } else if (routeArbitrationSettlement(error) !== undefined) {
+        // Audit a late commit result, not merely its liveness. A matching
+        // receipt or ordinary store rejection is retryable after the exact
+        // worker stop; an identity conflict or malformed success is permanent.
+        const audited = commitOperation.then(
+          (late) => { assertRouteReceiptResult(late, claim, upstreamSessionId); },
+          (lateError: unknown) => {
+            if (isDurableIdentityConflict(lateError)) throw lateError;
+          },
+        ).catch((auditError: unknown) => {
+          this.#uncontainedForeignOperations += 1;
+          throw auditError;
+        });
+        ROUTE_ARBITRATION_SETTLEMENTS.set(error as object, audited);
+        void audited.catch(() => {});
+      }
+      throw error;
+    }
+    try {
+      assertRouteReceiptResult(committed, claim, upstreamSessionId);
+    } catch (error) {
+      this.#uncontainedForeignOperations += 1;
+      throw error;
+    }
+  }
+
+  async #containCreateFailure(
+    session: ManagedSession,
+    reason: AresFallbackReason,
+    context: string,
+    error: unknown,
+  ): Promise<AresAdapterSessionStatus> {
+    this.#diagnostic(context, error);
+    const hasKnownWorker = session.vanguardSessionId !== undefined || session.legacySessionId !== undefined;
+    if (hasKnownWorker) {
+      if (!await this.#stopRouteAndWait(session, true)) this.#uncontainedForeignOperations += 1;
+    } else {
+      // Once a foreign create has been invoked, a throw cannot prove that it
+      // failed before allocation. The durable operation remains same-core,
+      // but this barrier must honestly stay poisoned for the current host.
+      this.#uncontainedForeignOperations += 1;
+    }
+    if (this.#closed) throw adapterClosedError();
+    session.mutationRisk ||= hasKnownWorker;
+    this.#requireManualRecovery(session, reason);
+    this.#sessions.set(session.id, session);
+    return this.#snapshot(session);
+  }
+
+  async #assertOpenAfterStart(session: ManagedSession): Promise<void> {
+    if (!this.#closed) return;
+    if (!await this.#stopRouteAndWait(session, true)) this.#uncontainedForeignOperations += 1;
+    throw adapterClosedError();
   }
 
   #cancelVanguardBestEffort(session: ManagedSession): void {
     if (session.vanguardSessionId === undefined) return;
     try {
-      const state = this.#vanguard.status(session.vanguardSessionId).state;
-      if (state === "running" || state === "waiting_for_user" || state === "cancelling") {
-        this.#vanguard.cancel(session.vanguardSessionId);
-      }
+      // Do not require a healthy status channel before attempting the stop;
+      // status corruption/transport loss is precisely when cancellation is
+      // most important. Cancelling an inactive session may reject and is safe.
+      this.#vanguard.cancel(session.vanguardSessionId);
     } catch {
       // Manual recovery already tells the host that worker state is uncertain.
     }
@@ -507,7 +1179,7 @@ export class AresVanguardAdapter {
       kind: "turn.failed",
       status: "failed",
       title: "Manual recovery required",
-      detail: "Vanguard may have crossed a mutation boundary; automatic legacy replay was blocked.",
+      detail: "An engine may have crossed a mutation or dispatch boundary; automatic replay was blocked.",
     });
     this.#metric(session, "manual_recovery_required", "failure", reason);
   }
@@ -528,6 +1200,115 @@ export class AresVanguardAdapter {
       replay: { requestedAfterCursor, availableFromCursor },
     });
     this.#metric(session, "replay_gap", "failure", "vanguard_critical_failure", "replay_gap");
+    if (session.route === "vanguard") {
+      this.#cancelVanguardBestEffort(session);
+      this.#requireManualRecovery(session, "vanguard_protocol_failure");
+    }
+  }
+
+  #claimVanguardId(session: ManagedSession, sessionId: string): boolean {
+    const existing = this.#byVanguardId.get(sessionId);
+    if (existing !== undefined && existing !== session) {
+      this.#poisonIdentityCollision(
+        existing,
+        "vanguard",
+        sessionId,
+        "Vanguard returned a duplicate session identity",
+      );
+      return false;
+    }
+    session.route = "vanguard";
+    session.vanguardSessionId = sessionId;
+    this.#byVanguardId.set(sessionId, session);
+    return true;
+  }
+
+  #containLateVanguardStart(session: ManagedSession, status: VanguardSessionStatus): void {
+    try {
+      assertVanguardStatus(status, "late create/resume");
+      const existing = this.#byVanguardId.get(status.sessionId);
+      if (existing !== undefined && existing !== session) {
+        this.#poisonIdentityCollision(
+          existing,
+          "vanguard",
+          status.sessionId,
+          "Late Vanguard start returned a duplicate session identity",
+        );
+        return;
+      }
+      session.vanguardSessionId = status.sessionId;
+      this.#byVanguardId.set(status.sessionId, session);
+      session.vanguardWorkerGeneration = status.workerGeneration;
+      session.vanguardOwnerEpoch = status.ownerEpoch;
+      this.#trackLateStopReceipt(
+        (timeoutMs) => this.#vanguard.stopAndWait(status.sessionId, timeoutMs),
+        status.sessionId,
+        status.workerGeneration,
+        status.ownerEpoch,
+        "Late Vanguard start",
+      );
+    } catch (error) {
+      this.#uncontainedForeignOperations += 1;
+      this.#diagnostic("Late Vanguard start could not be contained", error);
+    }
+  }
+
+  #containLateLegacyStart(session: ManagedSession, status: AresLegacySessionStatus): void {
+    try {
+      assertLegacyStatus(status);
+      const existing = this.#byLegacyId.get(status.sessionId);
+      if (existing !== undefined && existing !== session) {
+        this.#poisonIdentityCollision(
+          existing,
+          "legacy",
+          status.sessionId,
+          "Late legacy start returned a duplicate session identity",
+        );
+        return;
+      }
+      session.legacySessionId = status.sessionId;
+      this.#byLegacyId.set(status.sessionId, session);
+      session.legacyWorkerGeneration = status.workerGeneration;
+      session.legacyOwnerEpoch = status.ownerEpoch;
+      this.#trackLateStopReceipt(
+        (timeoutMs) => this.#legacy.stopAndWait(status.sessionId, timeoutMs),
+        status.sessionId,
+        status.workerGeneration,
+        status.ownerEpoch,
+        "Late legacy start",
+      );
+    } catch (error) {
+      this.#uncontainedForeignOperations += 1;
+      this.#diagnostic("Late legacy start could not be contained", error);
+    }
+  }
+
+  #poisonIdentityCollision(
+    existing: ManagedSession,
+    provider: "vanguard" | "legacy",
+    sessionId: string,
+    context: string,
+  ): void {
+    // One identifier can no longer distinguish the known worker from a
+    // potentially separate allocation. Stop the addressable identity, poison
+    // the barrier permanently, and make the prior owner explicit/manual too.
+    this.#uncontainedForeignOperations += 1;
+    existing.mutationRisk = true;
+    this.#requireManualRecovery(existing, provider === "vanguard"
+      ? "vanguard_protocol_failure"
+      : "legacy_protocol_failure");
+    const fence = provider === "vanguard"
+      ? this.#requiredVanguardFence(existing)
+      : this.#requiredLegacyFence(existing);
+    this.#trackLateStopReceipt(
+      provider === "vanguard"
+        ? (timeoutMs) => this.#vanguard.stopAndWait(sessionId, timeoutMs)
+        : (timeoutMs) => this.#legacy.stopAndWait(sessionId, timeoutMs),
+      sessionId,
+      fence.workerGeneration,
+      fence.ownerEpoch,
+      context,
+    );
   }
 
   #emitRoute(session: ManagedSession, reason?: AresFallbackReason): void {
@@ -544,7 +1325,7 @@ export class AresVanguardAdapter {
   }
 
   #record(session: ManagedSession, event: AresTurnEvent): void {
-    const finalized: AresTurnEvent = { ...event, cursor: session.nextCursor };
+    const finalized: AresTurnEvent = deepFreeze({ ...event, cursor: session.nextCursor });
     session.nextCursor += 1;
     session.events.push(finalized);
     while (session.events.length > this.#maxReplayEvents) session.events.shift();
@@ -561,26 +1342,151 @@ export class AresVanguardAdapter {
     fallbackReason?: AresFallbackReason,
     explicitReason?: Parameters<AresBetaTelemetry["emit"]>[0]["reason"],
   ): void {
-    this.#telemetry?.emit({
-      name,
-      actorId: session.actorId,
-      sessionId: session.id,
-      route: session.route,
-      ...(outcome === undefined ? {} : { outcome }),
-      ...(explicitReason === undefined && fallbackReason === undefined
-        ? {}
-        : { reason: explicitReason ?? FALLBACK_REASON_TELEMETRY[fallbackReason!] }),
-      ...(session.turnStartedAt === undefined ? {} : { durationMs: this.#now() - session.turnStartedAt }),
+    try {
+      this.#telemetry?.emit({
+        name,
+        actorId: session.actorId,
+        sessionId: session.id,
+        route: session.route,
+        ...(outcome === undefined ? {} : { outcome }),
+        ...(explicitReason === undefined && fallbackReason === undefined
+          ? {}
+          : { reason: explicitReason ?? FALLBACK_REASON_TELEMETRY[fallbackReason!] }),
+        ...(session.turnStartedAt === undefined ? {} : { durationMs: this.#now() - session.turnStartedAt }),
+      });
+    } catch (error) {
+      this.#diagnostic("Ares beta telemetry failed", error);
+    }
+  }
+
+  #applyLegacyStatus(session: ManagedSession, status: AresLegacySessionStatus): void {
+    assertLegacyStatus(status, requiredLegacyId(session));
+    session.state = status.state;
+    session.legacyWorkerGeneration = status.workerGeneration;
+    session.legacyOwnerEpoch = status.ownerEpoch;
+  }
+
+  #applyVanguardStatus(session: ManagedSession, status: VanguardSessionStatus, operation: string): void {
+    assertVanguardStatus(status, operation, requiredVanguardId(session));
+    session.state = mapVanguardState(status.state);
+    session.vanguardWorkerGeneration = status.workerGeneration;
+    session.vanguardOwnerEpoch = status.ownerEpoch;
+  }
+
+  #requiredVanguardFence(session: ManagedSession): { workerGeneration: number; ownerEpoch: number } {
+    if (session.vanguardWorkerGeneration === undefined || session.vanguardOwnerEpoch === undefined) {
+      throw protocolError("Vanguard worker fence is unavailable.");
+    }
+    return { workerGeneration: session.vanguardWorkerGeneration, ownerEpoch: session.vanguardOwnerEpoch };
+  }
+
+  #requiredLegacyFence(session: ManagedSession): { workerGeneration: number; ownerEpoch: number } {
+    if (session.legacyWorkerGeneration === undefined || session.legacyOwnerEpoch === undefined) {
+      throw protocolError("Legacy worker fence is unavailable.");
+    }
+    return { workerGeneration: session.legacyWorkerGeneration, ownerEpoch: session.legacyOwnerEpoch };
+  }
+
+  async #invokeLegacy(
+    session: ManagedSession,
+    operation: string,
+    invoke: () => Promise<AresLegacySessionStatus>,
+    reconcile: boolean,
+  ): Promise<void> {
+    try {
+      this.#applyLegacyStatus(session, await this.#withForeignDeadline(
+        invoke(),
+        reconcile ? (late) => this.#containLateLegacyControl(session, late, operation) : undefined,
+        this.#foreignOperationTimeoutMs,
+        reconcile,
+      ));
+      if (reconcile) await this.#reconcileLegacy(session);
+    } catch (error) {
+      this.#diagnostic(`Legacy ${operation} failed`, error);
+      if (session.route === "legacy") this.#requireManualRecovery(session, "legacy_protocol_failure");
+      throw manualRecoveryError();
+    }
+  }
+
+  #containLateLegacyControl(
+    session: ManagedSession,
+    status: AresLegacySessionStatus,
+    operation: string,
+  ): void {
+    assertLegacyStatus(status, requiredLegacyId(session));
+    this.#trackLateStopReceipt(
+      (timeoutMs) => this.#legacy.stopAndWait(status.sessionId, timeoutMs),
+      status.sessionId,
+      status.workerGeneration,
+      status.ownerEpoch,
+      `Late legacy ${operation}`,
+    );
+  }
+
+  async #routeStoreOperation<T>(operation: Promise<T>): Promise<T> {
+    try {
+      return await this.#withForeignDeadline(
+        operation,
+        undefined,
+        this.#foreignOperationTimeoutMs,
+        false,
+      );
+    } catch (error) {
+      if (isForeignOperationTimeout(error)) {
+        // The immutable store may still publish after our deadline. Pin this
+        // operation until that exact promise settles; the ordinary uncertain-
+        // operation barrier remains incomplete in the meantime. No core has
+        // been dispatched merely by claim/read latency.
+        const tagged = Object.assign(new Error("Durable route arbitration exceeded its deadline."), {
+          code: "route_arbitration_pending",
+        });
+        ROUTE_ARBITRATION_SETTLEMENTS.set(tagged, operation.then(() => undefined, () => undefined));
+        throw tagged;
+      }
+      throw error;
+    }
+  }
+
+  #withForeignDeadline<T>(
+    promise: Promise<T>,
+    onLate?: (value: T) => void,
+    timeoutMs = this.#foreignOperationTimeoutMs,
+    dispatchUncertain = true,
+  ): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        this.#uncertainForeignOperations.add(promise);
+        reject(Object.assign(new Error("Foreign operation exceeded its deadline."), {
+          code: "foreign_operation_timeout",
+        }));
+      }, timeoutMs);
+      promise.then((value) => {
+        if (timedOut) {
+          this.#uncertainForeignOperations.delete(promise);
+          if (onLate === undefined && dispatchUncertain) this.#uncontainedForeignOperations += 1;
+          else {
+            try { onLate?.(value); } catch { this.#uncontainedForeignOperations += 1; }
+          }
+          return;
+        }
+        clearTimeout(timer);
+        resolve(value);
+      }, (error: unknown) => {
+        if (timedOut) {
+          this.#uncertainForeignOperations.delete(promise);
+          if (dispatchUncertain) this.#uncontainedForeignOperations += 1;
+          return;
+        }
+        clearTimeout(timer);
+        reject(error);
+      });
     });
   }
 
-  #applyLegacyStatus(session: ManagedSession, status: { readonly sessionId: string; readonly state: Exclude<AresAdapterState, "manual_recovery"> }): void {
-    session.legacySessionId = status.sessionId;
-    session.state = status.state;
-  }
-
   #snapshot(session: ManagedSession): AresAdapterSessionStatus {
-    return {
+    return deepFreeze({
       sessionId: session.id,
       route: session.route,
       state: session.state,
@@ -588,18 +1494,22 @@ export class AresVanguardAdapter {
       replayFloorCursor: session.replayFloorCursor,
       ...(session.fallbackReason === undefined ? {} : { fallbackReason: session.fallbackReason }),
       requiresManualRecovery: session.route === "manual_recovery",
-    };
+    });
   }
 
   #newSession(
     actorId: string,
+    operationId: string | undefined,
     legacyCreate: AresLegacyCreateInput | undefined,
     legacyResume: AresLegacyResumeInput | undefined,
+    sessionId = `ares-vanguard-${randomUUID()}`,
+    initialRoute: AresClaimedCore = "legacy",
   ): ManagedSession {
     return {
-      id: `ares-vanguard-${randomUUID()}`,
+      id: sessionId,
       actorId,
-      route: "legacy",
+      operationId,
+      route: initialRoute,
       state: "idle",
       events: [],
       nextCursor: 1,
@@ -608,6 +1518,10 @@ export class AresVanguardAdapter {
       ...(legacyResume === undefined ? {} : { legacyResume }),
       vanguardCursor: 0,
       legacyCursor: 0,
+      vanguardWorkerGeneration: undefined,
+      vanguardOwnerEpoch: undefined,
+      legacyWorkerGeneration: undefined,
+      legacyOwnerEpoch: undefined,
       mutationRisk: false,
       vanguardSessionId: undefined,
       legacySessionId: undefined,
@@ -615,8 +1529,73 @@ export class AresVanguardAdapter {
       turnStartedAt: undefined,
       fallbackReason: undefined,
       recoveryInFlight: undefined,
-      tail: Promise.resolve(),
+      stateTail: Promise.resolve(),
+      pendingPushEvents: 0,
+      pushReconcileScheduled: false,
+      pushGeneration: 0,
     };
+  }
+
+  async #withControl<T>(session: ManagedSession, operation: () => Promise<T>): Promise<T> {
+    // One queue avoids the cyclic wait that two cross-linked control/event
+    // tails can create when a push arrives after a control is admitted. Keep
+    // the public result rejecting while the internal queue always recovers.
+    const admitted = session.stateTail.then(operation);
+    session.stateTail = admitted.then(() => undefined, () => undefined);
+    return admitted;
+  }
+
+  #rolloutDecision(actorId: string, optedIn: unknown): ReturnType<typeof decideAresVanguardRollout> {
+    try {
+      if (typeof optedIn !== "boolean") throw new Error("optedIn must be a boolean.");
+      return decideAresVanguardRollout(this.#rollout(), actorId, optedIn);
+    } catch (error) {
+      // A missing or malformed control-plane response must fail closed. It is
+      // never permission to start the experimental engine.
+      this.#diagnostic("Vanguard rollout config was unavailable", error);
+      return { useVanguard: false, reason: "disabled", bucket: 0 };
+    }
+  }
+
+  #rolloutSnapshot(actorId: string, optedIn: boolean): AresRolloutSnapshot {
+    try {
+      const config = normalizeRolloutSnapshot(this.#rollout());
+      return {
+        decision: decideAresVanguardRollout(config, actorId, optedIn),
+        policySha256: createHash("sha256")
+          .update("VANGUARD_ARES_ROLLOUT_POLICY_V1\n")
+          .update(stableJson(config))
+          .digest("hex"),
+      };
+    } catch (error) {
+      this.#diagnostic("Vanguard rollout config was unavailable", error);
+      return {
+        decision: { useVanguard: false, reason: "disabled", bucket: 0 },
+        policySha256: INVALID_ROLLOUT_POLICY_SHA256,
+      };
+    }
+  }
+
+  #killSwitchActive(): boolean {
+    try {
+      const config = this.#rollout();
+      // Full validation prevents malformed live config from turning a string,
+      // unknown stage, or partial object into an accidental permission grant.
+      decideAresVanguardRollout(config, "control-plane-probe", false);
+      return config.killSwitch;
+    } catch (error) {
+      this.#diagnostic("Vanguard rollout config was unavailable", error);
+      return true;
+    }
+  }
+
+  #handleIngestionFailure(session: ManagedSession, error: unknown): void {
+    this.#diagnostic("Vanguard event ingestion failed", error);
+    if (session.route === "vanguard") {
+      session.mutationRisk = true;
+      this.#cancelVanguardBestEffort(session);
+      this.#requireManualRecovery(session, classifyThrownFailure(error, "vanguard_protocol_failure"));
+    }
   }
 
   #required(sessionId: string): ManagedSession {
@@ -629,8 +1608,21 @@ export class AresVanguardAdapter {
     if (this.#closed) throw new Error("Ares Vanguard adapter is closed.");
   }
 
-  #assertCapacity(): void {
-    if (this.#sessions.size >= this.#maxSessions) throw new Error("Ares Vanguard adapter session capacity is full.");
+  #reserveCapacity(): void {
+    if (this.#sessions.size + this.#sessionReservations >= this.#maxSessions) {
+      throw new Error("Ares Vanguard adapter session capacity is full.");
+    }
+    this.#sessionReservations += 1;
+  }
+
+  #trackPendingStart(): () => void {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    this.#pendingStarts.add(pending);
+    return () => {
+      this.#pendingStarts.delete(pending);
+      release();
+    };
   }
 
   #diagnostic(prefix: string, error: unknown): void {
@@ -673,7 +1665,258 @@ function mapVanguardEvent(sessionId: string, upstreamCursor: number, raw: Public
 }
 
 function mapVanguardState(state: VanguardSessionState): AresAdapterState {
+  if (!(new Set<VanguardSessionState>([
+    "idle", "running", "waiting_for_user", "cancelling", "cancelled", "completed", "failed",
+  ])).has(state)) {
+    throw protocolError("Vanguard returned an invalid session state.");
+  }
   return state;
+}
+
+export interface AresAdapterBarrierReport {
+  readonly complete: boolean;
+  readonly unresolvedStarts: number;
+  readonly unresolvedSessions: number;
+  readonly unresolvedForeignOperations: number;
+}
+
+type FencedVanguardStatus = VanguardSessionStatus & {
+  readonly workerActive: boolean;
+  readonly workerGeneration: number;
+  readonly ownerEpoch: number;
+};
+
+function assertVanguardStatus(
+  status: VanguardSessionStatus,
+  operation: string,
+  expectedSessionId?: string,
+): asserts status is FencedVanguardStatus {
+  if (status === null || typeof status !== "object"
+    || typeof status.sessionId !== "string" || status.sessionId.length === 0
+    || (expectedSessionId !== undefined && status.sessionId !== expectedSessionId)
+    || typeof status.sessionRoot !== "string" || status.sessionRoot.length === 0
+    || typeof status.sourceRoot !== "string" || status.sourceRoot.length === 0
+    || typeof status.workspaceRoot !== "string" || status.workspaceRoot.length === 0
+    || typeof status.materialized !== "boolean"
+    || typeof status.workerActive !== "boolean"
+    || typeof status.workerGeneration !== "number"
+    || !Number.isSafeInteger(status.workerGeneration) || status.workerGeneration < 0
+    || typeof status.ownerEpoch !== "number"
+    || !Number.isSafeInteger(status.ownerEpoch) || status.ownerEpoch < 1
+    || !Number.isSafeInteger(status.latestCursor) || status.latestCursor < 0
+    || !Number.isSafeInteger(status.replayFloorCursor) || status.replayFloorCursor < 1
+    || status.replayFloorCursor > status.latestCursor + 1) {
+    throw protocolError(`Vanguard ${operation} returned an invalid status.`);
+  }
+  mapVanguardState(status.state);
+}
+
+function assertWorkerStopReceipt(
+  receipt: AresWorkerStopReceipt,
+  expectedSessionId: string,
+  expectedWorkerGeneration: number,
+  expectedOwnerEpoch: number,
+): void {
+  if (receipt === null || typeof receipt !== "object"
+    || receipt.version !== 1
+    || receipt.sessionId !== expectedSessionId
+    || receipt.stopped !== true
+    || receipt.workerGeneration !== expectedWorkerGeneration
+    || receipt.ownerEpoch !== expectedOwnerEpoch) {
+    throw protocolError("Worker stop was not proven by a valid lifecycle receipt.");
+  }
+}
+
+function assertLifecycleCapabilities(capabilities: readonly string[], provider: string): void {
+  if (!Array.isArray(capabilities) || capabilities.length > 100
+    || capabilities.some((capability) => typeof capability !== "string" || capability.length > 200)
+    || new Set(capabilities).size !== capabilities.length
+    || !capabilities.includes("sessions.create.idempotent")
+    || !capabilities.includes("sessions.stopAndWait")
+    || !capabilities.includes("sessions.workerFenced")
+    || !capabilities.includes("sessions.executionTreeFenced")) {
+    throw protocolError(`${provider} does not attest durable create, worker-stop, and execution-tree containment.`);
+  }
+}
+
+function assertRouteClaimCapabilities(capabilities: readonly string[] | undefined): void {
+  if (!Array.isArray(capabilities) || capabilities.length > 100
+    || capabilities.some((capability) => typeof capability !== "string" || capability.length > 200)
+    || new Set(capabilities).size !== capabilities.length
+    || !capabilities.includes(ARES_ROUTE_CLAIM_CAPABILITY)) {
+    throw protocolError("Route-claim store does not attest atomic durable arbitration.");
+  }
+}
+
+function assertRouteClaimResult(
+  result: AresRouteClaimResult,
+  operationId: string,
+  inputFingerprintSha256: string,
+  proposedCore: AresClaimedCore,
+  policySha256: string,
+): AresDurableRouteClaim {
+  if (!hasExactDataShape(result, ["claim", "created"]) || typeof result.created !== "boolean") {
+    throw protocolError("Route-claim store returned an invalid claim result.");
+  }
+  try { validateAresDurableRouteClaim(result.claim); }
+  catch { throw protocolError("Route-claim store returned an invalid durable claim."); }
+  const expectedOperation = aresRouteOperationDigest(operationId);
+  if (result.claim.operationIdSha256 !== expectedOperation
+    || result.claim.inputFingerprintSha256 !== inputFingerprintSha256
+    || (result.created && (result.claim.chosenCore !== proposedCore || result.claim.policySha256 !== policySha256))) {
+    throw protocolError("Route-claim store returned a detached or conflicting claim.");
+  }
+  return result.claim;
+}
+
+function assertRouteReceipt(
+  receipt: AresDurableRouteReceipt | undefined,
+  claim: AresDurableRouteClaim,
+): AresDurableRouteReceipt | undefined {
+  if (receipt === undefined) return undefined;
+  try { validateAresDurableRouteReceipt(receipt); }
+  catch { throw protocolError("Route-claim store returned an invalid durable receipt."); }
+  if (receipt.operationIdSha256 !== claim.operationIdSha256
+    || receipt.claimSha256 !== aresRouteClaimDigest(claim)
+    || receipt.source !== claim.chosenCore) {
+    throw protocolError("Route-claim store returned a receipt detached from its claim.");
+  }
+  return receipt;
+}
+
+function assertRouteReceiptResult(
+  result: AresRouteReceiptResult,
+  claim: AresDurableRouteClaim,
+  upstreamSessionId: string,
+): void {
+  if (!hasExactDataShape(result, ["receipt", "created"]) || typeof result.created !== "boolean") {
+    throw protocolError("Route-claim store returned an invalid receipt result.");
+  }
+  const receipt = assertRouteReceipt(result.receipt, claim);
+  if (receipt === undefined || receipt.upstreamSessionId !== upstreamSessionId
+    || receipt.upstreamIdentitySha256 !== aresUpstreamIdentityDigest(claim.chosenCore, upstreamSessionId)) {
+    throw protocolError("Route-claim store committed a conflicting upstream identity.");
+  }
+}
+
+function hasExactDataShape(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) return false;
+  const own = Reflect.ownKeys(value);
+  if (own.length !== keys.length || own.some((key) => typeof key !== "string" || !keys.includes(key))) return false;
+  return keys.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && descriptor.enumerable === true
+      && descriptor.get === undefined && descriptor.set === undefined;
+  });
+}
+
+function assertVanguardEnvelope(envelope: VanguardEngineEvent, sessionId: string): void {
+  if (envelope === null || typeof envelope !== "object"
+    || envelope.sessionId !== sessionId
+    || !Number.isSafeInteger(envelope.cursor) || envelope.cursor < 1
+    || envelope.event === null || typeof envelope.event !== "object"
+    || typeof envelope.event.type !== "string"
+    || typeof envelope.event.agentId !== "string"
+    || typeof envelope.event.title !== "string") {
+    throw protocolError("Vanguard returned an invalid or cross-session event envelope.");
+  }
+}
+
+function assertVanguardPage(page: VanguardEventPage, sessionId: string, requestedAfterCursor: number): void {
+  if (page === null || typeof page !== "object"
+    || page.sessionId !== sessionId
+    || page.afterCursor !== requestedAfterCursor
+    || !Array.isArray(page.events)
+    || !Number.isSafeInteger(page.latestCursor) || page.latestCursor < 0
+    || page.latestCursor < requestedAfterCursor
+    || !Number.isSafeInteger(page.replayFloorCursor) || page.replayFloorCursor < 1
+    || page.replayFloorCursor > page.latestCursor + 1
+    || typeof page.gap !== "boolean" || typeof page.hasMore !== "boolean"
+    || page.gap !== (requestedAfterCursor < page.replayFloorCursor - 1)
+    || (page.hasMore && page.events.length === 0)) {
+    throw protocolError("Vanguard returned an invalid replay page.");
+  }
+  const cursors = new Set<number>();
+  let previousCursor = page.gap ? page.replayFloorCursor - 1 : requestedAfterCursor;
+  for (const event of page.events) {
+    assertVanguardEnvelope(event, sessionId);
+    if (event.cursor < page.replayFloorCursor || event.cursor <= previousCursor
+      || event.cursor > page.latestCursor || cursors.has(event.cursor)) {
+      throw protocolError("Vanguard event cursor is invalid for the replay page.");
+    }
+    cursors.add(event.cursor);
+    previousCursor = event.cursor;
+  }
+  const effectiveBase = page.gap ? page.replayFloorCursor - 1 : requestedAfterCursor;
+  const finalCursor = page.events.at(-1)?.cursor ?? effectiveBase;
+  if (!page.hasMore && finalCursor !== page.latestCursor) {
+    throw protocolError("Vanguard replay page was truncated below its latest cursor.");
+  }
+}
+
+function assertLegacyStatus(status: AresLegacySessionStatus, expectedSessionId?: string): void {
+  if (status === null || typeof status !== "object"
+    || typeof status.sessionId !== "string" || status.sessionId.length === 0
+    || (expectedSessionId !== undefined && status.sessionId !== expectedSessionId)
+    || typeof status.workerActive !== "boolean"
+    || !Number.isSafeInteger(status.workerGeneration) || status.workerGeneration < 0
+    || !Number.isSafeInteger(status.ownerEpoch) || status.ownerEpoch < 1
+    || !Number.isSafeInteger(status.latestCursor) || status.latestCursor < 0
+    || !Number.isSafeInteger(status.replayFloorCursor) || status.replayFloorCursor < 1
+    || status.replayFloorCursor > status.latestCursor + 1
+    || !(new Set<Exclude<AresAdapterState, "manual_recovery">>([
+      "idle", "running", "waiting_for_user", "cancelling", "cancelled", "completed", "failed",
+    ])).has(status.state)) {
+    throw protocolError("Legacy core returned an invalid status.");
+  }
+}
+
+const ARES_EVENT_KINDS = new Set<AresTurnEvent["kind"]>([
+  "assistant.delta", "assistant.message", "tool.started", "tool.completed", "tool.failed",
+  "verification.completed", "turn.contracted", "turn.waiting_for_user", "turn.completed", "turn.failed",
+  "recovery.scheduled", "recovery.exhausted", "context.compacted", "route.changed", "replay.gap",
+  "adapter.notice",
+]);
+const ARES_EVENT_STATUSES = new Set<AresTurnEvent["status"]>(["pending", "passed", "failed", "info"]);
+
+function assertLegacyPage(page: AresLegacyEventPage, requestedAfterCursor: number): void {
+  if (page === null || typeof page !== "object"
+    || !Array.isArray(page.events)
+    || !Number.isSafeInteger(page.latestCursor) || page.latestCursor < 0
+    || page.latestCursor < requestedAfterCursor
+    || !Number.isSafeInteger(page.replayFloorCursor) || page.replayFloorCursor < 1
+    || page.replayFloorCursor > page.latestCursor + 1
+    || typeof page.gap !== "boolean" || typeof page.hasMore !== "boolean"
+    || page.gap !== (requestedAfterCursor < page.replayFloorCursor - 1)
+    || (page.hasMore && page.events.length === 0)) {
+    throw protocolError("Legacy core returned an invalid replay page.");
+  }
+  const cursors = new Set<number>();
+  let previousCursor = page.gap ? page.replayFloorCursor - 1 : requestedAfterCursor;
+  for (const event of page.events) {
+    if (event === null || typeof event !== "object"
+      || !Number.isSafeInteger(event.cursor) || event.cursor < page.replayFloorCursor
+      || event.cursor <= previousCursor || event.cursor > page.latestCursor
+      || cursors.has(event.cursor)
+      || !ARES_EVENT_KINDS.has(event.kind)
+      || (event.status !== undefined && !ARES_EVENT_STATUSES.has(event.status))
+      || !optionalString(event.title) || !optionalString(event.message)
+      || !optionalString(event.detail) || !optionalString(event.tool)) {
+      throw protocolError("Legacy core returned an invalid event.");
+    }
+    cursors.add(event.cursor);
+    previousCursor = event.cursor;
+  }
+  const effectiveBase = page.gap ? page.replayFloorCursor - 1 : requestedAfterCursor;
+  const finalCursor = page.events.at(-1)?.cursor ?? effectiveBase;
+  if (!page.hasMore && finalCursor !== page.latestCursor) {
+    throw protocolError("Legacy replay page was truncated below its latest cursor.");
+  }
+}
+
+function optionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
 }
 
 function classifyThrownFailure(error: unknown, fallback: AresFallbackReason): AresFallbackReason {
@@ -715,7 +1958,13 @@ function safeReasonText(reason: AresFallbackReason): string {
     case "vanguard_startup_failure": return "Vanguard could not start before workspace mutation.";
     case "vanguard_protocol_failure": return "The Vanguard protocol failed before a safe handoff.";
     case "vanguard_critical_failure": return "Vanguard stopped before a safe handoff.";
+    case "legacy_protocol_failure": return "The legacy engine response was uncertain; automatic retry was blocked.";
   }
+}
+
+function requiredOperationId(session: ManagedSession): string {
+  if (session.operationId === undefined) throw new Error("Durable create operation ID is unavailable.");
+  return session.operationId;
 }
 
 function validateActor(actorId: string): void {
@@ -724,9 +1973,47 @@ function validateActor(actorId: string): void {
   }
 }
 
-function validateMessage(message: string): void {
+function validateOperationId(operationId: string): void {
+  if (typeof operationId !== "string" || !/^op_[a-f0-9]{32,64}$/.test(operationId)) {
+    throw new Error("operationId must be a durable opaque op_ identifier.");
+  }
+}
+
+function adapterClosedError(): Error & { code: string } {
+  return Object.assign(new Error("Ares Vanguard adapter is closed."), { code: "adapter_closed" });
+}
+
+function isAdapterClosedError(error: unknown): boolean {
+  return error !== null && typeof error === "object" && "code" in error
+    && (error as { code?: unknown }).code === "adapter_closed";
+}
+
+function isForeignOperationTimeout(error: unknown): boolean {
+  return error !== null && typeof error === "object" && "code" in error
+    && (error as { code?: unknown }).code === "foreign_operation_timeout";
+}
+
+function routeArbitrationSettlement(error: unknown): Promise<void> | undefined {
+  return error !== null && typeof error === "object"
+    ? ROUTE_ARBITRATION_SETTLEMENTS.get(error)
+    : undefined;
+}
+
+function isDurableIdentityConflict(error: unknown): boolean {
+  if (error === null || typeof error !== "object" || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "route_receipt_conflict" || code === "upstream_identity_conflict";
+}
+
+function validateAdvanceMessage(message: string): void {
+  if (typeof message !== "string" || message.trim().length === 0 || message.length > 16_384) {
+    throw new Error("advance message must be non-empty and at most 16,384 characters.");
+  }
+}
+
+function validateSteeringMessage(message: string): void {
   if (typeof message !== "string" || message.trim().length === 0 || message.length > 262_144) {
-    throw new Error("message must be non-empty and at most 262,144 characters.");
+    throw new Error("steering message must be non-empty and at most 262,144 characters.");
   }
 }
 
@@ -741,4 +2028,283 @@ function boundedInteger(value: number, min: number, max: number, name: string): 
 
 function manualRecoveryError(): Error {
   return new Error("Session requires manual recovery; automatic fallback was intentionally blocked.");
+}
+
+async function unsettledAfter(promises: readonly Promise<unknown>[], timeoutMs: number): Promise<number> {
+  if (promises.length === 0) return 0;
+  const pending = new Set(promises);
+  for (const promise of promises) void promise.then(() => pending.delete(promise), () => pending.delete(promise));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.allSettled(promises),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  return pending.size;
+}
+
+function remainingMs(deadline: number): number {
+  return Math.max(1, deadline - Date.now());
+}
+
+function normalizeRolloutSnapshot(raw: AresVanguardRolloutConfig): Readonly<AresVanguardRolloutConfig> {
+  const record = requirePlainRecord(raw, undefined, "rollout config");
+  const required = [
+    "cohortPercent", "cohortSalt", "enabled", "killSwitch", "requireExplicitOptIn", "stage",
+  ] as const;
+  const allowed = [...required, "allowActorIds"];
+  const keys = Object.keys(record);
+  if (required.some((key) => !keys.includes(key)) || keys.some((key) => !allowed.includes(key))) {
+    throw new Error("Rollout config contains missing or extra fields.");
+  }
+  if (typeof record.enabled !== "boolean" || typeof record.killSwitch !== "boolean"
+    || typeof record.requireExplicitOptIn !== "boolean") throw new Error("Rollout flags must be booleans.");
+  if (typeof record.stage !== "string" || typeof record.cohortPercent !== "number"
+    || typeof record.cohortSalt !== "string" || record.cohortSalt.length > 4_096) {
+    throw new Error("Rollout config contains invalid scalar fields.");
+  }
+  let allowActorIds: readonly string[] | undefined;
+  if (record.allowActorIds !== undefined) {
+    const rawIds = record.allowActorIds;
+    if (!Array.isArray(rawIds) || rawIds.length > 4_096) throw new Error("Rollout allowlist is invalid.");
+    const own = Reflect.ownKeys(rawIds);
+    if (own.some((key) => typeof key !== "string" || (key !== "length" && !/^(?:0|[1-9]\d*)$/.test(key)))) {
+      throw new Error("Rollout allowlist contains forbidden keys.");
+    }
+    const normalized: string[] = [];
+    for (let index = 0; index < rawIds.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(rawIds, String(index));
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined
+        || descriptor.enumerable !== true || typeof descriptor.value !== "string"
+        || descriptor.value.trim().length === 0 || descriptor.value.length > 500) {
+        throw new Error("Rollout allowlist contains an invalid entry.");
+      }
+      normalized.push(descriptor.value);
+    }
+    allowActorIds = Object.freeze([...new Set(normalized)].sort());
+  }
+  const snapshot: AresVanguardRolloutConfig = Object.freeze({
+    enabled: record.enabled,
+    killSwitch: record.killSwitch,
+    stage: record.stage as AresVanguardRolloutConfig["stage"],
+    cohortPercent: record.cohortPercent,
+    cohortSalt: record.cohortSalt,
+    ...(allowActorIds === undefined ? {} : { allowActorIds }),
+    requireExplicitOptIn: record.requireExplicitOptIn,
+  });
+  // Reuse the public decision validator to keep the snapshot and runtime
+  // policy semantics identical.
+  decideAresVanguardRollout(snapshot, "policy-validation-probe", false);
+  return snapshot;
+}
+
+function stableJson(value: unknown): string {
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new Error("Create input contains a non-finite number.");
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "string" || typeof value === "number") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (typeof value !== "object") throw new Error("Create input contains an unsupported value.");
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+    .map(([key, child]) => `${JSON.stringify(key)}:${stableJson(child)}`)
+    .join(",")}}`;
+}
+
+interface CloneBudget {
+  readonly seen: WeakSet<object>;
+  nodes: number;
+  keys: number;
+  bytes: number;
+}
+
+function normalizeCreateInput(raw: AresAdapterCreateInput): AresAdapterCreateInput {
+  const top = requirePlainRecord(raw, ["operationId", "actorId", "optedIn", "vanguard", "legacy"], "create input");
+  // Cheap scalar bounds run before traversing any caller-owned nested graph.
+  validateActor(dataString(top, "actorId", 500));
+  validateOperationId(dataString(top, "operationId", 80));
+  const cloned = boundedClone(raw, newBudget(), 0) as unknown as AresAdapterCreateInput;
+  validateActor(cloned.actorId);
+  validateOperationId(cloned.operationId);
+  if (typeof cloned.optedIn !== "boolean") throw new Error("optedIn must be a boolean.");
+  validateVanguardInput(cloned.vanguard);
+  requirePlainRecord(cloned.legacy, ["workspace"], "legacy create input");
+  boundedString(cloned.legacy.workspace, 1, 32_768, "legacy workspace");
+  return deepFreeze(cloned);
+}
+
+function normalizeResumeInput(raw: AresAdapterResumeInput): AresAdapterResumeInput {
+  const top = requirePlainRecord(raw, ["actorId", "optedIn", "vanguardSessionRoot", "legacy"], "resume input");
+  validateActor(dataString(top, "actorId", 500));
+  dataString(top, "vanguardSessionRoot", 32_768);
+  const cloned = boundedClone(raw, newBudget(), 0) as unknown as AresAdapterResumeInput;
+  validateActor(cloned.actorId);
+  if (typeof cloned.optedIn !== "boolean") throw new Error("optedIn must be a boolean.");
+  boundedString(cloned.vanguardSessionRoot, 1, 32_768, "vanguardSessionRoot");
+  requirePlainRecord(cloned.legacy, ["sessionRoot"], "legacy resume input");
+  boundedString(cloned.legacy.sessionRoot, 1, 32_768, "legacy sessionRoot");
+  return deepFreeze(cloned);
+}
+
+function validateVanguardInput(config: AresAdapterCreateInput["vanguard"]): void {
+  const allowed = [
+    "workspace", "provider", "model", "endpoint", "verification", "publicCheck", "adaptiveVerification",
+    "allowedCommands", "protectedPaths", "editableRoots", "securityProfile", "restrictProcess",
+    "exposeRawProcess", "verifierEvidence", "maxSteps", "maxDurationMs", "commandTimeoutMs",
+    "maxContextBytes", "maxFailedVerificationAttempts",
+  ] as const;
+  requirePlainRecord(config, allowed, "Vanguard config", true);
+  boundedString(config.workspace, 1, 32_768, "workspace");
+  if (!(["openai", "anthropic", "deepseek", "http"] as const).includes(config.provider)) {
+    throw new Error("Vanguard provider is invalid.");
+  }
+  boundedString(config.model, 1, 4_096, "model");
+  if (config.endpoint !== undefined) boundedString(config.endpoint, 1, 16_384, "endpoint");
+  if (config.provider === "http" && config.endpoint === undefined) throw new Error("http provider requires endpoint.");
+  if (config.verification !== undefined) validateCommandInput(config.verification, "verification");
+  if (config.publicCheck !== undefined) validateCommandInput(config.publicCheck, "publicCheck");
+  for (const [name, values] of [
+    ["allowedCommands", config.allowedCommands],
+    ["protectedPaths", config.protectedPaths],
+    ["editableRoots", config.editableRoots],
+  ] as const) {
+    if (values === undefined) continue;
+    if (!Array.isArray(values) || values.length > 4_096) throw new Error(`${name} is invalid.`);
+    for (const value of values) boundedString(value, 0, 32_768, name);
+  }
+  for (const [name, value] of [
+    ["adaptiveVerification", config.adaptiveVerification],
+    ["restrictProcess", config.restrictProcess],
+    ["exposeRawProcess", config.exposeRawProcess],
+  ] as const) if (value !== undefined && typeof value !== "boolean") throw new Error(`${name} must be boolean.`);
+  if (config.securityProfile !== undefined && config.securityProfile !== "workspace" && config.securityProfile !== "guarded") {
+    throw new Error("securityProfile is invalid.");
+  }
+  if (config.verifierEvidence !== undefined && config.verifierEvidence !== "full" && config.verifierEvidence !== "summary") {
+    throw new Error("verifierEvidence is invalid.");
+  }
+  for (const [name, value] of [
+    ["maxSteps", config.maxSteps], ["maxDurationMs", config.maxDurationMs],
+    ["commandTimeoutMs", config.commandTimeoutMs], ["maxContextBytes", config.maxContextBytes],
+    ["maxFailedVerificationAttempts", config.maxFailedVerificationAttempts],
+  ] as const) {
+    if (value !== undefined && (!Number.isSafeInteger(value) || value < 1)) throw new Error(`${name} is invalid.`);
+  }
+}
+
+function validateCommandInput(command: { readonly command: string; readonly args: readonly string[] }, name: string): void {
+  requirePlainRecord(command, ["command", "args"], `${name} command`);
+  boundedString(command.command, 1, 4_096, `${name}.command`);
+  if (!Array.isArray(command.args) || command.args.length > 2_048) throw new Error(`${name}.args is invalid.`);
+  for (const argument of command.args) boundedString(argument, 0, 32_768, `${name}.args`);
+}
+
+function newBudget(): CloneBudget {
+  return { seen: new WeakSet(), nodes: 0, keys: 0, bytes: 0 };
+}
+
+function boundedClone(value: unknown, budget: CloneBudget, depth: number): unknown {
+  if (depth > 12) throw new Error("Adapter input exceeds the maximum nesting depth.");
+  budget.nodes += 1;
+  if (budget.nodes > 20_000) throw new Error("Adapter input contains too many values.");
+  if (typeof value === "string") {
+    budget.bytes += Buffer.byteLength(value, "utf8");
+    if (budget.bytes > 1_048_576) throw new Error("Adapter input exceeds one MiB.");
+    return value;
+  }
+  if (value === null || typeof value === "boolean") return value;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("Adapter input contains a non-finite number.");
+    return value;
+  }
+  if (typeof value !== "object") throw new Error("Adapter input contains an unsupported value.");
+  if (budget.seen.has(value)) throw new Error("Adapter input contains a cycle or shared mutable reference.");
+  budget.seen.add(value);
+  if (Array.isArray(value)) {
+    if (value.length > 10_000) throw new Error("Adapter input array is too large.");
+    const own = Reflect.ownKeys(value);
+    if (own.some((key) => typeof key !== "string" || (key !== "length" && !/^(?:0|[1-9]\d*)$/.test(key)))) {
+      throw new Error("Adapter input array contains forbidden keys.");
+    }
+    const output: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined
+        || descriptor.enumerable !== true) throw new Error("Adapter input contains a sparse or accessor array.");
+      output.push(boundedClone(descriptor.value, budget, depth + 1));
+    }
+    return output;
+  }
+  const record = requirePlainRecord(value, undefined, "adapter input object", true);
+  const output: Record<string, unknown> = {};
+  for (const key of Object.keys(record)) {
+    budget.keys += 1;
+    budget.bytes += Buffer.byteLength(key, "utf8");
+    if (budget.keys > 20_000 || budget.bytes > 1_048_576) throw new Error("Adapter input is too large.");
+    const descriptor = Object.getOwnPropertyDescriptor(record, key)!;
+    output[key] = boundedClone(descriptor.value, budget, depth + 1);
+  }
+  return output;
+}
+
+function requirePlainRecord(
+  value: unknown,
+  allowed: readonly string[] | undefined,
+  name: string,
+  optionalKeys = false,
+): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    throw new Error(`${name} must be a plain object.`);
+  }
+  const own = Reflect.ownKeys(value);
+  if (own.some((key) => typeof key !== "string")) throw new Error(`${name} contains a symbol key.`);
+  const keys = own as string[];
+  if (allowed !== undefined && (keys.some((key) => !allowed.includes(key))
+    || (!optionalKeys && allowed.some((key) => !keys.includes(key))))) {
+    throw new Error(`${name} contains missing or extra fields.`);
+  }
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || descriptor.get !== undefined || descriptor.set !== undefined
+      || descriptor.enumerable !== true) throw new Error(`${name} contains an accessor or hidden field.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function dataString(record: Record<string, unknown>, key: string, maximum: number): string {
+  const value = Object.getOwnPropertyDescriptor(record, key)?.value;
+  if (typeof value !== "string" || value.length > maximum) throw new Error(`${key} is invalid.`);
+  return value;
+}
+
+function boundedString(value: unknown, minimum: number, maximum: number, name: string): asserts value is string {
+  if (typeof value !== "string" || value.length < minimum || value.length > maximum) throw new Error(`${name} is invalid.`);
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return value;
+  for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);
+  return Object.freeze(value);
+}
+
+function protocolError(message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code: "protocol_invalid_response" });
+}
+
+function isNonFatalVanguardControlError(error: unknown): boolean {
+  const code = error !== null && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
+  return code === "steering_queue_full" || code === "steering_backpressure" || code === "session_not_running";
+}
+
+function safeControlError(error: unknown): Error {
+  const code = error !== null && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code ?? "control_rejected")
+    : "control_rejected";
+  const safeCode = /^[a-z0-9_.-]{1,80}$/i.test(code) ? code : "control_rejected";
+  return new Error(`Vanguard control message was not accepted (${safeCode}).`);
 }

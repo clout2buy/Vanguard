@@ -37,6 +37,7 @@ export function decideAresVanguardRollout(
   optedIn: boolean,
 ): AresRolloutDecision {
   validateRolloutConfig(config);
+  if (typeof optedIn !== "boolean") throw new Error("optedIn must be a boolean.");
   const bucket = rolloutBucket(config.cohortSalt, actorId);
   if (config.killSwitch) return { useVanguard: false, reason: "kill_switch", bucket };
   if (!config.enabled || config.stage === "off") return { useVanguard: false, reason: "disabled", bucket };
@@ -54,14 +55,28 @@ export function decideAresVanguardRollout(
 }
 
 export function validateRolloutConfig(config: AresVanguardRolloutConfig): void {
+  if (config === null || typeof config !== "object") throw new Error("Rollout config must be an object.");
+  if (typeof config.enabled !== "boolean" || typeof config.killSwitch !== "boolean"
+    || typeof config.requireExplicitOptIn !== "boolean") {
+    throw new Error("Rollout flags must be booleans.");
+  }
+  if (!(new Set<AresRolloutStage>(["off", "internal", "beta", "ramp", "full"])).has(config.stage)) {
+    throw new Error("Rollout stage is invalid.");
+  }
   if (!Number.isFinite(config.cohortPercent) || config.cohortPercent < 0 || config.cohortPercent > 100) {
     throw new Error("cohortPercent must be between 0 and 100.");
   }
+  if (typeof config.cohortSalt !== "string") throw new Error("cohortSalt must be a string.");
   if (config.enabled && config.stage !== "off" && config.cohortSalt.length < 16) {
     throw new Error("Enabled rollout requires a non-secret cohortSalt of at least 16 characters.");
   }
   if (!Array.isArray(config.allowActorIds) && config.allowActorIds !== undefined) {
     throw new Error("allowActorIds must be an array when provided.");
+  }
+  if (config.allowActorIds !== undefined && config.allowActorIds.some((actorId) => (
+    typeof actorId !== "string" || actorId.trim().length === 0 || actorId.length > 500
+  ))) {
+    throw new Error("allowActorIds entries must be non-empty strings of at most 500 characters.");
   }
 }
 

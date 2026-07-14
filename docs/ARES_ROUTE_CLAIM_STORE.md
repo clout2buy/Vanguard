@@ -19,6 +19,17 @@ The required host order is:
 5. Call `commitReceipt()` before publishing the adapter session. The receipt
    binds the source and upstream session ID to the claim.
 
+The adapter treats a deadline differently from a clean store rejection. A
+timed-out claim/read/commit may settle after the caller has lost observation of
+the linearization point. Pre-dispatch claim/read timeouts pin that operation and
+the lifecycle barrier only until the exact promise settles; no engine call is
+allowed meanwhile, and a same-operation retry then rereads the durable winner.
+For a post-allocation commit timeout, the exact fenced worker must also be
+proven stopped before the barrier may clear. A malformed late result, durable
+identity conflict, or failed/unknown stop remains permanent manual recovery.
+Operators must investigate the ledger; they must not delete records or retry
+the task under a new operation ID.
+
 The global identity index is published before a receipt. It stores only the
 hash of `(source, upstreamSessionId)`, the operation digest, and claim digest.
 This makes a crash after index publication recoverable for the same operation

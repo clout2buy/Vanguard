@@ -57,5 +57,6 @@ export * from "./extensions/ports.js";
 export * from "./integration/aresTypes.js";
 export * from "./integration/rollout.js";
 export * from "./integration/betaTelemetry.js";
+export * from "./integration/betaProgram.js";
 export * from "./integration/aresAdapter.js";
 export * from "./integration/aresRouteClaimStore.js";

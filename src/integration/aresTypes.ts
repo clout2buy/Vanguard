@@ -79,6 +79,8 @@ export interface AresAdapterSessionStatus {
 }
 
 export interface AresAdapterCreateInput {
+  /** Durable host idempotency key; the same key must never describe different input. */
+  readonly operationId: string;
   /** Used only for deterministic rollout and pseudonymization; never emitted. */
   readonly actorId: string;
   readonly optedIn: boolean;
@@ -90,7 +92,9 @@ export interface AresAdapterResumeInput {
   /** Used only for deterministic rollout and pseudonymization; never emitted. */
   readonly actorId: string;
   readonly optedIn: boolean;
+  /** Identifies an existing Vanguard session; unsafe/ineligible resume never silently switches cores. */
   readonly vanguardSessionRoot: string;
+  /** Used only by a later proven-pristine fallback after Vanguard resume succeeds. */
   readonly legacy: AresLegacyResumeInput;
 }
 
@@ -105,6 +109,9 @@ export interface AresLegacyResumeInput {
 export interface AresLegacySessionStatus {
   readonly sessionId: string;
   readonly state: Exclude<AresAdapterState, "manual_recovery">;
+  readonly workerActive: boolean;
+  readonly workerGeneration: number;
+  readonly ownerEpoch: number;
   readonly latestCursor: number;
   readonly replayFloorCursor: number;
 }
@@ -127,24 +134,46 @@ export interface AresLegacyEventPage {
   readonly hasMore: boolean;
 }
 
+/**
+ * Attests that the exact worker owned by a session can no longer execute.
+ * A control-delivery acknowledgement or terminal-looking run event is not a
+ * substitute: implementations must resolve only after the worker lifecycle
+ * itself has settled and every deferred launch has been disarmed.
+ */
+export interface AresWorkerStopReceipt {
+  readonly version: 1;
+  readonly sessionId: string;
+  readonly stopped: boolean;
+  readonly workerGeneration: number;
+  readonly ownerEpoch?: number;
+}
+
 /** Host-owned legacy core boundary. No Ares package is required by Vanguard. */
 export interface AresLegacyCorePort {
-  create(input: AresLegacyCreateInput): Promise<AresLegacySessionStatus>;
+  /** Must include sessions.executionTreeFenced; top-level process exit alone is insufficient. */
+  capabilities(): readonly string[];
+  /** MUST durably deduplicate this operationId across process restarts. */
+  create(input: AresLegacyCreateInput, operationId: string): Promise<AresLegacySessionStatus>;
   resume(input: AresLegacyResumeInput): Promise<AresLegacySessionStatus>;
   send(sessionId: string, message: string): Promise<AresLegacySessionStatus>;
   steer(sessionId: string, message: string): Promise<AresLegacySessionStatus>;
   interrupt(sessionId: string): Promise<AresLegacySessionStatus>;
+  stopAndWait(sessionId: string, timeoutMs?: number): Promise<AresWorkerStopReceipt>;
   status(sessionId: string): Promise<AresLegacySessionStatus>;
   events(sessionId: string, afterCursor: number, limit: number): Promise<AresLegacyEventPage>;
 }
 
 /** The exact public VanguardEngine surface consumed by the adapter. */
 export interface AresVanguardEnginePort {
-  create(config: VanguardSessionConfig): Promise<VanguardSessionStatus>;
+  /** Must include sessions.executionTreeFenced; top-level worker exit alone is insufficient. */
+  capabilities(): readonly string[];
+  /** MUST durably deduplicate this operationId across process restarts. */
+  create(config: VanguardSessionConfig, operationId: string): Promise<VanguardSessionStatus>;
   resume(sessionRoot: string): Promise<VanguardSessionStatus>;
   advance(sessionId: string, message?: string): VanguardSessionStatus;
   steer(sessionId: string, message: string): VanguardSessionStatus;
   cancel(sessionId: string): VanguardSessionStatus;
+  stopAndWait(sessionId: string, timeoutMs?: number): Promise<AresWorkerStopReceipt>;
   status(sessionId: string): VanguardSessionStatus;
   events(sessionId: string, afterCursor?: number, limit?: number): VanguardEventPage;
   subscribe(listener: (event: VanguardEngineEvent) => void): () => void;
@@ -155,5 +184,6 @@ export type AresFallbackReason =
   | "kill_switch"
   | "vanguard_startup_failure"
   | "vanguard_protocol_failure"
-  | "vanguard_critical_failure";
+  | "vanguard_critical_failure"
+  | "legacy_protocol_failure";
 
