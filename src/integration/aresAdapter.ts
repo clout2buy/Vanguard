@@ -84,8 +84,12 @@ interface ManagedSession {
   legacyCursor: number;
   vanguardWorkerGeneration: number | undefined;
   vanguardOwnerEpoch: number | undefined;
+  /** Independent of task state: undefined means a known identity is not proven inactive. */
+  vanguardWorkerActive: boolean | undefined;
   legacyWorkerGeneration: number | undefined;
   legacyOwnerEpoch: number | undefined;
+  /** Independent of task state: undefined means a known identity is not proven inactive. */
+  legacyWorkerActive: boolean | undefined;
   mutationRisk: boolean;
   pendingMessage: string | undefined;
   turnStartedAt: number | undefined;
@@ -408,7 +412,13 @@ export class AresVanguardAdapter {
         const currentDecision = this.#rolloutDecision(input.actorId, input.optedIn);
         if (!currentDecision.useVanguard) {
           const reason = currentDecision.reason === "kill_switch" ? "kill_switch" : "rollout_ineligible";
-          this.#cancelVanguardBestEffort(session);
+          if (!await this.#stopRouteAndWait(session, true)) {
+            // Resume has already attached to an existing worker. A failed or
+            // malformed receipt permanently poisons this adapter barrier; a
+            // best-effort cancel is useful but cannot substitute for proof.
+            this.#uncontainedForeignOperations += 1;
+            this.#cancelVanguardBestEffort(session);
+          }
           this.#requireManualRecovery(session, reason);
           this.#sessions.set(session.id, session);
           return this.#snapshot(session);
@@ -425,8 +435,12 @@ export class AresVanguardAdapter {
         this.#diagnostic("Vanguard resume failed", error);
         const reason = classifyThrownFailure(error, "vanguard_startup_failure");
         session.mutationRisk = true;
-        if (session.vanguardSessionId === undefined) this.#uncontainedForeignOperations += 1;
-        this.#cancelVanguardBestEffort(session);
+        if (session.vanguardSessionId === undefined) {
+          this.#uncontainedForeignOperations += 1;
+        } else if (!await this.#stopRouteAndWait(session, true)) {
+          this.#uncontainedForeignOperations += 1;
+          this.#cancelVanguardBestEffort(session);
+        }
         this.#requireManualRecovery(session, reason);
         this.#sessions.set(session.id, session);
         return this.#snapshot(session);
@@ -681,9 +695,7 @@ export class AresVanguardAdapter {
     // Cancel once immediately and once after all already-admitted control/event
     // work settles. The second pass closes a race where shutdown begins while
     // a serialized send is just about to call advance().
-    const initiallyRequiresStop = session.route === "manual_recovery"
-      ? session.vanguardSessionId !== undefined || session.legacySessionId !== undefined
-      : session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling";
+    const initiallyRequiresStop = this.#routeMayOwnLiveWorker(session);
     const [initial] = await Promise.allSettled([this.#stopRouteAndWait(session), session.stateTail]);
     if (initiallyRequiresStop && (initial.status === "rejected" || !initial.value)) {
       throw new Error("Initial shutdown interrupt was not acknowledged.");
@@ -691,9 +703,7 @@ export class AresVanguardAdapter {
     // Always inspect and interrupt the final state after already-admitted work.
     // A successful first interrupt says nothing about a send that was queued
     // immediately before shutdown and only started after that interrupt.
-    const finallyRequiresStop = session.route === "manual_recovery"
-      ? session.vanguardSessionId !== undefined || session.legacySessionId !== undefined
-      : session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling";
+    const finallyRequiresStop = this.#routeMayOwnLiveWorker(session);
     const final = await this.#stopRouteAndWait(session);
     if (finallyRequiresStop && !final) throw new Error("Final shutdown interrupt was not acknowledged.");
   }
@@ -760,36 +770,44 @@ export class AresVanguardAdapter {
   }
 
   async #stopRouteAndWait(session: ManagedSession, requireLifecycleReceipt = false): Promise<boolean> {
-    const active = session.state === "running" || session.state === "waiting_for_user" || session.state === "cancelling";
     const deadline = Date.now() + this.#barrierTimeoutMs;
     if (session.route === "manual_recovery") {
       const stops: Promise<void>[] = [];
-      if (session.vanguardSessionId !== undefined) {
+      if (session.vanguardSessionId !== undefined
+        && (requireLifecycleReceipt || session.vanguardWorkerActive !== false)) {
         const fence = this.#requiredVanguardFence(session);
-        stops.push(this.#awaitStopReceipt(
-          (timeoutMs) => this.#vanguard.stopAndWait(session.vanguardSessionId!, timeoutMs),
-          session.vanguardSessionId,
-          fence.workerGeneration,
-          fence.ownerEpoch,
-          deadline,
-        ));
+        stops.push((async () => {
+          await this.#awaitStopReceipt(
+            (timeoutMs) => this.#vanguard.stopAndWait(session.vanguardSessionId!, timeoutMs),
+            session.vanguardSessionId!,
+            fence.workerGeneration,
+            fence.ownerEpoch,
+            deadline,
+          );
+          this.#markVanguardWorkerStopped(session, fence);
+        })());
       }
-      if (session.legacySessionId !== undefined) {
+      if (session.legacySessionId !== undefined
+        && (requireLifecycleReceipt || session.legacyWorkerActive !== false)) {
         const fence = this.#requiredLegacyFence(session);
-        stops.push(this.#awaitStopReceipt(
-          (timeoutMs) => this.#legacy.stopAndWait(session.legacySessionId!, timeoutMs),
-          session.legacySessionId,
-          fence.workerGeneration,
-          fence.ownerEpoch,
-          deadline,
-        ));
+        stops.push((async () => {
+          await this.#awaitStopReceipt(
+            (timeoutMs) => this.#legacy.stopAndWait(session.legacySessionId!, timeoutMs),
+            session.legacySessionId!,
+            fence.workerGeneration,
+            fence.ownerEpoch,
+            deadline,
+          );
+          this.#markLegacyWorkerStopped(session, fence);
+        })());
       }
-      if (stops.length === 0) return false;
+      if (stops.length === 0) return true;
       const settled = await Promise.allSettled(stops);
       return settled.every((result) => result.status === "fulfilled");
     }
-    if (!active && !requireLifecycleReceipt) return false;
     if (session.route === "vanguard") {
+      if (session.vanguardSessionId === undefined) return !requireLifecycleReceipt;
+      if (!requireLifecycleReceipt && session.vanguardWorkerActive === false) return true;
       try {
         const sessionId = requiredVanguardId(session);
         const fence = this.#requiredVanguardFence(session);
@@ -800,9 +818,12 @@ export class AresVanguardAdapter {
           fence.ownerEpoch,
           deadline,
         );
+        this.#markVanguardWorkerStopped(session, fence);
         return true;
       } catch { return false; /* engine shutdown remains host-owned */ }
     } else if (session.route === "legacy") {
+      if (session.legacySessionId === undefined) return !requireLifecycleReceipt;
+      if (!requireLifecycleReceipt && session.legacyWorkerActive === false) return true;
       try {
         const sessionId = requiredLegacyId(session);
         const fence = this.#requiredLegacyFence(session);
@@ -813,10 +834,44 @@ export class AresVanguardAdapter {
           fence.ownerEpoch,
           deadline,
         );
+        this.#markLegacyWorkerStopped(session, fence);
         return true;
       } catch { return false; /* host shutdown remains authoritative */ }
     }
     return false;
+  }
+
+  #routeMayOwnLiveWorker(session: ManagedSession): boolean {
+    if (session.route === "vanguard") {
+      return session.vanguardSessionId !== undefined && session.vanguardWorkerActive !== false;
+    }
+    if (session.route === "legacy") {
+      return session.legacySessionId !== undefined && session.legacyWorkerActive !== false;
+    }
+    return (session.vanguardSessionId !== undefined && session.vanguardWorkerActive !== false)
+      || (session.legacySessionId !== undefined && session.legacyWorkerActive !== false);
+  }
+
+  #markVanguardWorkerStopped(
+    session: ManagedSession,
+    fence: { workerGeneration: number; ownerEpoch: number },
+  ): void {
+    // A shutdown stop races already-admitted work by design. Never let a
+    // receipt for generation N clear liveness for a newly started N+1 worker.
+    if (session.vanguardWorkerGeneration === fence.workerGeneration
+      && session.vanguardOwnerEpoch === fence.ownerEpoch) {
+      session.vanguardWorkerActive = false;
+    }
+  }
+
+  #markLegacyWorkerStopped(
+    session: ManagedSession,
+    fence: { workerGeneration: number; ownerEpoch: number },
+  ): void {
+    if (session.legacyWorkerGeneration === fence.workerGeneration
+      && session.legacyOwnerEpoch === fence.ownerEpoch) {
+      session.legacyWorkerActive = false;
+    }
   }
 
   #acceptVanguardPush(envelope: VanguardEngineEvent): void {
@@ -1067,6 +1122,7 @@ export class AresVanguardAdapter {
     session.legacySessionId = status.sessionId;
     this.#byLegacyId.set(status.sessionId, session);
     session.state = status.state;
+    session.legacyWorkerActive = status.workerActive;
     session.legacyWorkerGeneration = status.workerGeneration;
     session.legacyOwnerEpoch = status.ownerEpoch;
     session.legacyCursor = 0;
@@ -1240,6 +1296,7 @@ export class AresVanguardAdapter {
       this.#byVanguardId.set(status.sessionId, session);
       session.vanguardWorkerGeneration = status.workerGeneration;
       session.vanguardOwnerEpoch = status.ownerEpoch;
+      session.vanguardWorkerActive = status.workerActive;
       this.#trackLateStopReceipt(
         (timeoutMs) => this.#vanguard.stopAndWait(status.sessionId, timeoutMs),
         status.sessionId,
@@ -1270,6 +1327,7 @@ export class AresVanguardAdapter {
       this.#byLegacyId.set(status.sessionId, session);
       session.legacyWorkerGeneration = status.workerGeneration;
       session.legacyOwnerEpoch = status.ownerEpoch;
+      session.legacyWorkerActive = status.workerActive;
       this.#trackLateStopReceipt(
         (timeoutMs) => this.#legacy.stopAndWait(status.sessionId, timeoutMs),
         status.sessionId,
@@ -1362,6 +1420,7 @@ export class AresVanguardAdapter {
   #applyLegacyStatus(session: ManagedSession, status: AresLegacySessionStatus): void {
     assertLegacyStatus(status, requiredLegacyId(session));
     session.state = status.state;
+    session.legacyWorkerActive = status.workerActive;
     session.legacyWorkerGeneration = status.workerGeneration;
     session.legacyOwnerEpoch = status.ownerEpoch;
   }
@@ -1369,6 +1428,7 @@ export class AresVanguardAdapter {
   #applyVanguardStatus(session: ManagedSession, status: VanguardSessionStatus, operation: string): void {
     assertVanguardStatus(status, operation, requiredVanguardId(session));
     session.state = mapVanguardState(status.state);
+    session.vanguardWorkerActive = status.workerActive;
     session.vanguardWorkerGeneration = status.workerGeneration;
     session.vanguardOwnerEpoch = status.ownerEpoch;
   }
@@ -1520,8 +1580,10 @@ export class AresVanguardAdapter {
       legacyCursor: 0,
       vanguardWorkerGeneration: undefined,
       vanguardOwnerEpoch: undefined,
+      vanguardWorkerActive: undefined,
       legacyWorkerGeneration: undefined,
       legacyOwnerEpoch: undefined,
+      legacyWorkerActive: undefined,
       mutationRisk: false,
       vanguardSessionId: undefined,
       legacySessionId: undefined,

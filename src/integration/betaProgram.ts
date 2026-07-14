@@ -244,6 +244,7 @@ export interface AresBetaGateResult {
 export interface AresBetaEvaluationReport {
   readonly version: typeof ARES_BETA_PROGRAM_VERSION;
   readonly planSha256: string;
+  readonly candidateEpochSha256: string;
   readonly authorityPolicySha256: string;
   readonly evaluatedAt: string;
   readonly status: "invalid" | "incomplete" | "stop" | "failed" | "attestation_required" | "passed";
@@ -262,6 +263,12 @@ export interface AresBetaEvaluationReport {
   readonly evaluationSha256: string;
   readonly certificationStatement: string;
   readonly authorityAttestation?: AresBetaAuthoritySignature;
+}
+
+/** Out-of-band binding supplied by the deployment gate when the full plan is unavailable. */
+export interface AresBetaCertificationTarget {
+  readonly planSha256: string;
+  readonly candidateEpochSha256: string;
 }
 
 const WAVES: readonly AresBetaWave[] = ["A", "B", "C", "D"];
@@ -545,12 +552,14 @@ export function evaluateAresBetaProgram(
   authorityAttestation?: AresBetaAuthoritySignature,
 ): AresBetaEvaluationReport {
   let planSha256 = "0".repeat(64);
+  let candidateEpochSha256 = "0".repeat(64);
   let authorityPolicySha256 = "0".repeat(64);
   let evaluatedAtMs = 0;
   try {
     validateAresBetaAuthorityPolicy(authorityPolicy);
     authorityPolicySha256 = aresBetaAuthorityPolicyDigest(authorityPolicy);
     planSha256 = aresBetaPlanDigest(plan);
+    candidateEpochSha256 = aresBetaCandidateEpochDigest(plan.waves[0]!);
     if (canonicalJson(plan.evaluator) !== canonicalJson(authorityPolicy.evaluator)) {
       throw new Error("Plan evaluator is not pinned by the external authority policy.");
     }
@@ -565,7 +574,14 @@ export function evaluateAresBetaProgram(
     if (evaluatedAtMs < Date.parse(plan.frozenAt)) throw new Error("Evaluation precedes the frozen beta plan.");
     if (evaluatedAtMs > Date.now() + 5 * 60 * 1_000) throw new Error("Evaluation clock is in the future.");
   } catch (error) {
-    return invalidReport(planSha256, evaluatedAt, safeError(error), ledger, authorityPolicySha256);
+    return invalidReport(
+      planSha256,
+      evaluatedAt,
+      safeError(error),
+      ledger,
+      authorityPolicySha256,
+      candidateEpochSha256,
+    );
   }
 
   const blockers: string[] = [];
@@ -606,7 +622,14 @@ export function evaluateAresBetaProgram(
       );
     }
   } catch (error) {
-    return invalidReport(planSha256, evaluatedAt, safeError(error), ledger, authorityPolicySha256);
+    return invalidReport(
+      planSha256,
+      evaluatedAt,
+      safeError(error),
+      ledger,
+      authorityPolicySha256,
+      candidateEpochSha256,
+    );
   }
   const frozenAtMs = Date.parse(plan.frozenAt);
   if (controls.some((entry) => {
@@ -838,6 +861,7 @@ export function evaluateAresBetaProgram(
   const evaluationCore = {
     version: 1,
     planSha256,
+    candidateEpochSha256,
     authorityPolicySha256,
     evaluatedAt,
     complete,
@@ -859,6 +883,7 @@ export function evaluateAresBetaProgram(
     authorityPolicySha256,
     evaluationSha256,
     planSha256,
+    candidateEpochSha256,
     ledgerHeadHash,
     String(ledger.length),
     evaluatedAt,
@@ -873,7 +898,14 @@ export function evaluateAresBetaProgram(
       passed = true;
       status = "passed";
     } catch (error) {
-      return invalidReport(planSha256, evaluatedAt, safeError(error), ledger, authorityPolicySha256);
+      return invalidReport(
+        planSha256,
+        evaluatedAt,
+        safeError(error),
+        ledger,
+        authorityPolicySha256,
+        candidateEpochSha256,
+      );
     }
   }
   return {
@@ -890,10 +922,12 @@ export function evaluateAresBetaProgram(
 export function verifyAresBetaEvaluationReport(
   report: AresBetaEvaluationReport,
   authorityPolicy: AresBetaAuthorityPolicy,
+  expected: AresBetaPlan | AresBetaCertificationTarget,
 ): void {
   validateAresBetaAuthorityPolicy(authorityPolicy);
+  const target = resolveCertificationTarget(expected);
   exactKeys(report, [
-    "version", "planSha256", "authorityPolicySha256", "evaluatedAt", "status", "complete", "passed", "stopEnrollment",
+    "version", "planSha256", "candidateEpochSha256", "authorityPolicySha256", "evaluatedAt", "status", "complete", "passed", "stopEnrollment",
     "expectedAttempts", "recordedAttempts", "missingAttempts", "duplicateAttempts", "ledgerEntryCount",
     "ledgerHeadHash", "invalidatedWaves", "blockers", "gates", "evaluationSha256",
     "certificationStatement", "authorityAttestation",
@@ -901,6 +935,10 @@ export function verifyAresBetaEvaluationReport(
   if (report.status !== "passed" || !report.passed || !report.complete || report.stopEnrollment
     || report.authorityAttestation === undefined) {
     throw new Error("Beta report is not an authority-certified passing report.");
+  }
+  if (report.planSha256 !== target.planSha256
+    || report.candidateEpochSha256 !== target.candidateEpochSha256) {
+    throw new Error("Beta report is detached from the expected frozen plan or candidate epoch.");
   }
   const {
     status: _status,
@@ -922,12 +960,31 @@ export function verifyAresBetaEvaluationReport(
     expectedPolicySha256,
     expectedDigest,
     report.planSha256,
+    report.candidateEpochSha256,
     report.ledgerHeadHash,
     String(report.ledgerEntryCount),
     report.evaluatedAt,
   ].join("\n");
   if (certificationStatement !== expectedStatement) throw new Error("Beta report certification statement is detached.");
   verifyAuthoritySignature(authorityPolicy.authority, expectedStatement, authorityAttestation);
+}
+
+function resolveCertificationTarget(
+  expected: AresBetaPlan | AresBetaCertificationTarget,
+): AresBetaCertificationTarget {
+  if (expected !== null && typeof expected === "object"
+    && Object.prototype.hasOwnProperty.call(expected, "waves")) {
+    const plan = expected as AresBetaPlan;
+    return {
+      planSha256: aresBetaPlanDigest(plan),
+      candidateEpochSha256: aresBetaCandidateEpochDigest(plan.waves[0]!),
+    };
+  }
+  exactKeys(expected, ["planSha256", "candidateEpochSha256"], "beta certification target");
+  const target = expected as AresBetaCertificationTarget;
+  sha256(target.planSha256, "planSha256");
+  sha256(target.candidateEpochSha256, "candidateEpochSha256");
+  return target;
 }
 
 function validateWaveTiming(
@@ -1011,9 +1068,7 @@ function validateTrustRoot(root: AresBetaEvaluatorTrustRoot): void {
   exactKeys(root, ["evaluatorId", "keyId", "publicKeyPem"], "evaluator trust root");
   opaqueId(root.evaluatorId, "e", "evaluatorId");
   opaqueId(root.keyId, "k", "keyId");
-  if (typeof root.publicKeyPem !== "string" || root.publicKeyPem.length > 10_000) throw new Error("Evaluator key is invalid.");
-  const key = createPublicKey(root.publicKeyPem);
-  if (key.asymmetricKeyType !== "ed25519") throw new Error("Evaluator key must be Ed25519.");
+  canonicalEd25519PublicKey(root.publicKeyPem, "Evaluator");
 }
 
 function validateAuthorityRoot(root: AresBetaAuthorityTrustRoot): void {
@@ -1045,19 +1100,40 @@ function verifyAuthoritySignature(
 }
 
 function validateEd25519PublicKey(publicKeyPem: string, name: string): void {
-  if (typeof publicKeyPem !== "string" || publicKeyPem.length > 10_000) throw new Error(`${name} key is invalid.`);
-  const key = createPublicKey(publicKeyPem);
-  if (key.asymmetricKeyType !== "ed25519") throw new Error(`${name} key must be Ed25519.`);
+  canonicalEd25519PublicKey(publicKeyPem, name);
 }
 
 function canonicalPublicKeyDer(publicKeyPem: string): Buffer {
-  return Buffer.from(createPublicKey(publicKeyPem).export({ type: "spki", format: "der" }));
+  return Buffer.from(canonicalEd25519PublicKey(publicKeyPem, "Trust root")
+    .export({ type: "spki", format: "der" }));
+}
+
+function canonicalEd25519PublicKey(publicKeyPem: string, name: string): ReturnType<typeof createPublicKey> {
+  if (typeof publicKeyPem !== "string" || publicKeyPem.length > 10_000) {
+    throw new Error(`${name} key is invalid.`);
+  }
+  let key: ReturnType<typeof createPublicKey>;
+  try {
+    key = createPublicKey(publicKeyPem);
+  } catch {
+    throw new Error(`${name} key must be canonical SPKI PUBLIC KEY PEM.`);
+  }
+  if (key.asymmetricKeyType !== "ed25519") throw new Error(`${name} key must be Ed25519.`);
+  const canonicalPem = key.export({ type: "spki", format: "pem" }).toString();
+  // Normalize transport line endings only. Headers, payload wrapping, trailing
+  // newline, and the absence of extra PEM blocks must match Node's SPKI export.
+  // A PKCS#8 private key or certificate may be accepted by createPublicKey(),
+  // but can never equal this canonical PUBLIC KEY representation.
+  if (publicKeyPem.replace(/\r\n/g, "\n") !== canonicalPem) {
+    throw new Error(`${name} key must be canonical SPKI PUBLIC KEY PEM.`);
+  }
+  return key;
 }
 
 function verifyEd25519Signature(publicKeyPem: string, statement: string, signatureBase64: string, name: string): void {
   const bytes = Buffer.from(signatureBase64, "base64");
   if (bytes.toString("base64") !== signatureBase64
-    || !verifySignature(null, Buffer.from(statement, "utf8"), createPublicKey(publicKeyPem), bytes)) {
+    || !verifySignature(null, Buffer.from(statement, "utf8"), canonicalEd25519PublicKey(publicKeyPem, name), bytes)) {
     throw new Error(`${name} signature is invalid.`);
   }
 }
@@ -1274,7 +1350,12 @@ function verifyEvidenceSignature(
   }
   const bytes = Buffer.from(signature.signatureBase64, "base64");
   if (bytes.toString("base64") !== signature.signatureBase64
-    || !verifySignature(null, Buffer.from(statement, "utf8"), createPublicKey(trust.publicKeyPem), bytes)) {
+    || !verifySignature(
+      null,
+      Buffer.from(statement, "utf8"),
+      canonicalEd25519PublicKey(trust.publicKeyPem, "Evaluator"),
+      bytes,
+    )) {
     throw new Error("Beta evidence signature is invalid.");
   }
 }
@@ -1285,10 +1366,12 @@ function invalidReport(
   blocker: string,
   ledger: readonly AresBetaLedgerEntry[] = [],
   authorityPolicySha256 = "0".repeat(64),
+  candidateEpochSha256 = "0".repeat(64),
 ): AresBetaEvaluationReport {
   const core = {
     version: 1,
     planSha256,
+    candidateEpochSha256,
     authorityPolicySha256,
     evaluatedAt: typeof evaluatedAt === "string" ? evaluatedAt : "invalid",
     complete: false,

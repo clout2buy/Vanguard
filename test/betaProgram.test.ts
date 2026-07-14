@@ -3,6 +3,7 @@ import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import test from "node:test";
 import {
   ARES_BETA_LEDGER_GENESIS,
+  aresBetaCandidateEpochDigest,
   aresBetaPlanAuthorizationStatement,
   aresBetaPlanDigest,
   aresBetaWaveFreezeDigest,
@@ -48,7 +49,7 @@ test("a complete ledger requires an externally pinned authority before it can pa
   );
   assert.equal(certified.status, "passed");
   assert.equal(certified.passed, true);
-  assert.doesNotThrow(() => verifyAresBetaEvaluationReport(certified, fixture.policy));
+  assert.doesNotThrow(() => verifyAresBetaEvaluationReport(certified, fixture.policy, fixture.plan));
 });
 
 test("self-declared evaluator or authority roots cannot certify the program", () => {
@@ -89,6 +90,32 @@ test("authority and evaluator require distinct identities and canonical public k
       publicKeyPem: sameKeyDifferentPem,
     },
   }), /distinct Ed25519 keys/i);
+});
+
+test("authority and evaluator trust roots reject private and non-SPKI PEM containers", () => {
+  const fixture = buildFixture();
+  const evaluatorPrivatePem = evaluatorKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  const authorityPrivatePem = authorityKeys.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  assert.throws(() => validateAresBetaAuthorityPolicy({
+    ...fixture.policy,
+    evaluator: { ...fixture.policy.evaluator, publicKeyPem: evaluatorPrivatePem },
+  }), /SPKI PUBLIC KEY/i);
+  assert.throws(() => validateAresBetaAuthorityPolicy({
+    ...fixture.policy,
+    authority: { ...fixture.policy.authority, publicKeyPem: authorityPrivatePem },
+  }), /SPKI PUBLIC KEY/i);
+  assert.throws(() => validateAresBetaPlan({
+    ...fixture.plan,
+    evaluator: { ...fixture.plan.evaluator, publicKeyPem: evaluatorPrivatePem },
+  }), /SPKI PUBLIC KEY/i);
+
+  const certificateContainer = fixture.policy.authority.publicKeyPem
+    .replace("BEGIN PUBLIC KEY", "BEGIN CERTIFICATE")
+    .replace("END PUBLIC KEY", "END CERTIFICATE");
+  assert.throws(() => validateAresBetaAuthorityPolicy({
+    ...fixture.policy,
+    authority: { ...fixture.policy.authority, publicKeyPem: certificateContainer },
+  }), /SPKI PUBLIC KEY/i);
 });
 
 test("omission, duplication, reassignment, and partial denominators never pass", () => {
@@ -292,11 +319,11 @@ test("edited or detached certified reports fail verification", () => {
   assert.throws(() => verifyAresBetaEvaluationReport({
     ...certified,
     recordedAttempts: 199,
-  }, fixture.policy), /digest|detached|edited/i);
+  }, fixture.policy, fixture.plan), /digest|detached|edited/i);
   assert.throws(() => verifyAresBetaEvaluationReport({
     ...certified,
     ledgerHeadHash: sha("other-ledger"),
-  }, fixture.policy), /digest|detached|edited/i);
+  }, fixture.policy, fixture.plan), /digest|detached|edited/i);
   const changedPolicy: AresBetaAuthorityPolicy = {
     ...fixture.policy,
     evaluator: {
@@ -305,7 +332,33 @@ test("edited or detached certified reports fail verification", () => {
       publicKeyPem: foreignAuthorityKeys.publicKey.export({ type: "spki", format: "pem" }).toString(),
     },
   };
-  assert.throws(() => verifyAresBetaEvaluationReport(certified, changedPolicy), /policy|detached/i);
+  assert.throws(() => verifyAresBetaEvaluationReport(certified, changedPolicy, fixture.plan), /policy|detached/i);
+
+  const { authorization: _authorization, ...unsignedA } = fixture.plan;
+  const unsignedB: AresBetaUnsignedPlan = {
+    ...unsignedA,
+    waves: unsignedA.waves.map((wave) => ({
+      ...wave,
+      vanguardPackageSha256: sha("different-candidate-package"),
+    })),
+  };
+  const planB: AresBetaPlan = {
+    ...unsignedB,
+    authorization: authoritySignature(authoritySigner(aresBetaPlanAuthorizationStatement(unsignedB))),
+  };
+  assert.doesNotThrow(() => validateAresBetaPlan(planB));
+  assert.throws(
+    () => verifyAresBetaEvaluationReport(certified, fixture.policy, planB),
+    /expected frozen plan|candidate epoch|detached/i,
+  );
+  assert.doesNotThrow(() => verifyAresBetaEvaluationReport(certified, fixture.policy, {
+    planSha256: aresBetaPlanDigest(fixture.plan),
+    candidateEpochSha256: aresBetaCandidateEpochDigest(fixture.plan.waves[0]!),
+  }));
+  assert.throws(() => verifyAresBetaEvaluationReport(certified, fixture.policy, {
+    planSha256: aresBetaPlanDigest(planB),
+    candidateEpochSha256: aresBetaCandidateEpochDigest(planB.waves[0]!),
+  }), /expected frozen plan|candidate epoch|detached/i);
 });
 
 test("forbidden raw fields and hash-chain tampering are invalid", () => {

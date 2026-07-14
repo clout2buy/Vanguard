@@ -520,6 +520,79 @@ test("malformed resume/status responses retain the worker ID and attempt cancell
   }
 });
 
+test("a post-resume rollout flip requires an exact generation and owner stop receipt", async () => {
+  const stopped = new FakeVanguard();
+  const existing = await stopped.create(config, "op_resume_policy_flip_exact_stop_0001");
+  stopped.advance(existing.sessionId, "already running");
+  let stoppedPolicy = rollout;
+  stopped.afterEventsSnapshot = () => { stoppedPolicy = { ...rollout, enabled: false }; };
+  const stoppedAdapter = new AresVanguardAdapter({
+    vanguard: stopped,
+    legacy: new FakeLegacy(),
+    rollout: () => stoppedPolicy,
+  });
+  const safelyRejected = await stoppedAdapter.resume({
+    actorId: "returning-user",
+    optedIn: true,
+    vanguardSessionRoot: existing.sessionRoot,
+    legacy: { sessionRoot: "legacy-token" },
+  });
+  assert.equal(safelyRejected.route, "manual_recovery");
+  assert.equal(stopped.stopAndWaitCalls, 1);
+  assert.equal((await stoppedAdapter.shutdown()).complete, true);
+
+  const stale = new FakeVanguard();
+  const staleExisting = await stale.create(config, "op_resume_policy_flip_stale_stop_0002");
+  stale.advance(staleExisting.sessionId, "already running");
+  stale.stopReceiptWorkerGeneration = 0;
+  stale.stopReceiptOwnerEpoch = 99;
+  let stalePolicy = rollout;
+  stale.afterEventsSnapshot = () => { stalePolicy = { ...rollout, enabled: false }; };
+  const staleAdapter = new AresVanguardAdapter({
+    vanguard: stale,
+    legacy: new FakeLegacy(),
+    rollout: () => stalePolicy,
+    barrierTimeoutMs: 20,
+  });
+  const unsafeRejection = await staleAdapter.resume({
+    actorId: "returning-user",
+    optedIn: true,
+    vanguardSessionRoot: staleExisting.sessionRoot,
+    legacy: { sessionRoot: "legacy-token" },
+  });
+  assert.equal(unsafeRejection.route, "manual_recovery");
+  assert.equal(stale.stopAndWaitCalls >= 1, true);
+  const staleShutdown = await staleAdapter.shutdown();
+  assert.equal(staleShutdown.complete, false);
+  assert.equal(staleShutdown.unresolvedForeignOperations > 0, true);
+});
+
+test("resume replay failure proves the known worker stopped or permanently poisons the barrier", async () => {
+  const vanguard = new FakeVanguard();
+  const existing = await vanguard.create(config, "op_resume_replay_stale_stop_0003");
+  vanguard.advance(existing.sessionId, "already running");
+  vanguard.emit(existing.sessionId, publicEvent("agent.message", { message: "history" }), false);
+  vanguard.crossSessionReplay = true;
+  vanguard.stopReceiptWorkerGeneration = 0;
+  const adapter = new AresVanguardAdapter({
+    vanguard,
+    legacy: new FakeLegacy(),
+    rollout,
+    barrierTimeoutMs: 20,
+  });
+  const resumed = await adapter.resume({
+    actorId: "returning-user",
+    optedIn: true,
+    vanguardSessionRoot: existing.sessionRoot,
+    legacy: { sessionRoot: "legacy-token" },
+  });
+  assert.equal(resumed.route, "manual_recovery");
+  assert.equal(vanguard.stopAndWaitCalls >= 1, true);
+  const report = await adapter.shutdown();
+  assert.equal(report.complete, false);
+  assert.equal(report.unresolvedForeignOperations > 0, true);
+});
+
 test("push overflow reconciliation includes events arriving during the final replay fetch", async () => {
   const vanguard = new FakeVanguard();
   const adapter = new AresVanguardAdapter({
@@ -1180,6 +1253,40 @@ test("kill-switch and shutdown barriers stay incomplete without authoritative wo
   assert.equal((await staleAdapter.shutdown()).complete, false);
 });
 
+test("terminal task events cannot clear independently active worker ownership", async () => {
+  const contained = new FakeVanguard();
+  const containedAdapter = new AresVanguardAdapter({
+    vanguard: contained,
+    legacy: new FakeLegacy(),
+    rollout,
+    barrierTimeoutMs: 20,
+  });
+  const containedSession = await containedAdapter.create(input(true));
+  await containedAdapter.send(containedSession.sessionId, "finish while the worker drains");
+  contained.emit(contained.onlySessionId(), publicEvent("run.completed"));
+  assert.equal((await containedAdapter.events(containedSession.sessionId)).events.at(-1)?.kind, "turn.completed");
+  const containedReport = await containedAdapter.shutdown();
+  assert.equal(containedReport.complete, true);
+  assert.equal(contained.stopAndWaitCalls >= 1, true, "terminal task state still requires worker-stop proof");
+
+  const unproven = new FakeVanguard();
+  const unprovenAdapter = new AresVanguardAdapter({
+    vanguard: unproven,
+    legacy: new FakeLegacy(),
+    rollout,
+    barrierTimeoutMs: 20,
+  });
+  const unprovenSession = await unprovenAdapter.create(input(true));
+  await unprovenAdapter.send(unprovenSession.sessionId, "finish while the worker drains");
+  unproven.emit(unproven.onlySessionId(), publicEvent("run.completed"));
+  await unprovenAdapter.events(unprovenSession.sessionId);
+  unproven.stopReceiptStopped = false;
+  const unprovenReport = await unprovenAdapter.shutdown();
+  assert.equal(unprovenReport.complete, false);
+  assert.equal(unprovenReport.unresolvedSessions > 0, true);
+  assert.equal(unproven.stopAndWaitCalls >= 1, true);
+});
+
 test("shutdown cannot lose unpublished Vanguard or legacy workers whose stop proof fails", async () => {
   const containable = new FakeVanguard();
   let releaseContainable!: () => void;
@@ -1249,14 +1356,14 @@ test("concurrent creation honors capacity reservations and shutdown interrupts o
   await adapter.send(created.sessionId, "active work");
   await adapter.shutdown();
   assert.equal(vanguard.cancelCalls, 1);
-  assert.equal(vanguard.stopAndWaitCalls, 2, "both shutdown race checks require lifecycle receipts");
+  assert.equal(vanguard.stopAndWaitCalls, 1, "one exact receipt clears the unchanged worker generation");
 
   const legacy = new FakeLegacy();
   const legacyAdapter = new AresVanguardAdapter({ vanguard: new FakeVanguard(), legacy });
   const legacySession = await legacyAdapter.create(input(false));
   await legacyAdapter.send(legacySession.sessionId, "active legacy work");
   await legacyAdapter.shutdown();
-  assert.equal(legacy.interruptCalls, 2);
+  assert.equal(legacy.interruptCalls, 1);
 });
 
 class FakeRouteClaimStore implements AresRouteClaimStorePort {
