@@ -37,6 +37,15 @@ export interface CodingSession {
   readonly createdAt: string;
 }
 
+export interface MaterializeSessionWorkspaceOptions {
+  /**
+   * Narrow injection seam for deterministic filesystem-race tests. Production
+   * callers should use the default copier by omitting this option.
+   * @internal
+   */
+  readonly copyWorkspace?: (sourceRoot: string, destinationRoot: string) => Promise<void>;
+}
+
 export async function createCodingSession(source: string): Promise<CodingSession> {
   return materializeSessionWorkspace(await createSessionShell(source));
 }
@@ -123,20 +132,30 @@ export async function createSessionShellAt(
  * prepared under a sibling temporary name and renamed into place, so a crash
  * cannot expose a half-materialized execution workspace. A content-addressed
  * baseline is captured at exactly the same boundary for later drift checks.
+ * Fingerprints bracketing the copy must agree with the staged tree, preventing
+ * a source mutation from publishing a mixed-time workspace snapshot.
  */
-export async function materializeSessionWorkspace(session: CodingSession): Promise<CodingSession> {
+export async function materializeSessionWorkspace(
+  session: CodingSession,
+  options: MaterializeSessionWorkspaceOptions = {},
+): Promise<CodingSession> {
   if (session.materialized) return session;
   const container = await realpath(path.dirname(session.metadataFile));
   if (path.dirname(session.workspaceRoot) !== container) throw new Error("Session workspace is outside its container.");
+  const sourceFingerprintBeforeCopy = await fingerprintSessionSource(session.sourceRoot);
   const sourceChanged = session.sourceFingerprint !== undefined
-    && await fingerprintSessionSource(session.sourceRoot) !== session.sourceFingerprint;
+    && sourceFingerprintBeforeCopy !== session.sourceFingerprint;
   const temporary = path.join(container, `.workspace-${randomUUID()}.tmp`);
   try {
-    await cp(session.sourceRoot, temporary, {
-      recursive: true,
-      verbatimSymlinks: true,
-      filter: shouldCopy,
-    });
+    await (options.copyWorkspace ?? copySessionWorkspace)(session.sourceRoot, temporary);
+    const sourceFingerprintAfterCopy = await fingerprintSessionSource(session.sourceRoot);
+    if (sourceFingerprintAfterCopy !== sourceFingerprintBeforeCopy) {
+      throw new Error("Source changed while materializing the session workspace; no workspace was published.");
+    }
+    const copiedFingerprint = await fingerprintSessionSource(temporary);
+    if (copiedFingerprint !== sourceFingerprintAfterCopy) {
+      throw new Error("Materialized workspace copy does not match the source; no workspace was published.");
+    }
     const baseline = await snapshotTree(temporary);
     await rm(session.workspaceRoot, { recursive: true, force: true });
     await rename(temporary, session.workspaceRoot);
@@ -151,6 +170,14 @@ export async function materializeSessionWorkspace(session: CodingSession): Promi
   };
   await writeSessionMetadata(materialized);
   return materialized;
+}
+
+async function copySessionWorkspace(sourceRoot: string, destinationRoot: string): Promise<void> {
+  await cp(sourceRoot, destinationRoot, {
+    recursive: true,
+    verbatimSymlinks: true,
+    filter: shouldCopy,
+  });
 }
 
 /** Creates an isolated child at an already captured checkpoint. */
