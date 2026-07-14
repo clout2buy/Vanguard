@@ -7,7 +7,7 @@ import type { AgentKernel as AgentKernelType, RunOutcome } from "./kernel/run.js
 import { logicalRunEvents } from "./kernel/logicalHistory.js";
 import { nodePermissionFlag, resolveNodePackageManagerAlias } from "./runtime/nodePackageManager.js";
 import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
-import { SESSION_EXCLUDED_DIRECTORIES, snapshotTree } from "./runtime/treeSnapshot.js";
+import { SESSION_EXCLUDED_DIRECTORIES, TreeSnapshotCache, snapshotTree } from "./runtime/treeSnapshot.js";
 import {
   AgentKernel,
   CheckpointTool,
@@ -17,6 +17,7 @@ import {
   HttpModelAdapter,
   ImageInspectionTool,
   JournalEvidenceResolver,
+  GlobTool,
   ListFilesTool,
   ProcessTool,
   ReadFileTool,
@@ -404,6 +405,7 @@ function buildConversationRuntime(
     tools: [
       new ListFilesTool(source),
       new SearchTextTool(source),
+      new GlobTool(source),
       new ReadFileTool(source, 1_000_000, versions),
       new RepositoryMapTool(source, { includeInstructions: !options.disableExtensions }),
       new ImageInspectionTool(source),
@@ -552,6 +554,7 @@ async function buildExecutionRuntime(
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
+      new GlobTool(workspace),
       new ReadFileTool(workspace, 1_000_000, versions),
       new WriteFileTool(workspace, versions, mutationPolicy),
       new ReplaceTextTool(workspace, versions, mutationPolicy),
@@ -570,9 +573,15 @@ async function buildExecutionRuntime(
     journal,
     workingState,
     workspaceState: {
-      fingerprint: async () => (await snapshotTree(session.workspaceRoot, {
-        excludedDirectories: SESSION_EXCLUDED_DIRECTORIES,
-      })).rootHash,
+      fingerprint: (() => {
+        // One stat-validated cache per built runtime: boundary fingerprints
+        // run several times per step, and only changed files need re-hashing.
+        const fingerprintCache = new TreeSnapshotCache();
+        return async () => (await snapshotTree(session.workspaceRoot, {
+          excludedDirectories: SESSION_EXCLUDED_DIRECTORIES,
+          cache: fingerprintCache,
+        })).rootHash;
+      })(),
     },
     plan,
     completionGates: [{ blockers: () => delegation.completionBlockers() }],

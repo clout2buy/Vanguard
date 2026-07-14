@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { TextDecoder } from "node:util";
+import vm from "node:vm";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
@@ -9,8 +10,8 @@ import { WorkspaceMutationPolicy } from "./mutationPolicy.js";
 import { WorkspaceVersionLedger } from "./versionLedger.js";
 
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
-const DEFAULT_READ_PAGE_BYTES = 8 * 1024;
-const MAX_READ_PAGE_BYTES = 32 * 1024;
+const DEFAULT_READ_PAGE_BYTES = 64 * 1024;
+const MAX_READ_PAGE_BYTES = 128 * 1024;
 const READ_CURSOR_VERSION = 1;
 
 interface ReadByteRange {
@@ -255,7 +256,9 @@ export class ReplaceTextTool implements ToolPort {
     if (occurrences !== 1) {
       return { ok: false, output: { error: "Replacement target must occur exactly once.", occurrences } };
     }
-    const updated = contents.replace(before, after);
+    // A function replacement keeps `after` byte-literal: string replacement
+    // would reinterpret $&, $', $`, and $$ as substitution patterns.
+    const updated = contents.replace(before, () => after);
     await atomicWrite(this.workspace.lexical(relativePath), updated);
     this.versions?.record(relativePath, contentHash(updated));
     return {
@@ -349,15 +352,33 @@ export class ListFilesTool implements ToolPort {
   }
 }
 
+type SearchMatch = { [key: string]: JsonValue };
+
+const MAX_SEARCH_PATTERN_LENGTH = 512;
+const MAX_SEARCH_CONTEXT_LINES = 5;
+const REGEX_FILE_TIMEOUT_MS = 250;
+const REGEX_SEARCH_BUDGET_MS = 5_000;
+
 export class SearchTextTool implements ToolPort {
   readonly name = "workspace.search";
   readonly definition = toolDefinition(
     this.name,
-    "Search bounded UTF-8 workspace files for literal text and return source locations.",
+    "Search bounded UTF-8 workspace files for literal text (default) or a regular expression, and return source locations with optional context lines.",
     {
-      query: { type: "string", description: "Literal text to find." },
+      query: { type: "string", description: "Literal text, or a JavaScript regular expression when regex is true." },
       path: { type: "string", description: "Optional workspace-relative directory." },
       caseSensitive: { type: "boolean", description: "Whether letter case must match; defaults to true." },
+      regex: { type: "boolean", description: "Interpret query as a regular expression matched per line; defaults to false." },
+      filePattern: {
+        type: "string",
+        description: "Optional glob restricting searched files, e.g. 'src/**/*.ts' or '*.java'. A pattern without '/' matches file names anywhere.",
+      },
+      context: {
+        type: "integer",
+        minimum: 0,
+        maximum: MAX_SEARCH_CONTEXT_LINES,
+        description: "Lines of surrounding context to include with each match; defaults to 0.",
+      },
     },
     ["query"],
     "observe",
@@ -371,16 +392,45 @@ export class SearchTextTool implements ToolPort {
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
+    rejectUnknownFields(fields, ["query", "path", "caseSensitive", "regex", "filePattern", "context"], this.name);
     const query = stringField(fields, "query");
     const requested = fields.path === undefined ? "." : stringField(fields, "path");
-    const caseSensitive = fields.caseSensitive === undefined ? true : fields.caseSensitive;
-    if (typeof caseSensitive !== "boolean") throw new Error("Field 'caseSensitive' must be a boolean.");
+    const caseSensitive = optionalBooleanField(fields, "caseSensitive") ?? true;
+    const useRegex = optionalBooleanField(fields, "regex") ?? false;
+    const contextLines = optionalIntegerField(fields, "context") ?? 0;
+    if (contextLines < 0 || contextLines > MAX_SEARCH_CONTEXT_LINES) {
+      throw new Error(`Field 'context' must be an integer from 0 through ${MAX_SEARCH_CONTEXT_LINES}.`);
+    }
     if (query.length === 0) return { ok: false, output: { error: "Search query cannot be empty." } };
+    if (query.length > MAX_SEARCH_PATTERN_LENGTH) {
+      return { ok: false, output: { error: "Search query exceeds the pattern length limit.", limit: MAX_SEARCH_PATTERN_LENGTH } };
+    }
+
+    let pathFilter: ((relative: string) => boolean) | undefined;
+    if (fields.filePattern !== undefined) {
+      const pattern = stringField(fields, "filePattern");
+      try {
+        pathFilter = compileGlob(pattern);
+      } catch (error) {
+        return { ok: false, output: { error: `Invalid file pattern: ${(error as Error).message}` } };
+      }
+    }
+
+    let matcher: LineMatcher;
+    if (useRegex) {
+      try {
+        matcher = compileRegexMatcher(query, caseSensitive);
+      } catch (error) {
+        return { ok: false, output: { error: `Invalid regular expression: ${(error as Error).message}` } };
+      }
+    } else {
+      matcher = literalMatcher(query, caseSensitive);
+    }
 
     const root = await this.workspace.existing(requested);
     const queue = [root];
-    const matches: Array<{ path: string; line: number; column: number; text: string }> = [];
-    const needle = caseSensitive ? query : query.toLocaleLowerCase();
+    const matches: SearchMatch[] = [];
+    const deadline = Date.now() + REGEX_SEARCH_BUDGET_MS;
     let truncated = false;
 
     while (queue.length > 0 && !truncated) {
@@ -395,21 +445,39 @@ export class SearchTextTool implements ToolPort {
         }
         if (entry.isDirectory()) continue;
         if (!entry.isFile()) continue;
+        const relative = normalizeToolPath(path.relative(this.workspace.root, absolute));
+        if (pathFilter !== undefined && !pathFilter(relative)) continue;
         const metadata = await stat(absolute);
         if (metadata.size > this.maxFileBytes) continue;
         const buffer = await readFile(absolute);
         if (buffer.includes(0)) continue;
+        if (useRegex && Date.now() > deadline) {
+          return { ok: false, output: { error: "Regex search exceeded its time budget; narrow the pattern, path, or filePattern.", matches, truncated: true } };
+        }
         const lines = buffer.toString("utf8").split(/\r?\n/u);
-        for (let index = 0; index < lines.length; index += 1) {
-          const line = lines[index] ?? "";
-          const haystack = caseSensitive ? line : line.toLocaleLowerCase();
-          const column = haystack.indexOf(needle);
-          if (column === -1) continue;
+        let fileHits: ReadonlyArray<{ line: number; column: number }>;
+        try {
+          fileHits = matcher(lines, this.maxResults - matches.length);
+        } catch (error) {
+          if (isRegexTimeout(error)) {
+            return { ok: false, output: { error: `Regular expression is too expensive: matching timed out in ${relative}. Simplify the pattern.` } };
+          }
+          throw error;
+        }
+        // A trailing newline makes split produce one empty final segment that
+        // is not a real source line; keep it out of context windows.
+        const lineCount = lines.at(-1) === "" ? lines.length - 1 : lines.length;
+        for (const hit of fileHits) {
+          const line = lines[hit.line] ?? "";
           matches.push({
-            path: path.relative(this.workspace.root, absolute),
-            line: index + 1,
-            column: column + 1,
+            path: relative,
+            line: hit.line + 1,
+            column: hit.column + 1,
             text: line.slice(0, 500),
+            ...(contextLines > 0 ? {
+              before: lines.slice(Math.max(0, hit.line - contextLines), hit.line).map((value) => value.slice(0, 500)),
+              after: lines.slice(hit.line + 1, Math.min(lineCount, hit.line + 1 + contextLines)).map((value) => value.slice(0, 500)),
+            } : {}),
           });
           if (matches.length >= this.maxResults) {
             truncated = true;
@@ -422,6 +490,199 @@ export class SearchTextTool implements ToolPort {
 
     return { ok: true, output: { matches, truncated } };
   }
+}
+
+export class GlobTool implements ToolPort {
+  readonly name = "workspace.glob";
+  readonly definition = toolDefinition(
+    this.name,
+    "List workspace files matching a glob pattern, e.g. 'src/**/*.ts' or '*.md'. A pattern without '/' matches file names anywhere.",
+    {
+      pattern: { type: "string", description: "Glob pattern with *, **, ?, and character classes." },
+      path: { type: "string", description: "Optional workspace-relative directory; defaults to the root." },
+    },
+    ["pattern"],
+    "observe",
+  );
+
+  constructor(
+    private readonly workspace: WorkspaceBoundary,
+    private readonly maxEntries = 5_000,
+  ) {}
+
+  async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
+    const fields = objectInput(input);
+    rejectUnknownFields(fields, ["pattern", "path"], this.name);
+    const pattern = stringField(fields, "pattern");
+    const requested = fields.path === undefined ? "." : stringField(fields, "path");
+    let matches: (relative: string) => boolean;
+    try {
+      matches = compileGlob(pattern);
+    } catch (error) {
+      return { ok: false, output: { error: `Invalid glob pattern: ${(error as Error).message}` } };
+    }
+
+    const root = await this.workspace.existing(requested);
+    const rootRelativePrefix = normalizeToolPath(path.relative(this.workspace.root, root));
+    const files: string[] = [];
+    const queue = [root];
+    let scanned = 0;
+    let truncated = false;
+
+    while (queue.length > 0 && !truncated) {
+      const directory = queue.shift();
+      if (directory === undefined) break;
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        const absolute = path.join(directory, entry.name);
+        if (entry.isSymbolicLink()) continue;
+        if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) queue.push(absolute);
+        if (!entry.isFile()) continue;
+        scanned += 1;
+        if (scanned > this.maxEntries * 20) {
+          truncated = true;
+          break;
+        }
+        const workspaceRelative = normalizeToolPath(path.relative(this.workspace.root, absolute));
+        // Patterns are evaluated relative to the searched directory so
+        // 'src/**/*.ts' behaves the same from the root and from src's parent.
+        const patternRelative = rootRelativePrefix === ""
+          ? workspaceRelative
+          : workspaceRelative.slice(rootRelativePrefix.length + 1);
+        if (!matches(patternRelative)) continue;
+        files.push(workspaceRelative);
+        if (files.length >= this.maxEntries) {
+          truncated = true;
+          break;
+        }
+      }
+    }
+
+    files.sort();
+    return { ok: true, output: { files, truncated } };
+  }
+}
+
+type LineMatcher = (lines: readonly string[], remaining: number) => ReadonlyArray<{ line: number; column: number }>;
+
+function literalMatcher(query: string, caseSensitive: boolean): LineMatcher {
+  const needle = caseSensitive ? query : query.toLocaleLowerCase();
+  return (lines, remaining) => {
+    const hits: Array<{ line: number; column: number }> = [];
+    for (let index = 0; index < lines.length && hits.length < remaining; index += 1) {
+      const line = lines[index] ?? "";
+      const haystack = caseSensitive ? line : line.toLocaleLowerCase();
+      const column = haystack.indexOf(needle);
+      if (column !== -1) hits.push({ line: index, column });
+    }
+    return hits;
+  };
+}
+
+class RegexTimeoutError extends Error {}
+
+function isRegexTimeout(error: unknown): boolean {
+  return error instanceof RegexTimeoutError;
+}
+
+/**
+ * Compiles a model-authored regular expression into a per-line matcher that
+ * executes inside a vm context with a hard timeout: V8 interrupts runaway
+ * backtracking, so a catastrophic pattern fails the tool call instead of
+ * hanging the runtime.
+ */
+function compileRegexMatcher(source: string, caseSensitive: boolean): LineMatcher {
+  const flags = caseSensitive ? "u" : "iu";
+  const compiled = new RegExp(source, flags);
+  return (lines, remaining) => {
+    const sandbox = { re: compiled, lines, cap: Math.max(0, remaining), out: [] as number[] };
+    try {
+      runInTimedContext(sandbox);
+    } catch (error) {
+      // The timeout error is constructed in the sandbox realm, so it fails
+      // instanceof Error here; the Node error code is realm-independent.
+      if ((error as { code?: unknown } | null)?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") {
+        throw new RegexTimeoutError("Regular expression matching timed out.");
+      }
+      throw error;
+    }
+    const hits: Array<{ line: number; column: number }> = [];
+    for (let index = 0; index + 1 < sandbox.out.length; index += 2) {
+      hits.push({ line: sandbox.out[index]!, column: sandbox.out[index + 1]! });
+    }
+    return hits;
+  };
+}
+
+function runInTimedContext(sandbox: { re: RegExp; lines: readonly string[]; cap: number; out: number[] }): void {
+  vm.runInNewContext(
+    "for (let i = 0; i < lines.length && out.length / 2 < cap; i += 1) { const m = re.exec(lines[i]); if (m !== null) { out.push(i, m.index); } re.lastIndex = 0; }",
+    sandbox,
+    { timeout: REGEX_FILE_TIMEOUT_MS },
+  );
+}
+
+/**
+ * Translates a bounded glob subset into a RegExp over '/'-separated relative
+ * paths: '**' spans directories, '*' and '?' stay within one segment, and
+ * '[...]' character classes pass through. Everything else is literal.
+ */
+function compileGlob(pattern: string): (relative: string) => boolean {
+  if (pattern.length === 0) throw new Error("pattern cannot be empty");
+  if (pattern.length > MAX_SEARCH_PATTERN_LENGTH) throw new Error("pattern is too long");
+  if (pattern.includes("\\")) throw new Error("use '/' as the path separator");
+  const matchBasename = !pattern.includes("/");
+  let regex = "";
+  let index = 0;
+  while (index < pattern.length) {
+    const char = pattern[index]!;
+    if (char === "*") {
+      if (pattern[index + 1] === "*") {
+        // '**/' also matches zero directories.
+        if (pattern[index + 2] === "/") {
+          regex += "(?:[^/]+/)*";
+          index += 3;
+        } else {
+          regex += ".*";
+          index += 2;
+        }
+      } else {
+        regex += "[^/]*";
+        index += 1;
+      }
+    } else if (char === "?") {
+      regex += "[^/]";
+      index += 1;
+    } else if (char === "[") {
+      const closing = pattern.indexOf("]", index + 2);
+      if (closing === -1) throw new Error("unterminated character class");
+      const body = pattern.slice(index + 1, closing);
+      if (body.includes("/")) throw new Error("character classes cannot contain '/'");
+      regex += `[${body.replaceAll("\\", "\\\\")}]`;
+      index = closing + 1;
+    } else {
+      regex += char.replace(/[.+^${}()|\\]/u, "\\$&");
+      index += 1;
+    }
+  }
+  const full = new RegExp(`^${regex}$`, "u");
+  return (relative) => {
+    if (matchBasename) {
+      const basename = relative.split("/").at(-1) ?? relative;
+      return full.test(basename);
+    }
+    return full.test(relative);
+  };
+}
+
+function normalizeToolPath(value: string): string {
+  return value.replaceAll("\\", "/");
+}
+
+function optionalBooleanField(fields: Record<string, JsonValue>, name: string): boolean | undefined {
+  const value = fields[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`Field '${name}' must be a boolean.`);
+  return value;
 }
 
 export function contentHash(contents: string | Buffer): string {

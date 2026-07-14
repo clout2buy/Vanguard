@@ -19,6 +19,77 @@ export const SESSION_EXCLUDED_DIRECTORIES = new Set([".git", ".vanguard", "node_
 
 export interface TreeSnapshotOptions {
   readonly excludedDirectories?: ReadonlySet<string>;
+  readonly cache?: TreeSnapshotCache;
+}
+
+interface CachedFileEntry {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly ctimeMs: number;
+  readonly sha256: string;
+  readonly binary: boolean;
+  /** Wall-clock time this hash was computed from real file bytes. */
+  readonly hashedAtMs: number;
+}
+
+/**
+ * Filesystem mtime can be coarser than a millisecond (FAT is 2 seconds), so a
+ * write that lands in the same timestamp window as the hash could otherwise
+ * be served from cache. Entries younger than this slop are always re-hashed.
+ */
+const RACY_MTIME_SLOP_MS = 2_000;
+
+/**
+ * A stat-validated hash cache for repeated snapshots of one workspace root.
+ * A cached hash is reused only when the file's current size, mtime, and ctime
+ * are identical to the stat observed when the hash was computed AND the mtime
+ * is strictly older than that computation by the racy slop. Any mismatch or
+ * racy entry falls back to reading and hashing real bytes, so a cached
+ * snapshot is byte-equivalent to an uncached one.
+ */
+export class TreeSnapshotCache {
+  #root: string | undefined;
+  readonly #entries = new Map<string, CachedFileEntry>();
+
+  bindRoot(root: string): void {
+    if (this.#root === undefined) {
+      this.#root = root;
+      return;
+    }
+    if (this.#root !== root) {
+      throw new Error("Tree snapshot cache is bound to a different root.");
+    }
+  }
+
+  lookup(absolutePath: string, stats: { size: number; mtimeMs: number; ctimeMs: number }): CachedFileEntry | undefined {
+    const cached = this.#entries.get(absolutePath);
+    if (cached === undefined) return undefined;
+    if (cached.size !== stats.size || cached.mtimeMs !== stats.mtimeMs || cached.ctimeMs !== stats.ctimeMs) return undefined;
+    if (cached.mtimeMs + RACY_MTIME_SLOP_MS >= cached.hashedAtMs) return undefined;
+    return cached;
+  }
+
+  store(
+    absolutePath: string,
+    stats: { size: number; mtimeMs: number; ctimeMs: number },
+    digest: string,
+    binary: boolean,
+  ): void {
+    this.#entries.set(absolutePath, {
+      size: stats.size,
+      mtimeMs: stats.mtimeMs,
+      ctimeMs: stats.ctimeMs,
+      sha256: digest,
+      binary,
+      hashedAtMs: Date.now(),
+    });
+  }
+
+  retainOnly(seen: ReadonlySet<string>): void {
+    for (const key of this.#entries.keys()) {
+      if (!seen.has(key)) this.#entries.delete(key);
+    }
+  }
 }
 
 export interface TreeEntry {
@@ -45,6 +116,9 @@ export async function snapshotTree(root: string, options: TreeSnapshotOptions = 
   if (!(await stat(absoluteRoot)).isDirectory()) throw new Error("Snapshot root must be a directory.");
   const entries: TreeEntry[] = [];
   const excludedDirectories = options.excludedDirectories ?? SESSION_EXCLUDED_DIRECTORIES;
+  const cache = options.cache;
+  cache?.bindRoot(absoluteRoot);
+  const seenFiles = new Set<string>();
   const queue = [absoluteRoot];
   while (queue.length > 0) {
     const directory = queue.shift()!;
@@ -68,18 +142,46 @@ export async function snapshotTree(root: string, options: TreeSnapshotOptions = 
       } else if (details.isDirectory()) {
         if (!excludedDirectories.has(child.name)) queue.push(absolute);
       } else if (details.isFile()) {
-        const contents = await readFile(absolute);
-        entries.push({
-          path: relative,
-          kind: "file",
-          sha256: sha256(contents),
-          size: contents.byteLength,
-          mode: details.mode & 0o777,
-          binary: contents.subarray(0, 8_192).includes(0),
-        });
+        seenFiles.add(absolute);
+        const cached = cache?.lookup(absolute, details);
+        if (cached !== undefined) {
+          entries.push({
+            path: relative,
+            kind: "file",
+            sha256: cached.sha256,
+            size: cached.size,
+            mode: details.mode & 0o777,
+            binary: cached.binary,
+          });
+        } else {
+          const contents = await readFile(absolute);
+          const digest = sha256(contents);
+          const binary = contents.subarray(0, 8_192).includes(0);
+          entries.push({
+            path: relative,
+            kind: "file",
+            sha256: digest,
+            size: contents.byteLength,
+            mode: details.mode & 0o777,
+            binary,
+          });
+          // Re-stat after reading: caching the pre-read stat could bless bytes
+          // that changed between lstat and readFile.
+          const settled = await lstat(absolute).catch(() => undefined);
+          if (
+            settled !== undefined
+            && settled.isFile()
+            && settled.size === contents.byteLength
+            && settled.mtimeMs === details.mtimeMs
+            && settled.ctimeMs === details.ctimeMs
+          ) {
+            cache?.store(absolute, settled, digest, binary);
+          }
+        }
       }
     }
   }
+  cache?.retainOnly(seenFiles);
   entries.sort((left, right) => compareText(left.path, right.path));
   const canonical = JSON.stringify(entries);
   return { version: 1, rootHash: sha256(Buffer.from(canonical, "utf8")), entries };

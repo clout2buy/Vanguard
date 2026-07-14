@@ -69,9 +69,9 @@ test("file tools write atomically, read, and enumerate workspace files", async (
 test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-pages-"));
   try {
-    const contents = "alpha αβγ\n".repeat(4_000);
+    const contents = "alpha αβγ\n".repeat(16_000);
     await writeFile(path.join(root, "large.txt"), contents);
-    const reader = new ReadFileTool(new WorkspaceBoundary(root));
+    const reader = new ReadFileTool(new WorkspaceBoundary(root), 1_000_000);
 
     const first = await reader.execute({ path: "large.txt" }, context);
     assert.equal(first.ok, true);
@@ -87,7 +87,7 @@ test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", 
     assert.equal(firstOutput.sha256, contentHash(contents));
     assert.equal(firstOutput.totalBytes, Buffer.byteLength(contents));
     assert.deepEqual(firstOutput.range, { startByte: 0, endByte: Buffer.byteLength(firstOutput.contents) });
-    assert.equal(Buffer.byteLength(firstOutput.contents) <= 8 * 1_024, true);
+    assert.equal(Buffer.byteLength(firstOutput.contents) <= 64 * 1_024, true);
     assert.equal(firstOutput.contents.includes("\ufffd"), false);
     assert.equal(firstOutput.truncated, true);
     assert.equal(typeof firstOutput.nextCursor, "string");
@@ -101,7 +101,7 @@ test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", 
       assert.equal(nextOutput.sha256, firstOutput.sha256);
       assert.equal(nextOutput.totalBytes, firstOutput.totalBytes);
       assert.equal(nextOutput.range.startByte, current.range.endByte);
-      assert.equal(Buffer.byteLength(nextOutput.contents) <= 8 * 1_024, true);
+      assert.equal(Buffer.byteLength(nextOutput.contents) <= 64 * 1_024, true);
       assert.equal(nextOutput.contents.includes("\ufffd"), false);
       pages.push(nextOutput.contents);
       current = nextOutput;
@@ -164,7 +164,7 @@ test("workspace.read supports exact byte ranges and rejects ambiguous or unknown
     );
     await assert.rejects(
       reader.execute({ path: "value.txt", maxBytes: 3 }, context),
-      /from 4 through 32768/u,
+      /from 4 through 131072/u,
     );
     await assert.rejects(
       reader.execute({ path: "unicode.txt", range: { startByte: 0, endByte: 1 } }, context),
