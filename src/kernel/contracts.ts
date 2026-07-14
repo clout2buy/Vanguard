@@ -258,6 +258,13 @@ export interface ToolObservation {
   readonly workspaceGeneration?: number;
   /** True only on a successful mutation that advanced workspaceGeneration. */
   readonly workspaceMutation?: true;
+  /**
+   * Runtime-computed: a passing verify.syntax that satisfied the post-change
+   * execution-evidence gate inside the bounded plan-free small-change lane.
+   * This is deliberately distinct from evidenceAuthority so it can never be
+   * cited as plan-milestone execution proof.
+   */
+  readonly smallChangeExecutionEvidence?: true;
   readonly callId: string;
   readonly tool: string;
   readonly ok: boolean;

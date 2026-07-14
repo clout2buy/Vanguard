@@ -94,7 +94,7 @@ const runtimeEvidence = (evidenceId: string): EvidenceClaim => ({ kind: "tool", 
 const invalidationApproval = (milestoneId: string, supersededBy: string): string =>
   `VANGUARD_PLAN_INVALIDATION_APPROVAL ${JSON.stringify({ milestoneId, supersededBy })}`;
 
-test("only one narrow exact replacement is plan-free; the second mutation is refused", async () => {
+test("the plan-free lane allows three narrow replacements; the fourth is refused", async () => {
   let mutations = 0;
   const plan = new PlanLedger();
   const journal = new MemoryJournal();
@@ -102,8 +102,10 @@ test("only one narrow exact replacement is plan-free; the second mutation is ref
     model: new CapturingModel([
       { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
       { kind: "tools", calls: [{ id: "w2", name: "workspace.replace", input: replaceInput("2") }] },
-      planDecision("m1", "active"),
       { kind: "tools", calls: [{ id: "w3", name: "workspace.replace", input: replaceInput("3") }] },
+      { kind: "tools", calls: [{ id: "w4", name: "workspace.replace", input: replaceInput("4") }] },
+      planDecision("m1", "active"),
+      { kind: "tools", calls: [{ id: "w5", name: "workspace.replace", input: replaceInput("5") }] },
       { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
       planDecision("m1", "proven", [toolEvidence("t")]),
       { kind: "complete", answer: "done" },
@@ -117,8 +119,8 @@ test("only one narrow exact replacement is plan-free; the second mutation is ref
   });
   const outcome = await kernel.run("planned work");
   assert.equal(outcome.status, "completed");
-  assert.equal(mutations, 2);
-  assert.match(JSON.stringify(journal.events), /not one narrow exact-text replacement/);
+  assert.equal(mutations, 4);
+  assert.match(JSON.stringify(journal.events), /Plan-free changes are limited to 3 narrow exact-text replacements/);
 });
 
 test("write/delete and multi-mutation batches cannot exploit the plan-free exception", async () => {

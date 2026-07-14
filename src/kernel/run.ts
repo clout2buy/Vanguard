@@ -815,8 +815,15 @@ export class AgentKernel {
         const runtimeBlockers = this.#completionGates.flatMap((gate) => gate.blockers());
         if (mutationNeedsExecutionEvidence || mutationNeedsReview || unprovenMilestones.length > 0
           || stalePlanEvidence.length > 0 || runtimeBlockers.length > 0) {
+          const smallChangeLaneOpen = (!this.#hasPlanTool || this.#plan!.isEmpty())
+            && completedMutations > 0
+            && completedMutations <= SMALL_CHANGE_MUTATION_BUDGET;
           const missing = [
-            mutationNeedsExecutionEvidence ? "a successful executable check" : undefined,
+            mutationNeedsExecutionEvidence
+              ? (smallChangeLaneOpen
+                ? "a successful executable check (for this small plan-free change, a passing verify.syntax on the edited file also satisfies it)"
+                : "a successful executable check")
+              : undefined,
             mutationNeedsReview ? "workspace.changes review" : undefined,
           ].filter((item) => item !== undefined).join(" and ");
           const parts = [
@@ -1121,15 +1128,19 @@ export class AgentKernel {
           evidenceId,
         );
       }
-      // The only plan-free mutation is one genuinely narrow exact-text
-      // replacement. Creates, deletes, overwrites, large replacements, any
-      // second mutation, and multi-mutation batches require a durable plan.
+      // Plan-free mutation is a bounded small-change lane: up to
+      // SMALL_CHANGE_MUTATION_BUDGET genuinely narrow exact-text replacements,
+      // one per batch. Creates, deletes, overwrites, large replacements,
+      // multi-mutation batches, and anything past the budget require a
+      // durable plan.
       if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
         && this.#plan!.isEmpty()
-        && (context.completedMutations() > 0 || mutationCalls.length !== 1 || !isNarrowPlanFreeMutation(call))) {
+        && (context.completedMutations() >= SMALL_CHANGE_MUTATION_BUDGET
+          || mutationCalls.length !== 1
+          || !isNarrowPlanFreeMutation(call))) {
         return this.#terminalObservation(
           call,
-          "This mutation is not one narrow exact-text replacement. Materialize a non-empty engineering plan with plan.update before changing the workspace.",
+          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow exact-text replacements, one per step. Materialize a non-empty engineering plan with plan.update before changing the workspace further.`,
           "policy",
           context.recovery,
           context.signal,
@@ -1249,6 +1260,13 @@ export class AgentKernel {
       const fingerprint = stableFingerprint(call.name, call.input);
       const definition = this.#tools.get(call.name)?.definition;
       const effect = definition?.effect;
+      const smallChangeSyntaxEvidence = observation.ok && !workspaceChanged
+        && call.name === "verify.syntax"
+        && context.mode === "execution"
+        && (!this.#hasPlanTool || this.#plan!.isEmpty())
+        && context.completedMutations() > 0
+        && context.completedMutations() <= SMALL_CHANGE_MUTATION_BUDGET
+        && syntaxCheckPassed(observation.output);
       if (observation.ok) {
         context.actionFailures.delete(fingerprint);
         // A successful mutation changes the meaning of subsequent execution.
@@ -1257,6 +1275,10 @@ export class AgentKernel {
         if (effect === "mutate" && !workspaceChanged) context.onMutate();
         if (definition?.evidenceAuthority === "independent-execution" && !workspaceChanged) context.onExecute();
         if (definition?.evidenceAuthority === "independent-review" && !workspaceChanged) context.onReview();
+        // Within the plan-free small-change lane, a passing targeted syntax
+        // check satisfies the model-visible pre-claim gate. Sealed completion
+        // verification still runs the real project check unconditionally.
+        if (smallChangeSyntaxEvidence) context.onExecute();
       } else {
         const priorCount = context.actionFailures.get(fingerprint) ?? 0;
         const count = priorCount + 1;
@@ -1302,6 +1324,7 @@ export class AgentKernel {
         ...(observation.ok && !workspaceChanged && definition?.evidenceAuthority !== undefined
           ? { evidenceAuthority: definition.evidenceAuthority }
           : {}),
+        ...(smallChangeSyntaxEvidence ? { smallChangeExecutionEvidence: true as const } : {}),
       };
       context.transcript.push({ role: "observation", content: observation as unknown as JsonValue });
       await this.#record(observation.ok ? "tool.completed" : "tool.failed", observation as unknown as JsonValue);
@@ -1753,6 +1776,9 @@ function restoreSession(
           }
           if (data?.evidenceAuthority === "independent-execution") mutationNeedsExecutionEvidence = false;
           if (data?.evidenceAuthority === "independent-review") mutationNeedsReview = false;
+          // The lane decision was made and journaled at execution time;
+          // resume replays it rather than re-deciding.
+          if (data?.smallChangeExecutionEvidence === true) mutationNeedsExecutionEvidence = false;
         } else {
           if (pendingObservationBatch !== undefined) pendingObservationBatch.invalidated = true;
           actionFailures.set(fingerprint, (actionFailures.get(fingerprint) ?? 0) + 1);
@@ -1867,6 +1893,19 @@ function hasTopLevelHistoricalElisionMarker(input: JsonValue): boolean {
     && typeof input === "object"
     && !Array.isArray(input)
     && Object.prototype.hasOwnProperty.call(input, "vanguardElided");
+}
+
+/**
+ * The plan-free small-change lane: this many narrow exact-text replacements
+ * may proceed without a durable plan, and a passing verify.syntax satisfies
+ * the pre-claim execution-evidence gate while inside it. Sealed completion
+ * verification is unaffected.
+ */
+export const SMALL_CHANGE_MUTATION_BUDGET = 3;
+
+function syntaxCheckPassed(output: JsonValue | undefined): boolean {
+  if (output === null || output === undefined || typeof output !== "object" || Array.isArray(output)) return false;
+  return (output as { status?: JsonValue }).status === "passed";
 }
 
 function isNarrowPlanFreeMutation(call: ToolCall): boolean {
