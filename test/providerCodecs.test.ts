@@ -673,8 +673,14 @@ test("runtime history never satisfies a pending user.ask across provider wires",
   const anthropicResult = anthropicBlocks.map(wireRecord).find((item) =>
     item?.type === "tool_result" && item.tool_use_id === "permission");
   assert.doesNotMatch(String(anthropicResult?.content), /historical tool exchange/);
+  // The trailing message may carry a rolling cache breakpoint, which renders
+  // string content as its equivalent single text block.
   assert.equal(anthropic.messages.some((message) =>
-    message.role === "assistant" && message.content === history), true);
+    message.role === "assistant" && (message.content === history
+      || (Array.isArray(message.content) && message.content.some((value) => {
+        const block = wireRecord(value);
+        return block?.type === "text" && block.text === history;
+      })))), true);
 
   const chat = new OpenAIChatCompletionsCodec("deepseek-v4-pro").encode({
     ...base,

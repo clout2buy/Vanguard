@@ -26,6 +26,18 @@ export interface EnvironmentCredentialConfig {
 }
 
 /**
+ * Optional reasoning configuration. Each field is honored only by the wire
+ * contract that can express it and rejected everywhere else, so a config
+ * cannot silently claim reasoning that the provider never performs.
+ */
+export interface ProviderReasoningConfig {
+  /** Anthropic Messages extended thinking budget in tokens (min 1024). */
+  readonly thinkingBudgetTokens?: number;
+  /** OpenAI Responses reasoning effort. */
+  readonly effort?: "low" | "medium" | "high";
+}
+
+/**
  * Portable, versioned provider connection configuration. It contains only
  * credential provenance, never credential values.
  */
@@ -39,6 +51,9 @@ export interface ProviderConnectionConfigV1 {
   readonly capabilities?: ProviderCapabilityOverrides;
   /** Required header version for Anthropic Messages; ignored nowhere else. */
   readonly apiVersion?: string;
+  /** Maximum output tokens per response; defaults to 16384. */
+  readonly maxOutputTokens?: number;
+  readonly reasoning?: ProviderReasoningConfig;
 }
 
 export interface CredentialProvenance {
@@ -57,6 +72,8 @@ export interface ResolvedProviderProfile {
   readonly credentialProvenance: CredentialProvenance;
   readonly capabilities: ProviderCapabilities;
   readonly apiVersion?: string;
+  readonly maxOutputTokens: number;
+  readonly reasoning?: ProviderReasoningConfig;
 }
 
 const PROVIDER_DEFAULTS: Readonly<Record<Exclude<ProviderIdentity, "openai-compatible">, {
@@ -152,6 +169,8 @@ export function resolveProviderProfile(
     streamUsage: streaming && (input.capabilities?.streamUsage ?? baseline.streamUsage),
     continuationReplay: input.capabilities?.continuationReplay ?? baseline.continuationReplay,
   };
+  const maxOutputTokens = input.maxOutputTokens ?? 16_384;
+  const reasoning = validateReasoning(input.reasoning, wire, maxOutputTokens);
   return {
     version: VANGUARD_PROVIDER_CONFIG_VERSION,
     provider: input.provider,
@@ -166,7 +185,48 @@ export function resolveProviderProfile(
     },
     capabilities,
     ...(apiVersion === undefined ? {} : { apiVersion }),
+    maxOutputTokens,
+    ...(reasoning === undefined ? {} : { reasoning }),
   };
+}
+
+function validateReasoning(
+  reasoning: ProviderReasoningConfig | undefined,
+  wire: ProviderWireProtocol,
+  maxOutputTokens: number,
+): ProviderReasoningConfig | undefined {
+  if (reasoning === undefined) return undefined;
+  if (reasoning === null || typeof reasoning !== "object" || Array.isArray(reasoning)) {
+    throw new Error("Provider reasoning config must be an object.");
+  }
+  for (const name of Object.keys(reasoning)) {
+    if (name !== "thinkingBudgetTokens" && name !== "effort") {
+      throw new Error(`Unknown provider reasoning field: ${name}.`);
+    }
+  }
+  const budget = reasoning.thinkingBudgetTokens;
+  const effort = reasoning.effort;
+  if (budget !== undefined) {
+    if (wire !== "anthropic-messages") {
+      throw new Error("thinkingBudgetTokens is valid only for the Anthropic Messages wire contract.");
+    }
+    if (!Number.isSafeInteger(budget) || budget < 1_024) {
+      throw new Error("thinkingBudgetTokens must be an integer of at least 1024.");
+    }
+    if (budget >= maxOutputTokens) {
+      throw new Error("thinkingBudgetTokens must be smaller than maxOutputTokens.");
+    }
+  }
+  if (effort !== undefined) {
+    if (wire !== "openai-responses") {
+      throw new Error("reasoning effort is valid only for the OpenAI Responses wire contract.");
+    }
+    if (effort !== "low" && effort !== "medium" && effort !== "high") {
+      throw new Error("reasoning effort must be low, medium, or high.");
+    }
+  }
+  if (budget === undefined && effort === undefined) return undefined;
+  return reasoning;
 }
 
 export async function readProviderProfile(
@@ -194,6 +254,8 @@ export function describeProviderProfile(profile: ResolvedProviderProfile): Recor
     credential: profile.credentialProvenance,
     capabilities: profile.capabilities,
     ...(profile.apiVersion === undefined ? {} : { apiVersion: profile.apiVersion }),
+    maxOutputTokens: profile.maxOutputTokens,
+    ...(profile.reasoning === undefined ? {} : { reasoning: profile.reasoning }),
   };
 }
 
@@ -217,6 +279,10 @@ function validateConfigShape(input: ProviderConnectionConfigV1): void {
   }
   if (input.apiVersion !== undefined && typeof input.apiVersion !== "string") {
     throw new Error("Provider apiVersion must be a string.");
+  }
+  if (input.maxOutputTokens !== undefined
+    && (!Number.isSafeInteger(input.maxOutputTokens) || input.maxOutputTokens < 256 || input.maxOutputTokens > 1_000_000)) {
+    throw new Error("maxOutputTokens must be an integer from 256 through 1000000.");
   }
   if (input.capabilities !== undefined) {
     if (input.capabilities === null || typeof input.capabilities !== "object") {

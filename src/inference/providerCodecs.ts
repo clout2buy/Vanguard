@@ -119,9 +119,14 @@ export function createConfiguredProviderModel(
   // cannot forge the marker fields and bypass endpoint/credential validation.
   const profile = resolveProviderProfile(config, environment);
   const codec = profile.wire === "openai-responses"
-    ? new OpenAIResponsesCodec(profile.model, profile.capabilities)
+    ? new OpenAIResponsesCodec(profile.model, profile.capabilities, profile.reasoning?.effort)
     : profile.wire === "anthropic-messages"
-      ? new AnthropicMessagesCodec(profile.model, 16_384, profile.capabilities)
+      ? new AnthropicMessagesCodec(
+        profile.model,
+        profile.maxOutputTokens,
+        profile.capabilities,
+        profile.reasoning?.thinkingBudgetTokens,
+      )
       : new OpenAIChatCompletionsCodec(profile.model, profile.capabilities);
   const headerProvider = profile.wire === "anthropic-messages"
     ? new AnthropicHeaders(profile.credential.variable, profile.apiVersion!, environment)
@@ -499,7 +504,13 @@ export class OpenAIResponsesCodec implements ModelWireCodec {
   constructor(
     private readonly model: string,
     private readonly capabilities: ProviderCapabilities = DEFAULT_CODEC_CAPABILITIES,
-  ) {}
+    private readonly reasoningEffort?: "low" | "medium" | "high",
+  ) {
+    if (reasoningEffort !== undefined
+      && reasoningEffort !== "low" && reasoningEffort !== "medium" && reasoningEffort !== "high") {
+      throw new Error("OpenAI reasoning effort must be low, medium, or high.");
+    }
+  }
 
   encode(request: SerializableModelRequest): JsonValue {
     this.#vendorToInternal.clear();
@@ -545,6 +556,7 @@ export class OpenAIResponsesCodec implements ModelWireCodec {
       input,
       tools: request.tools.map((tool) => openAITool(tool, openAIToolName(tool.name))),
       ...(this.capabilities.parallelToolCalls ? { parallel_tool_calls: true } : {}),
+      ...(this.reasoningEffort === undefined ? {} : { reasoning: { effort: this.reasoningEffort } }),
       store: false,
     };
   }
@@ -604,7 +616,13 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
     private readonly model: string,
     private readonly maxTokens = 16_384,
     private readonly capabilities: ProviderCapabilities = DEFAULT_CODEC_CAPABILITIES,
-  ) {}
+    private readonly thinkingBudgetTokens?: number,
+  ) {
+    if (thinkingBudgetTokens !== undefined
+      && (!Number.isSafeInteger(thinkingBudgetTokens) || thinkingBudgetTokens < 1_024 || thinkingBudgetTokens >= maxTokens)) {
+      throw new Error("Anthropic thinking budget must be an integer >= 1024 and smaller than max_tokens.");
+    }
+  }
 
   encode(request: SerializableModelRequest): JsonValue {
     const messages: JsonValue[] = [];
@@ -667,6 +685,12 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
     });
     flushResults();
     markCacheBreakpoint(messages, taskMessageIndex);
+    // A rolling breakpoint on the final message lets each turn reuse the
+    // previous turn's entire prefix instead of only system+task. Anthropic
+    // permits four breakpoints; system, task, and this one use three.
+    if (messages.length - 1 !== taskMessageIndex) {
+      markCacheBreakpoint(messages, messages.length - 1);
+    }
     return {
       model: this.model,
       max_tokens: this.maxTokens,
@@ -674,6 +698,9 @@ export class AnthropicMessagesCodec implements ModelWireCodec {
       messages,
       tools: request.tools.map(anthropicTool),
       tool_choice: { type: "auto" },
+      ...(this.thinkingBudgetTokens === undefined
+        ? {}
+        : { thinking: { type: "enabled", budget_tokens: this.thinkingBudgetTokens } }),
     };
   }
 
@@ -1227,14 +1254,29 @@ function anthropicTool(tool: ToolDefinition): JsonValue {
 function markCacheBreakpoint(messages: JsonValue[], index: number): void {
   if (index < 0 || index >= messages.length) return;
   const message = optionalObject(messages[index]);
-  if (message === undefined || !Array.isArray(message.content)) return;
+  if (message === undefined) return;
+  if (typeof message.content === "string") {
+    // Anthropic accepts cache_control only on content blocks, so a plain
+    // string message is upgraded to its equivalent single text block.
+    messages[index] = {
+      ...message,
+      content: [{ type: "text", text: message.content, cache_control: { type: "ephemeral" } }],
+    };
+    return;
+  }
+  if (!Array.isArray(message.content)) return;
   const blocks = message.content;
   for (let position = blocks.length - 1; position >= 0; position -= 1) {
     const block = optionalObject(blocks[position]);
-    if (block?.type === "text") {
+    const type = block?.type;
+    // cache_control is rejected on thinking blocks; any other block type at
+    // the tail (text, tool_use, tool_result) may carry the breakpoint.
+    if (type === "text" || type === "tool_use" || type === "tool_result") {
       blocks[position] = { ...block, cache_control: { type: "ephemeral" } };
       return;
     }
+    if (type === "thinking" || type === "redacted_thinking") continue;
+    return;
   }
 }
 
