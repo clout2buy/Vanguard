@@ -1,9 +1,0 @@
-@@VANGUARD_EVENT@@{"type":"session.ready","agentId":"main","status":"info","title":"Session created","sessionId":"vanguard-session-cO6pnF","sessionRoot":"C:\\Users\\Clout\\AppData\\Local\\Temp\\vanguard-session-cO6pnF","workspaceRoot":"C:\\Users\\Clout\\AppData\\Local\\Temp\\vanguard-session-cO6pnF\\workspace","journalFile":"C:\\Users\\Clout\\AppData\\Local\\Temp\\vanguard-session-cO6pnF\\run.jsonl","scorecardFile":"C:\\Users\\Clout\\AppData\\Local\\Temp\\vanguard-session-cO6pnF\\scorecard.json","materialized":false}
-@@VANGUARD_EVENT@@{"type":"agent.stream_started","agentId":"main","status":"info","title":"Agent","detail":"attempt 1"}
-@@VANGUARD_EVENT@@{"type":"agent.delta","agentId":"main","status":"info","title":"Agent","message":"Hey! I'm Vanguard, an"}
-@@VANGUARD_EVENT@@{"type":"agent.delta","agentId":"main","status":"info","title":"Agent","message":" expert software engineering agent. How can I help you today?\n\nIf you have"}
-@@VANGUARD_EVENT@@{"type":"agent.delta","agentId":"main","status":"info","title":"Agent","message":" questions about your project, want me to investigate something"}
-@@VANGUARD_EVENT@@{"type":"agent.delta","agentId":"main","status":"info","title":"Agent","message":", or need engineering work done, just let me know."}
-@@VANGUARD_EVENT@@{"type":"agent.stream_committed","agentId":"main","status":"info","title":"Agent"}
-@@VANGUARD_EVENT@@{"type":"agent.message","agentId":"main","sequence":2,"turn":1,"status":"info","title":"Agent","message":"Hey! I'm Vanguard, an expert software engineering agent. How can I help you today?\n\nIf you have questions about your project, want me to investigate something, or need engineering work done, just let me know."}
-[Vanguard] turn 1: respond
