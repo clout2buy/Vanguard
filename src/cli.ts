@@ -33,6 +33,7 @@ import {
   createAnthropicModel,
   createCodingSession,
   createDeepSeekModel,
+  createOllamaModel,
   createOpenAIModel,
   createSessionShell,
   materializeSessionWorkspace,
@@ -79,7 +80,7 @@ import {
 interface CliOptions {
   readonly workspace: string;
   readonly task: string;
-  readonly provider: "openai" | "anthropic" | "deepseek" | "http";
+  readonly provider: "openai" | "anthropic" | "deepseek" | "ollama" | "http";
   readonly model: string;
   readonly endpoint?: string;
   readonly verification: CommandSpec;
@@ -758,6 +759,7 @@ function createModel(options: CliOptions, streamObserver?: StreamObserver) {
   if (options.provider === "openai") return createOpenAIModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "anthropic") return createAnthropicModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "deepseek") return createDeepSeekModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
+  if (options.provider === "ollama") return createOllamaModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.endpoint === undefined) throw new Error("--endpoint is required for the http provider.");
   return new HttpModelAdapter({ endpoint: options.endpoint, timeoutMs: common.timeoutMs, maxAttempts: common.maxAttempts });
 }
@@ -866,8 +868,9 @@ async function parseOptions(
   });
   const task = await resolveTaskInput(values, requireTask);
   const provider = required(values, "--provider");
-  if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "http") {
-    throw new Error("--provider must be openai, anthropic, deepseek, or http.");
+  if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "ollama"
+    && provider !== "http") {
+    throw new Error("--provider must be openai, anthropic, deepseek, ollama, or http.");
   }
   const model = required(values, "--model");
   const maxSteps = Number(single(values, "--max-steps") ?? "60");

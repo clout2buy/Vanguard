@@ -20,7 +20,7 @@ export const VANGUARD_IDEMPOTENT_CREATE_CAPABILITY = "sessions.create.idempotent
 export const VANGUARD_WORKER_FENCING_CAPABILITY = "sessions.workerFenced" as const;
 export const VANGUARD_EXECUTION_TREE_FENCING_CAPABILITY = "sessions.executionTreeFenced" as const;
 
-export type VanguardProvider = "openai" | "anthropic" | "deepseek" | "http";
+export type VanguardProvider = "openai" | "anthropic" | "deepseek" | "ollama" | "http";
 
 export interface VanguardSessionConfig {
   readonly workspace: string;

@@ -9,6 +9,7 @@ import type {
 import { CONTROL_TOOL_NAMES, normalizeContract, normalizeDecision, workingStateTailEntries } from "../kernel/contracts.js";
 import {
   EnvironmentBearerHeaders,
+  OptionalBearerHeaders,
   HttpModelAdapter,
   type HeaderProvider,
   type ModelWireCodec,
@@ -110,6 +111,17 @@ export function createDeepSeekModel(options: ProviderModelOptions): HttpModelAda
   }, options);
 }
 
+export function createOllamaModel(options: ProviderModelOptions): HttpModelAdapter {
+  return createConfiguredProviderModel({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "ollama",
+    model: options.model,
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    ...(options.credentialVariable === undefined ? {} : { credential: { source: "environment", variable: options.credentialVariable } }),
+    ...(options.capabilities === undefined ? {} : { capabilities: options.capabilities }),
+  }, options);
+}
+
 export function createConfiguredProviderModel(
   config: ProviderConnectionConfigV1 | ResolvedProviderProfile,
   options: ConfiguredProviderRuntimeOptions = {},
@@ -130,7 +142,9 @@ export function createConfiguredProviderModel(
       : new OpenAIChatCompletionsCodec(profile.model, profile.capabilities);
   const headerProvider = profile.wire === "anthropic-messages"
     ? new AnthropicHeaders(profile.credential.variable, profile.apiVersion!, environment)
-    : new EnvironmentBearerHeaders(profile.credential.variable, environment);
+    : profile.credentialOptional
+      ? new OptionalBearerHeaders(profile.credential.variable, environment)
+      : new EnvironmentBearerHeaders(profile.credential.variable, environment);
   return new HttpModelAdapter({
     endpoint: profile.endpoint,
     codec,

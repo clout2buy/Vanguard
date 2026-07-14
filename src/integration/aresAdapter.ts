@@ -2219,7 +2219,7 @@ function validateVanguardInput(config: AresAdapterCreateInput["vanguard"]): void
   ] as const;
   requirePlainRecord(config, allowed, "Vanguard config", true);
   boundedString(config.workspace, 1, 32_768, "workspace");
-  if (!(["openai", "anthropic", "deepseek", "http"] as const).includes(config.provider)) {
+  if (!(["openai", "anthropic", "deepseek", "ollama", "http"] as const).includes(config.provider)) {
     throw new Error("Vanguard provider is invalid.");
   }
   boundedString(config.model, 1, 4_096, "model");

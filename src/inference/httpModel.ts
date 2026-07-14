@@ -420,6 +420,30 @@ export class EnvironmentBearerHeaders implements HeaderProvider {
   }
 }
 
+/**
+ * Bearer headers for local inference servers: a present credential is sent,
+ * a missing one sends no Authorization header at all. Only profiles that
+ * declare credentialOptional (Ollama) may use this provider.
+ */
+export class OptionalBearerHeaders implements HeaderProvider {
+  constructor(private readonly variable: string, private readonly environment: NodeJS.ProcessEnv = process.env) {}
+
+  async headers(): Promise<Readonly<Record<string, string>>> {
+    const secret = this.environment[this.variable];
+    if (secret === undefined || secret.length === 0) return {};
+    return { authorization: `Bearer ${secret}` };
+  }
+
+  provenance(): Readonly<Record<string, string | boolean>> {
+    return {
+      source: "environment",
+      variable: this.variable,
+      present: typeof this.environment[this.variable] === "string" && this.environment[this.variable]!.length > 0,
+      optional: true,
+    };
+  }
+}
+
 export class VanguardJsonCodec implements ModelWireCodec {
   encode(request: SerializableModelRequest): JsonValue {
     return request as unknown as JsonValue;

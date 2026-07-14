@@ -9,7 +9,7 @@ import type { PublicRunEvent } from "./runtime/publicRunEvents.js";
 import { VanguardEngine } from "./engine/vanguardEngine.js";
 import type { VanguardEngineEvent, VanguardSessionStatus } from "./engine/types.js";
 
-type Provider = "deepseek" | "openai" | "anthropic";
+type Provider = "deepseek" | "openai" | "anthropic" | "ollama";
 type Phase = "starting" | "running" | "verifying" | "completed" | "failed" | "cancelling" | "cancelled";
 
 interface TuiConfig {
@@ -597,6 +597,8 @@ function loadCredential(provider: Provider): string {
   const variable = credentialVariable(provider);
   const existing = process.env[variable]?.trim();
   if (existing !== undefined && existing.length > 0) return existing;
+  // A local Ollama server accepts unauthenticated loopback requests.
+  if (provider === "ollama") return "";
   if (process.platform !== "win32") throw new Error(`${variable} is not set.`);
   const script = path.join(repositoryRoot(), "scripts", "export-credential.ps1");
   const result = spawnSync("powershell.exe", [
@@ -614,7 +616,10 @@ function loadCredential(provider: Provider): string {
 }
 
 function credentialVariable(provider: Provider): string {
-  return provider === "deepseek" ? "DEEPSEEK_API_KEY" : provider === "openai" ? "OPENAI_API_KEY" : "ANTHROPIC_API_KEY";
+  if (provider === "deepseek") return "DEEPSEEK_API_KEY";
+  if (provider === "openai") return "OPENAI_API_KEY";
+  if (provider === "ollama") return "OLLAMA_API_KEY";
+  return "ANTHROPIC_API_KEY";
 }
 
 function repositoryRoot(): string {
@@ -624,7 +629,7 @@ function repositoryRoot(): string {
 function configuredProvider(): Provider {
   const configured = process.env.VANGUARD_PROVIDER?.trim().toLowerCase() ?? "deepseek";
   const provider = parseProvider(configured);
-  if (provider === undefined) throw new Error("VANGUARD_PROVIDER must be deepseek, openai, or anthropic.");
+  if (provider === undefined) throw new Error("VANGUARD_PROVIDER must be deepseek, openai, anthropic, or ollama.");
   return provider;
 }
 
@@ -644,6 +649,7 @@ function configuredMaxSteps(): number {
 function defaultModel(provider: Provider): string {
   if (provider === "deepseek") return "deepseek-v4-pro";
   if (provider === "openai") return "gpt-5.6";
+  if (provider === "ollama") return "qwen3-coder";
   return "claude-opus-4-8";
 }
 
@@ -655,6 +661,7 @@ function parseProvider(value: string): Provider | undefined {
   if (value.length === 0 || value === "1" || value === "deepseek") return "deepseek";
   if (value === "2" || value === "openai") return "openai";
   if (value === "3" || value === "anthropic") return "anthropic";
+  if (value === "4" || value === "ollama") return "ollama";
   return undefined;
 }
 

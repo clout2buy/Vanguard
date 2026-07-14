@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 
 export const VANGUARD_PROVIDER_CONFIG_VERSION = 1 as const;
 
-export type ProviderIdentity = "openai" | "anthropic" | "deepseek" | "openai-compatible";
+export type ProviderIdentity = "openai" | "anthropic" | "deepseek" | "ollama" | "openai-compatible";
 export type ProviderWireProtocol = "openai-responses" | "openai-chat-completions" | "anthropic-messages";
 
 export interface ProviderCapabilities {
@@ -74,6 +74,12 @@ export interface ResolvedProviderProfile {
   readonly apiVersion?: string;
   readonly maxOutputTokens: number;
   readonly reasoning?: ProviderReasoningConfig;
+  /**
+   * Local inference servers such as Ollama accept unauthenticated loopback
+   * requests; when true, a missing credential variable sends no Authorization
+   * header instead of failing the request.
+   */
+  readonly credentialOptional: boolean;
 }
 
 const PROVIDER_DEFAULTS: Readonly<Record<Exclude<ProviderIdentity, "openai-compatible">, {
@@ -97,6 +103,11 @@ const PROVIDER_DEFAULTS: Readonly<Record<Exclude<ProviderIdentity, "openai-compa
     endpoint: "https://api.deepseek.com/chat/completions",
     wire: "openai-chat-completions",
     credentialVariable: "DEEPSEEK_API_KEY",
+  },
+  ollama: {
+    endpoint: "http://127.0.0.1:11434/v1/chat/completions",
+    wire: "openai-chat-completions",
+    credentialVariable: "OLLAMA_API_KEY",
   },
 };
 
@@ -161,7 +172,11 @@ export function resolveProviderProfile(
   // or opaque continuation replay.
   const baseline = input.provider === "openai-compatible"
     ? { streaming: false, parallelToolCalls: false, streamUsage: false, continuationReplay: false }
-    : WIRE_CAPABILITIES[wire];
+    : input.provider === "ollama"
+      // Ollama streams reliably, but parallel calls, stream usage accounting,
+      // and opaque continuation replay vary by hosted model; stay conservative.
+      ? { streaming: true, parallelToolCalls: false, streamUsage: false, continuationReplay: false }
+      : WIRE_CAPABILITIES[wire];
   const streaming = input.capabilities?.streaming ?? baseline.streaming;
   const capabilities: ProviderCapabilities = {
     streaming,
@@ -187,6 +202,7 @@ export function resolveProviderProfile(
     ...(apiVersion === undefined ? {} : { apiVersion }),
     maxOutputTokens,
     ...(reasoning === undefined ? {} : { reasoning }),
+    credentialOptional: input.provider === "ollama",
   };
 }
 
@@ -265,7 +281,7 @@ function validateConfigShape(input: ProviderConnectionConfigV1): void {
     throw new Error(`Unsupported provider config version: ${String(input.version)}.`);
   }
   if (!(input.provider === "openai" || input.provider === "anthropic" || input.provider === "deepseek"
-    || input.provider === "openai-compatible")) {
+    || input.provider === "ollama" || input.provider === "openai-compatible")) {
     throw new Error(`Unsupported provider: ${String(input.provider)}.`);
   }
   if (typeof input.model !== "string" || input.model.trim().length === 0 || input.model.length > 256) {
