@@ -56,6 +56,11 @@ import {
   UsageLedger,
   extensionRuntimeState,
   resolveExtensions,
+  ExtensionPermissionPolicy,
+  FileExtensionAuditJournal,
+  HookRunner,
+  McpStdioClient,
+  loadWorkspaceSkills,
   createStreamLifecyclePresenter,
   reviewSessionChanges,
   applyReviewedManifest,
@@ -249,7 +254,7 @@ async function runCommand(resuming: boolean, args: readonly string[]): Promise<v
     const priorEvents = resuming ? await fileJournal.readValidated() : [];
     const runtime = await buildExecutionRuntime(session, options, fileJournal, false);
     const startedAt = Date.now();
-    const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${runtime.mutationPolicyDescription}`;
+    const runtimeTask = `${options.task}\n\nVanguard runtime mutation policy: ${runtime.mutationPolicyDescription}${runtime.taskAugmentation ?? ""}`;
     try {
       const outcome = await runWithBudgets(options, runtime.journalActivity, new AbortController(), (signal) =>
         runtime.kernel.run(runtimeTask, signal, priorEvents));
@@ -382,6 +387,8 @@ async function advanceSessionUnlocked(
 interface ExecutionRuntime {
   readonly kernel: AgentKernelType;
   readonly mutationPolicyDescription: string;
+  /** Extension-derived task augmentation (skills, instructions) for direct-run tasks. */
+  readonly taskAugmentation?: string;
   readonly journalActivity: () => number;
   readonly usage?: UsageLedger;
   readonly dispose?: () => Promise<void>;
@@ -490,6 +497,69 @@ async function buildExecutionRuntime(
       editableRoots: options.editableRoots,
     }));
   }
+  // Configured extensions become live runtime capability here: MCP servers
+  // contribute execute-effect tools, hooks gate run/tool boundaries, and
+  // data-only skills are advertised in the task addendum. Everything stays
+  // inside the exact-match permission ceiling resolved from config layers.
+  const extensionCloseables: Array<() => Promise<void>> = [];
+  const extensionTools: import("./kernel/contracts.js").ToolPort[] = [];
+  let hookRunner: HookRunner | undefined;
+  let skillsAddendum = "";
+  if (options.disableExtensions !== true) {
+    // Configuration and skills are project truth, so they resolve from the
+    // original source tree: session copies deliberately exclude .vanguard.
+    const resolved = await resolveExtensions({ workspaceRoot: session.sourceRoot });
+    const policy = new ExtensionPermissionPolicy(resolved.config.permissions);
+    const needsAudit = resolved.config.mcp.length > 0 || resolved.config.hooks.length > 0;
+    const audit = needsAudit
+      ? await FileExtensionAuditJournal.open(path.join(container, "extension-audit.jsonl"))
+      : undefined;
+    for (const server of resolved.config.mcp) {
+      const client = await McpStdioClient.connect(workspace, server, policy, audit!);
+      extensionTools.push(...client.tools());
+      extensionCloseables.push(() => client.close());
+    }
+    if (resolved.config.hooks.length > 0) {
+      hookRunner = new HookRunner(workspace, policy, resolved.config.hooks, audit!);
+    }
+    const sourceBoundary = new WorkspaceBoundary(session.sourceRoot);
+    const skillRoots: string[] = [];
+    for (const root of resolved.config.skills.roots) {
+      try {
+        await sourceBoundary.existing(root);
+        skillRoots.push(root);
+      } catch {
+        // A missing skills directory simply contributes no skills.
+      }
+    }
+    if (skillRoots.length > 0) {
+      const skills = await loadWorkspaceSkills(sourceBoundary, { ...resolved.config.skills, roots: skillRoots });
+      if (skills.length > 0) {
+        // Skill bodies are inlined because the agent workspace cannot read
+        // .vanguard; the loader already bounds file and corpus sizes.
+        skillsAddendum = "\n\nAvailable workspace skills (apply when relevant to the task):"
+          + skills.map((skill) =>
+            `\n### Skill: ${skill.metadata.name} — ${skill.metadata.description}\n${skill.instructions.trim()}`).join("");
+      }
+    }
+  }
+  const hasToolHooks = hookRunner !== undefined;
+  const withToolHooks = (tool: import("./kernel/contracts.js").ToolPort): import("./kernel/contracts.js").ToolPort =>
+    !hasToolHooks ? tool : {
+      name: tool.name,
+      definition: tool.definition,
+      execute: async (input, context) => {
+        await hookRunner!.run("before-tool", context.signal);
+        const result = await tool.execute(input, context);
+        await hookRunner!.run("after-tool", context.signal);
+        return result;
+      },
+    };
+  if (hookRunner !== undefined) {
+    // A fail-closed before-run hook refuses the whole run.
+    await hookRunner.run("before-run", new AbortController().signal);
+  }
+
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
   const priorEvents = await fileJournal.readValidated();
   const logicalPriorEvents = logicalRunEvents(priorEvents);
@@ -582,7 +652,8 @@ async function buildExecutionRuntime(
       ...delegationTools,
       ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
       ...(options.exposeRawProcess ? [processTool] : []),
-    ],
+      ...extensionTools,
+    ].map(withToolHooks),
     verifiers,
     journal,
     workingState,
@@ -599,7 +670,7 @@ async function buildExecutionRuntime(
     },
     plan,
     completionGates: [{ blockers: () => delegation.completionBlockers() }],
-    taskAddendum: taskAddendum(options, mutationPolicy),
+    taskAddendum: `${taskAddendum(options, mutationPolicy)}${skillsAddendum}`,
     ...(userChannel === undefined ? {} : { userChannel }),
     options: {
       maxSteps: options.maxSteps,
@@ -612,12 +683,22 @@ async function buildExecutionRuntime(
   return {
     kernel,
     mutationPolicyDescription: mutationPolicy.describe(),
+    ...(skillsAddendum.length === 0 ? {} : { taskAugmentation: skillsAddendum }),
     journalActivity,
     usage,
     delegationSnapshot: () => JSON.parse(JSON.stringify(delegation.snapshot())) as JsonValue,
-    dispose: () => delegation.close(),
+    dispose: async () => {
+      if (hookRunner !== undefined) {
+        // after-run hooks are observational at teardown; a failure is
+        // reported by the hook audit journal, never by masking run results.
+        await hookRunner.run("after-run", new AbortController().signal).catch(() => {});
+      }
+      for (const close of extensionCloseables) await close().catch(() => {});
+      await delegation.close();
+    },
   };
 }
+
 
 function taskAddendum(options: CliOptions, mutationPolicy: WorkspaceMutationPolicy): string {
   const adaptive = options.adaptiveVerification === true
