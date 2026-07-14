@@ -111,6 +111,11 @@ export interface KernelDependencies {
   readonly options?: Partial<RunOptions>;
 }
 
+interface BatchFailure {
+  readonly reason: string;
+  readonly poisoned?: boolean;
+}
+
 const DEFAULT_OPTIONS: RunOptions = {
   maxSteps: 50,
   maxRepeatedAction: 2,
@@ -273,6 +278,9 @@ export class AgentKernel {
       this.#recoveryConfiguration,
     );
 
+    if (restored.poisonedReason !== undefined) {
+      return { status: "failed", reason: restored.poisonedReason, steps: restored.completedSteps };
+    }
     if (restored.completed) throw new Error("Cannot resume a completed Vanguard run.");
 
     if (input.task !== undefined) {
@@ -603,7 +611,7 @@ export class AgentKernel {
         onExecute: () => { mutationNeedsExecutionEvidence = false; },
         onReview: () => { mutationNeedsReview = false; },
       });
-      if (batchOutcome !== undefined) return this.#fail(batchOutcome, step);
+      if (batchOutcome !== undefined) return this.#fail(batchOutcome.reason, step, batchOutcome.poisoned === true);
     }
 
     return this.#fail("Step budget exhausted without verified completion.", this.#options.maxSteps);
@@ -649,10 +657,11 @@ export class AgentKernel {
       onExecute: () => void;
       onReview: () => void;
     },
-  ): Promise<string | undefined> {
+  ): Promise<BatchFailure | undefined> {
     const allObserve = calls.every((call) => this.#tools.get(call.name)?.definition.effect === "observe");
     const mutationCalls = calls.filter((call) => this.#tools.get(call.name)?.definition.effect === "mutate");
     const circuitBlockedCallIds = new Set<string>();
+    let containmentPoisonReason: string | undefined;
     const runCall = async (call: ToolCall): Promise<ToolObservation> => {
       const fingerprint = stableFingerprint(call.name, call.input);
       if ((context.actionFailures.get(fingerprint) ?? 0) >= this.#options.maxRepeatedAction) {
@@ -711,6 +720,16 @@ export class AgentKernel {
             signal: context.signal,
           });
           if (result.ok) return { callId: call.id, tool: call.name, ok: true, output: result.output };
+          if (tool.definition.effect === "execute" && isContainmentUncertain(result.output)) {
+            containmentPoisonReason = `Execution containment became uncertain in '${call.name}'; this run is permanently fenced.`;
+            return {
+              callId: call.id,
+              tool: call.name,
+              ok: false,
+              output: result.output,
+              failure: classifyFailure(containmentPoisonReason, { source: "process" }),
+            };
+          }
           output = result.output;
           error = result;
         } catch (caught) {
@@ -761,10 +780,15 @@ export class AgentKernel {
       ? await Promise.all(calls.map(runCall))
       : [];
     if (observations.length === 0) {
-      for (const call of calls) observations.push(await runCall(call));
+      for (const call of calls) {
+        observations.push(await runCall(call));
+        if (containmentPoisonReason !== undefined) break;
+      }
     }
 
-    let failureReason: string | undefined;
+    let failureReason: BatchFailure | undefined = containmentPoisonReason === undefined
+      ? undefined
+      : { reason: containmentPoisonReason, poisoned: true };
     for (const [index, originalObservation] of observations.entries()) {
       const call = calls[index]!;
       let observation = originalObservation;
@@ -783,15 +807,19 @@ export class AgentKernel {
         const count = priorCount + 1;
         context.actionFailures.set(fingerprint, count);
         if (circuitBlockedCallIds.has(call.id)) {
-          if (failureReason === undefined) failureReason = `Circuit breaker blocked identical replay for ${call.name}.`;
+          if (failureReason === undefined) {
+            failureReason = { reason: `Circuit breaker blocked identical replay for ${call.name}.` };
+          }
         } else if (count >= this.#options.maxRepeatedAction && failureReason === undefined) {
           const failure = observation.failure ?? classifyFailure(observation, {
             source: this.#tools.get(call.name)?.definition.effect === "execute" ? "process" : "tool",
           });
           if (failure.disposition === "transient" || failure.disposition === "cancelled") {
-            failureReason = this.#tools.has(call.name)
-              ? `Recovery and repeated-action budgets exhausted for ${call.name}.`
-              : `Repeated invalid tool action: ${call.name}`;
+            failureReason = {
+              reason: this.#tools.has(call.name)
+                ? `Recovery and repeated-action budgets exhausted for ${call.name}.`
+                : `Repeated invalid tool action: ${call.name}`,
+            };
           } else {
             const feedback = replanFeedback(
               failure,
@@ -898,8 +926,8 @@ export class AgentKernel {
     await this.#journal.append({ sequence: this.#sequence, type, data });
   }
 
-  async #fail(reason: string, steps: number): Promise<RunOutcome> {
-    await this.#record("run.failed", { reason, steps });
+  async #fail(reason: string, steps: number, poisoned = false): Promise<RunOutcome> {
+    await this.#record("run.failed", { reason, steps, ...(poisoned ? { poisoned: true } : {}) });
     return { status: "failed", reason, steps };
   }
 }
@@ -922,6 +950,7 @@ interface RestoredSession {
   readonly trailingNarrations: number;
   readonly stepsSinceReground: number;
   readonly completedMutations: number;
+  readonly poisonedReason: string | undefined;
 }
 
 function restoreSession(
@@ -949,6 +978,7 @@ function restoreSession(
   let trailingNarrations = 0;
   let stepsSinceReground = 0;
   let completedMutations = 0;
+  let poisonedReason: string | undefined;
 
   const flushCompletion = () => {
     if (pendingCompletion && completionClaimFailed) failedVerificationAttempts += 1;
@@ -1001,6 +1031,11 @@ function restoreSession(
       completed = true;
       continue;
     }
+    if (event.type === "run.failed") {
+      const data = recordValue(event.data);
+      if (data?.poisoned === true && typeof data.reason === "string") poisonedReason = data.reason;
+      continue;
+    }
     if (event.type === "session.restored" || event.type === "session.forked") {
       const data = recordValue(event.data);
       if (event.type === "session.forked" && data?.role !== "child") continue;
@@ -1041,11 +1076,17 @@ function restoreSession(
         : pendingCalls.findIndex((call) => call.id === callId);
       const call = matchedIndex >= 0 ? pendingCalls[matchedIndex] : undefined;
       if (matchedIndex >= 0) pendingCalls.splice(matchedIndex, 1);
+      const observedTool = call?.name ?? (typeof data?.tool === "string" ? data.tool : undefined);
+      const observedEffect = observedTool === undefined ? undefined : tools.get(observedTool)?.definition.effect;
+      if (event.type === "tool.failed" && observedEffect === "execute"
+        && isContainmentUncertain(data?.output)) {
+        poisonedReason = `Execution containment became uncertain in '${observedTool}'; this run is permanently fenced.`;
+      }
       if (call !== undefined) {
         const fingerprint = stableFingerprint(call.name, call.input);
         if (event.type === "tool.completed" && data?.ok !== false) {
           actionFailures.delete(fingerprint);
-          const effect = tools.get(call.name)?.definition.effect;
+          const effect = observedEffect;
           if (effect === "mutate") {
             completedMutations += 1;
             actionFailures.clear();
@@ -1088,6 +1129,7 @@ function restoreSession(
     trailingNarrations,
     stepsSinceReground,
     completedMutations,
+    poisonedReason,
   };
 }
 
@@ -1115,6 +1157,11 @@ function objectKeySorter(_key: string, value: unknown): unknown {
 
 function recordValue(value: JsonValue): Record<string, JsonValue> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+
+function isContainmentUncertain(value: JsonValue | undefined): boolean {
+  if (value === undefined) return false;
+  return recordValue(value)?.containmentUncertain === true;
 }
 
 function errorMessage(error: unknown): string {

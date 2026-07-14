@@ -16,6 +16,9 @@ export class CliVanguardRunner implements VanguardRunnerPort {
   }
 
   start(sessionRoot: string, message: string | undefined, hooks: VanguardRunHooks): VanguardRunHandle {
+    // Prepare every synchronous dependency before spawn. By RunnerPort
+    // contract, a thrown start() is proof that execution was not dispatched.
+    const redact = createSecretRedactor();
     const args = [this.#cliFile, "advance", "--session", sessionRoot];
     if (message !== undefined) args.push("--message", message);
     const child = spawn(process.execPath, args, {
@@ -27,21 +30,27 @@ export class CliVanguardRunner implements VanguardRunnerPort {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
-    const redact = createSecretRedactor();
+
     let stderrBuffer = Buffer.alloc(0);
     child.stderr.on("data", (chunk: Buffer) => {
-      stderrBuffer = Buffer.concat([stderrBuffer, chunk]);
-      while (true) {
-        const newline = stderrBuffer.indexOf(0x0a);
-        if (newline < 0) break;
-        const raw = stderrBuffer.subarray(0, newline);
-        stderrBuffer = stderrBuffer.subarray(newline + 1);
-        const line = raw.at(-1) === 0x0d ? raw.subarray(0, -1).toString("utf8") : raw.toString("utf8");
-        receiveLine(line, hooks, redact);
-      }
-      if (stderrBuffer.length > MAX_DIAGNOSTIC_LINE_BYTES) {
-        hooks.onLog(redact(stderrBuffer.subarray(0, MAX_DIAGNOSTIC_LINE_BYTES).toString("utf8")) + "…");
+      try {
+        stderrBuffer = Buffer.concat([stderrBuffer, chunk]);
+        while (true) {
+          const newline = stderrBuffer.indexOf(0x0a);
+          if (newline < 0) break;
+          const raw = stderrBuffer.subarray(0, newline);
+          stderrBuffer = stderrBuffer.subarray(newline + 1);
+          const line = raw.at(-1) === 0x0d ? raw.subarray(0, -1).toString("utf8") : raw.toString("utf8");
+          receiveLine(line, hooks, redact);
+        }
+        if (stderrBuffer.length > MAX_DIAGNOSTIC_LINE_BYTES) {
+          const truncated = redact(stderrBuffer.subarray(0, MAX_DIAGNOSTIC_LINE_BYTES).toString("utf8"));
+          safeLog(hooks, `${truncated}…`);
+          stderrBuffer = Buffer.alloc(0);
+        }
+      } catch (error) {
         stderrBuffer = Buffer.alloc(0);
+        safeLog(hooks, `Worker diagnostic stream failed: ${safeRedact(redact, errorMessage(error))}`);
       }
     });
     // The legacy command prints a human/JSON result on stdout. It is drained
@@ -66,12 +75,18 @@ export class CliVanguardRunner implements VanguardRunnerPort {
       while (controlQueue.length > 0) {
         const next = controlQueue.shift()!;
         controlQueueBytes -= next.bytes;
-        if (!child.stdin.write(next.frame, "utf8")) {
-          waitingForDrain = true;
-          child.stdin.once("drain", () => {
-            waitingForDrain = false;
-            flushControls();
-          });
+        try {
+          if (!child.stdin.write(next.frame, "utf8")) {
+            waitingForDrain = true;
+            child.stdin.once("drain", () => {
+              waitingForDrain = false;
+              flushControls();
+            });
+            return;
+          }
+        } catch (error) {
+          clearControls();
+          safeLog(hooks, `Worker control stream failed: ${safeRedact(redact, errorMessage(error))}`);
           return;
         }
       }
@@ -90,16 +105,21 @@ export class CliVanguardRunner implements VanguardRunnerPort {
       controlQueue.push({ frame, bytes });
       controlQueueBytes += bytes;
       flushControls();
+      if (required && controlClosed) throw new Error("Worker control channel is closed.");
     };
     const done = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       child.once("error", (error) => {
-        hooks.onLog(`Worker launch failed: ${redact(error.message)}`);
+        safeLog(hooks, `Worker launch failed: ${safeRedact(redact, error.message)}`);
       });
       child.once("close", (code, signal) => {
-        clearControls();
-        if (stderrBuffer.length > 0) receiveLine(stderrBuffer.toString("utf8"), hooks, redact);
-        if (forceTimer !== undefined) clearTimeout(forceTimer);
-        resolve({ code, signal });
+        try {
+          clearControls();
+          if (stderrBuffer.length > 0) receiveLine(stderrBuffer.toString("utf8"), hooks, redact);
+          if (forceTimer !== undefined) clearTimeout(forceTimer);
+        } finally {
+          // A close event is the only concrete process-stop receipt.
+          resolve({ code, signal });
+        }
       });
     });
     return {
@@ -116,7 +136,11 @@ export class CliVanguardRunner implements VanguardRunnerPort {
         controlQueueBytes = 0;
         send({ type: "cancel" }, false);
         forceTimer = setTimeout(() => {
-          if (child.exitCode === null && child.signalCode === null) child.kill();
+          try {
+            if (child.exitCode === null && child.signalCode === null) child.kill();
+          } catch (error) {
+            safeLog(hooks, `Worker force-stop failed: ${safeRedact(redact, errorMessage(error))}`);
+          }
         }, 2_000);
         forceTimer.unref?.();
       },
@@ -129,13 +153,41 @@ function receiveLine(line: string, hooks: VanguardRunHooks, redact: (text: strin
     try {
       const parsed = JSON.parse(line.slice(PUBLIC_EVENT_PREFIX.length)) as PublicRunEvent;
       if (parsed !== null && typeof parsed === "object" && typeof parsed.type === "string") {
-        hooks.onEvent(sanitizePublicEvent(parsed));
+        safeEvent(hooks, sanitizePublicEvent(parsed));
         return;
       }
     } catch {
-      hooks.onLog("Worker emitted a malformed public event.");
+      safeLog(hooks, "Worker emitted a malformed public event.");
       return;
     }
   }
-  if (line.length > 0) hooks.onLog(redact(line.slice(0, MAX_DIAGNOSTIC_LINE_BYTES)));
+  if (line.length > 0) safeLog(hooks, safeRedact(redact, line.slice(0, MAX_DIAGNOSTIC_LINE_BYTES)));
+}
+
+function safeEvent(hooks: VanguardRunHooks, event: PublicRunEvent): void {
+  try {
+    hooks.onEvent(event);
+  } catch {
+    // Host callbacks cannot tear down EventEmitter callbacks or falsify close.
+  }
+}
+
+function safeLog(hooks: VanguardRunHooks, line: string): void {
+  try {
+    hooks.onLog(line);
+  } catch {
+    // Logging is diagnostic-only and must never become a worker failure.
+  }
+}
+
+function safeRedact(redact: (text: string) => string, text: string): string {
+  try {
+    return redact(text);
+  } catch {
+    return "[diagnostic unavailable]";
+  }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

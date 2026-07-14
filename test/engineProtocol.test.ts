@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -603,7 +603,9 @@ test("compiled serve --stdio keeps stdout protocol-only", async () => {
   let stderr = "";
   child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
   child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
-  child.stdin.end(line(request("hello", "handshake", { versions: [1] })));
+  child.stdin.write(line(request("hello", "handshake", { versions: [1] })));
+  await until(() => stdout.includes("\n"), 5_000);
+  child.stdin.end();
   const exit = await new Promise<number | null>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", resolve);
@@ -614,6 +616,148 @@ test("compiled serve --stdio keeps stdout protocol-only", async () => {
   const response = JSON.parse(lines[0]!) as ReceivedFrame;
   assert.equal(response.id, "hello");
   assert.equal(response.ok, true);
+});
+
+test("stdio replay pages fit the configured byte limit and keep the connection usable", async () => {
+  const source = await workspace("protocol-replay-byte-page");
+  const runner = new FakeRunner();
+  const engine = new VanguardEngine({ runner, maxReplayEvents: 100, maxReplayBytesPerSession: 1_048_576 });
+  const created = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+  engine.advance(created.sessionId, "stream large events");
+  await until(() => runner.runs.has(created.sessionRoot));
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const frames = collectFrames(output);
+  const server = new VanguardStdioServer({
+    input,
+    output,
+    engine,
+    writer: { maxFrameBytes: 32_768, maxQueueBytes: 262_144 },
+  });
+  const closed = server.start();
+  try {
+    input.write(line(request("hello", "handshake", { versions: [1] })));
+    await waitForFrame(frames, (frame) => frame.id === "hello" && frame.ok === true);
+    for (let index = 0; index < 12; index += 1) {
+      runner.emit(created.sessionRoot, event("agent.message", `${index}:${"x".repeat(8_000)}`));
+    }
+    input.write(line(request("large-page", "events", {
+      sessionId: created.sessionId,
+      afterCursor: 0,
+      limit: 100,
+    })));
+    const replay = await waitForFrame(frames, (frame) => frame.id === "large-page" && frame.ok === true);
+    const replayed = replay.result?.events as unknown[];
+    assert.ok(replayed.length > 0 && replayed.length < 12);
+    assert.equal(replay.result?.hasMore, true);
+    assert.ok(Buffer.byteLength(`${JSON.stringify(replay)}\n`) <= 32_768);
+
+    input.write(line(request("still-alive", "status", { sessionId: created.sessionId })));
+    assert.equal((await waitForFrame(frames, (frame) => frame.id === "still-alive")).ok, true);
+    runner.runs.get(created.sessionRoot)?.finish();
+    await until(() => engine.status(created.sessionId).workerActive === false);
+    input.end();
+    assert.equal((await closed).complete, true);
+  } finally {
+    runner.runs.get(created.sessionRoot)?.finish();
+    if (!input.writableEnded) input.end();
+    await engine.shutdown();
+    await cleanup([created.sessionRoot, source]);
+  }
+});
+
+test("one replay event larger than the transport frame returns a correlated error without disconnect", async () => {
+  const source = await workspace("protocol-replay-single-too-large");
+  const runner = new FakeRunner();
+  const engine = new VanguardEngine({ runner });
+  const created = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+  engine.advance(created.sessionId, "emit one oversized transport event");
+  await until(() => runner.runs.has(created.sessionRoot));
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const frames = collectFrames(output);
+  const server = new VanguardStdioServer({
+    input,
+    output,
+    engine,
+    writer: { maxFrameBytes: 4_096, maxQueueBytes: 32_768 },
+  });
+  const closed = server.start();
+  try {
+    input.write(line(request("hello", "handshake", { versions: [1] })));
+    await waitForFrame(frames, (frame) => frame.id === "hello" && frame.ok === true);
+    runner.emit(created.sessionRoot, event("agent.message", "x".repeat(8_000)));
+    input.write(line(request("too-large", "events", { sessionId: created.sessionId, afterCursor: 0, limit: 1 })));
+    const rejected = await waitForFrame(frames, (frame) => frame.id === "too-large");
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.error?.code, "response_too_large");
+    input.write(line(request("still-alive", "status", { sessionId: created.sessionId })));
+    assert.equal((await waitForFrame(frames, (frame) => frame.id === "still-alive")).ok, true);
+    runner.runs.get(created.sessionRoot)?.finish();
+    await until(() => engine.status(created.sessionId).workerActive === false);
+    input.end();
+    assert.equal((await closed).complete, true);
+  } finally {
+    runner.runs.get(created.sessionRoot)?.finish();
+    if (!input.writableEnded) input.end();
+    await engine.shutdown();
+    await cleanup([created.sessionRoot, source]);
+  }
+});
+
+test("engine replay retention is byte-bounded with exact cursor gaps", async () => {
+  const source = await workspace("engine-replay-bytes");
+  const runner = new FakeRunner();
+  const engine = new VanguardEngine({
+    runner,
+    maxReplayEvents: 100,
+    maxReplayBytesPerSession: 25_000,
+  });
+  let root = "";
+  try {
+    const created = await engine.create({ workspace: source, provider: "deepseek", model: "test", verification });
+    root = created.sessionRoot;
+    engine.advance(created.sessionId, "emit large replay events");
+    await until(() => runner.runs.has(root));
+    for (let index = 0; index < 6; index += 1) {
+      runner.emit(root, event("agent.message", `${index}:${"x".repeat(8_000)}`));
+    }
+    const page = engine.events(created.sessionId, 0, 100);
+    assert.equal(page.latestCursor, 6);
+    assert.equal(page.gap, true);
+    assert.ok(page.events.length > 0 && page.events.length < 6);
+    assert.ok(page.replayFloorCursor > 1);
+    assert.ok(page.events.reduce((bytes, item) => bytes + Buffer.byteLength(JSON.stringify(item)), 0) <= 25_000);
+    runner.runs.get(root)?.finish();
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
+  }
+
+  assert.throws(
+    () => new VanguardEngine({ maxSessions: 10_000 }),
+    /256 MiB engine replay ceiling/u,
+  );
+});
+
+test("compiled serve --stdio persists idempotent create across process restart", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-cli-create-store-"));
+  const source = path.join(root, "workspace");
+  const store = path.join(root, "create-store");
+  const operationId = "op_cli_restart_0123456789abcdef0123456789abcdef";
+  await writeFile(path.join(root, "placeholder"), "ready");
+  await mkdir(source);
+  await writeFile(path.join(source, "index.mjs"), "export const value = 1;\n");
+  try {
+    const first = await compiledProtocolCreate(store, source, operationId);
+    const second = await compiledProtocolCreate(store, source, operationId);
+    assert.equal(second.sessionId, first.sessionId);
+    assert.equal(second.sessionRoot, first.sessionRoot);
+    assert.equal(first.ownerEpoch, 1);
+    assert.equal(second.ownerEpoch, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 function event(type: string, message: string): PublicRunEvent {
@@ -675,6 +819,48 @@ async function waitForFrame(
 
 function request(id: string, operation: string, params: Record<string, unknown>): Record<string, unknown> {
   return { type: "request", id, protocolVersion: 1, operation, params };
+}
+
+async function compiledProtocolCreate(
+  store: string,
+  source: string,
+  operationId: string,
+): Promise<Record<string, any>> {
+  const child = spawn(
+    process.execPath,
+    [path.resolve("dist/src/cli.js"), "serve", "--stdio", "--create-store", store],
+    { cwd: path.resolve("."), stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
+  );
+  const frames: ReceivedFrame[] = [];
+  let stderr = "";
+  const framer = new NdjsonFramer({
+    onFrame: (frame) => frames.push(JSON.parse(frame) as ReceivedFrame),
+    onError: (code) => { throw new Error(`Invalid child output: ${code}`); },
+  });
+  child.stdout.on("data", (chunk: Buffer) => framer.push(chunk));
+  child.stderr.setEncoding("utf8").on("data", (chunk: string) => { stderr += chunk; });
+  child.stdin.write(line(request("hello", "handshake", { versions: [1] })));
+  const hello = await waitForFrame(frames, (frame) => frame.id === "hello" && frame.ok === true, 10_000);
+  assert.ok(hello.result?.capabilities.includes("sessions.create.idempotent"));
+  assert.ok(hello.result?.capabilities.includes("sessions.workerFenced"));
+  assert.equal(hello.result?.capabilities.includes("sessions.executionTreeFenced"), false);
+  child.stdin.write(line(request("create", "create", {
+    operationId,
+    config: {
+      workspace: source,
+      provider: "deepseek",
+      model: "test",
+      verification: { command: process.execPath, args: ["--check", "index.mjs"] },
+    },
+  })));
+  const created = await waitForFrame(frames, (frame) => frame.id === "create" && frame.ok === true, 20_000);
+  child.stdin.end();
+  const exit = await new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  assert.equal(exit, 0, stderr);
+  return created.result!;
 }
 
 function line(value: unknown): string {

@@ -106,38 +106,93 @@ async function runProcess(
   signal: AbortSignal,
   environment: NodeJS.ProcessEnv,
 ): Promise<ToolResult> {
+  if (signal.aborted) return { ok: false, output: { error: "Process aborted before launch." } };
   return new Promise((resolve) => {
     const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: environment });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let settled = false;
+    let termination: "aborted" | "timed_out" | undefined;
+    let terminationEscalation: NodeJS.Timeout | undefined;
+    let containmentDeadline: NodeJS.Timeout | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> => {
+      if (current.length >= maxOutputBytes) return current;
+      const remaining = maxOutputBytes - current.length;
+      return Buffer.concat([current, chunk.length <= remaining ? chunk : chunk.subarray(0, remaining)]);
+    };
+    const onStdout = (chunk: Buffer): void => { stdout = append(stdout, chunk); };
+    const onStderr = (chunk: Buffer): void => { stderr = append(stderr, chunk); };
+    const stopCapture = (): void => {
+      child.stdout.off("data", onStdout);
+      child.stderr.off("data", onStderr);
+      child.stdout.destroy();
+      child.stderr.destroy();
+    };
 
     const finish = (result: ToolResult): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
+      if (terminationEscalation !== undefined) clearTimeout(terminationEscalation);
+      if (containmentDeadline !== undefined) clearTimeout(containmentDeadline);
       signal.removeEventListener("abort", abort);
       resolve(result);
     };
-    const abort = (): void => {
-      child.kill();
-      finish({ ok: false, output: { error: "Process aborted." } });
+    const terminate = (reason: "aborted" | "timed_out"): void => {
+      if (settled || termination !== undefined) return;
+      termination = reason;
+      if (timer !== undefined) clearTimeout(timer);
+      try { child.kill("SIGTERM"); } catch { /* The exact close/deadline below remains authoritative. */ }
+      terminationEscalation = setTimeout(() => {
+        if (settled) return;
+        try { child.kill("SIGKILL"); } catch { /* Report uncertainty if close still cannot be proven. */ }
+        containmentDeadline = setTimeout(() => {
+          stopCapture();
+          finish({
+            ok: false,
+            output: {
+              error: reason === "aborted"
+                ? "Process abort could not prove direct-child closure."
+                : "Process timeout could not prove direct-child closure.",
+              containmentUncertain: true,
+              ...(reason === "timed_out" ? { timeoutMs } : {}),
+            },
+          });
+        }, 1_000);
+      }, 1_000);
     };
-    const append = (current: Buffer<ArrayBufferLike>, chunk: Buffer<ArrayBufferLike>): Buffer<ArrayBufferLike> =>
-      Buffer.concat([current, chunk]).subarray(0, maxOutputBytes);
+    const abort = (): void => terminate("aborted");
 
-    child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
-    child.on("error", (error) => finish({ ok: false, output: { error: error.message } }));
-    child.on("close", (code) => finish({
-      ok: code === 0,
-      output: { exitCode: code ?? -1, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8") },
-    }));
-    const timer = setTimeout(() => {
-      child.kill();
-      finish({ ok: false, output: { error: "Process timed out.", timeoutMs } });
-    }, timeoutMs);
+    child.stdout.on("data", onStdout);
+    child.stderr.on("data", onStderr);
+    child.on("error", (error) => {
+      // A pre-dispatch spawn error has no live child. Once termination has
+      // begun, however, only `close` (or the explicit uncertainty deadline)
+      // may settle the operation.
+      if (termination === undefined) finish({ ok: false, output: { error: error.message } });
+    });
+    child.on("close", (code, closeSignal) => finish(termination === undefined
+      ? {
+          ok: code === 0,
+          output: { exitCode: code ?? -1, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8") },
+        }
+      : {
+          ok: false,
+          output: {
+            error: termination === "aborted" ? "Process aborted." : "Process timed out.",
+            ...(termination === "timed_out" ? { timeoutMs } : {}),
+            exitCode: code ?? -1,
+            signal: closeSignal ?? "",
+            stdout: stdout.toString("utf8"),
+            stderr: stderr.toString("utf8"),
+            directChildClosed: true,
+          },
+        }));
+    timer = setTimeout(() => terminate("timed_out"), timeoutMs);
     signal.addEventListener("abort", abort, { once: true });
+    // Cover an abort that raced the synchronous spawn/listener setup.
+    if (signal.aborted) abort();
   });
 }
 

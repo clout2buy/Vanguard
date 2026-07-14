@@ -123,6 +123,61 @@ test("a repeated deterministic failure requires replanning before another action
   assert.match(JSON.stringify(journal.events), /replan_and_checkpoint/);
 });
 
+test("execution containment uncertainty permanently poisons the run and survives resume", async () => {
+  let unsafeFollowupCalls = 0;
+  const uncertainExecution: ToolPort = {
+    name: "process.run",
+    definition: { ...toolDefinition("process.run"), effect: "execute" },
+    async execute() {
+      return { ok: false, output: { error: "close not proven", containmentUncertain: true } };
+    },
+  };
+  const unsafeFollowup: ToolPort = {
+    name: "workspace.write",
+    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    async execute() {
+      unsafeFollowupCalls += 1;
+      return { ok: true, output: "mutated" };
+    },
+  };
+  const journal = new MemoryJournal();
+  const first = new AgentKernel({
+    model: new ScriptedModel([{
+      kind: "tools",
+      calls: [
+        { id: "uncertain", name: "process.run", input: {} },
+        { id: "must-not-run", name: "workspace.write", input: { path: "unsafe" } },
+      ],
+    }]),
+    tools: [uncertainExecution, unsafeFollowup],
+    verifiers: [passingVerifier],
+    journal,
+  });
+  const failed = await first.run("contain every process");
+  assert.equal(failed.status, "failed");
+  assert.match(failed.status === "failed" ? failed.reason : "", /permanently fenced/u);
+  assert.equal(unsafeFollowupCalls, 0, "later calls in the same batch must not execute after uncertainty");
+  const poison = journal.events.find((event) => event.type === "run.failed");
+  assert.equal((poison?.data as Record<string, unknown>).poisoned, true);
+
+  const resumedModel = new CapturingModel([{ kind: "complete", answer: "must never be consulted" }]);
+  const truncated = journal.events.filter((event) => event.type !== "run.failed");
+  const resumed = new AgentKernel({
+    model: resumedModel,
+    tools: [uncertainExecution, unsafeFollowup],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  });
+  const resumedOutcome = await resumed.run(
+    "contain every process",
+    new AbortController().signal,
+    truncated,
+  );
+  assert.deepEqual(resumedOutcome, failed);
+  assert.equal(resumedModel.requests.length, 0);
+  assert.equal(unsafeFollowupCalls, 0);
+});
+
 test("a successful mutation resets repeated execution failure history", async () => {
   let attempts = 0;
   const execution: ToolPort = {

@@ -1,10 +1,13 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { FileJournal } from "../kernel/fileJournal.js";
 import { detectProjectVerification, type CommandSpec } from "../runtime/projectVerification.js";
 import { PublicRunEventPresenter, type PublicRunEvent } from "../runtime/publicRunEvents.js";
 import {
   createSessionShell,
+  createSessionShellAt,
+  fingerprintSessionSource,
   openCodingSession,
   type CodingSession,
 } from "../runtime/session.js";
@@ -14,15 +17,32 @@ import { extensionRuntimeState, resolveExtensions } from "../extensions/config.j
 import type { JsonValue } from "../kernel/contracts.js";
 import { resolveSecurityPolicy, type SecurityProfile } from "../security/policy.js";
 import {
+  FileCreateOperationStore,
+  canonicalDigest,
+  createOperationIdDigest,
+  sessionIdFor,
+  type DurableCreateClaim,
+  type DurableCreateReceipt,
+  type DurableOwnershipLease,
+} from "./createOperationStore.js";
+import {
   VanguardEngineError,
+  VANGUARD_EXECUTION_TREE_FENCING_CAPABILITY,
+  VANGUARD_IDEMPOTENT_CREATE_CAPABILITY,
+  VANGUARD_PROTOCOL_CAPABILITIES,
+  VANGUARD_WORKER_FENCING_CAPABILITY,
   type VanguardEngineEvent,
   type VanguardEngineOptions,
+  type VanguardCreateFaultContext,
+  type VanguardCreateOperationStoreOptions,
   type VanguardEventPage,
   type VanguardRunHandle,
   type VanguardRunnerPort,
   type VanguardSessionConfig,
+  type VanguardShutdownReceipt,
   type VanguardSessionState,
   type VanguardSessionStatus,
+  type VanguardStopReceipt,
 } from "./types.js";
 
 interface ManagedSession {
@@ -32,11 +52,18 @@ interface ManagedSession {
   nextCursor: number;
   replayFloorCursor: number;
   readonly events: VanguardEngineEvent[];
+  readonly eventSizes: number[];
+  eventBytes: number;
   handle: VanguardRunHandle | undefined;
   startTimer: NodeJS.Immediate | undefined;
   readonly pendingSteering: string[];
   steeringBytesThisAdvance: number;
   cancelRequested: boolean;
+  workerGeneration: number;
+  terminalStatePending: "completed" | "failed" | undefined;
+  stopBarrier: Promise<void> | undefined;
+  ownership: DurableOwnershipLease | undefined;
+  workerUncertain: boolean;
 }
 
 interface StoredCliOptions {
@@ -64,6 +91,19 @@ interface StoredCliOptions {
   readonly extensionInstructions?: string;
 }
 
+interface StoredRunConfiguration {
+  readonly version: 1;
+  readonly options: StoredCliOptions;
+}
+
+interface DurableSessionCreateBinding {
+  readonly version: 1;
+  readonly operationIdSha256: string;
+  readonly requestSha256: string;
+  readonly configSha256: string;
+  readonly sourceFingerprint: string;
+}
+
 /**
  * Public, transport-neutral Vanguard engine.
  *
@@ -73,62 +113,330 @@ interface StoredCliOptions {
  */
 export class VanguardEngine {
   readonly #runner: VanguardRunnerPort;
+  readonly #executionTreeFenced: boolean;
   readonly #maxReplayEvents: number;
+  readonly #maxReplayBytesPerSession: number;
   readonly #maxSessions: number;
   readonly #maxSteeringBytesPerAdvance: number;
+  readonly #shutdownTimeoutMs: number;
   readonly #logger: (line: string) => void;
+  readonly #createOperationStore: FileCreateOperationStore | undefined;
+  readonly #createFaultInjector: VanguardCreateOperationStoreOptions["faultInjector"];
+  readonly #ownerToken = randomUUID();
+  readonly #ownedLeases = new Map<string, DurableOwnershipLease>();
   readonly #sessions = new Map<string, ManagedSession>();
+  readonly #registrationFlights = new Map<string, Promise<VanguardSessionStatus>>();
+  readonly #pendingSessionReservations = new Map<string, number>();
+  #pendingLifecycleOperations = 0;
   readonly #listeners = new Set<(event: VanguardEngineEvent) => void>();
   #closed = false;
+  #shutdownPromise: Promise<VanguardShutdownReceipt> | undefined;
+  #shutdownComplete: VanguardShutdownReceipt | undefined;
 
   constructor(options: VanguardEngineOptions = {}) {
     this.#runner = options.runner ?? new CliVanguardRunner();
-    this.#maxReplayEvents = positiveInteger(options.maxReplayEvents ?? 4_096, "maxReplayEvents", 100_000);
+    const executionTreeFencing = this.#runner.executionTreeFencing;
+    this.#executionTreeFenced = executionTreeFencing?.version === 1
+      && executionTreeFencing.exactTreeClose === true;
     this.#maxSessions = positiveInteger(options.maxSessions ?? 128, "maxSessions", 10_000);
+    this.#maxReplayEvents = positiveInteger(options.maxReplayEvents ?? 4_096, "maxReplayEvents", 100_000);
+    this.#maxReplayBytesPerSession = positiveInteger(
+      options.maxReplayBytesPerSession ?? 1_048_576,
+      "maxReplayBytesPerSession",
+      67_108_864,
+    );
+    if (this.#maxSessions * this.#maxReplayBytesPerSession > 268_435_456) {
+      throw new VanguardEngineError(
+        "invalid_config",
+        "maxSessions multiplied by maxReplayBytesPerSession may not exceed the 256 MiB engine replay ceiling.",
+      );
+    }
     this.#maxSteeringBytesPerAdvance = positiveInteger(
       options.maxSteeringBytesPerAdvance ?? 1_048_576,
       "maxSteeringBytesPerAdvance",
       16_777_216,
     );
-    this.#logger = options.logger ?? (() => {});
+    this.#shutdownTimeoutMs = positiveInteger(options.shutdownTimeoutMs ?? 3_000, "shutdownTimeoutMs", 300_000);
+    this.#createOperationStore = options.createOperationStore === undefined
+      ? undefined
+      : new FileCreateOperationStore(options.createOperationStore);
+    this.#createFaultInjector = options.createOperationStore?.faultInjector;
+    const logger = options.logger ?? (() => {});
+    this.#logger = (line) => {
+      try { logger(line); } catch { /* Diagnostics may never disrupt engine ownership. */ }
+    };
   }
 
-  async create(config: VanguardSessionConfig): Promise<VanguardSessionStatus> {
+  capabilities(): readonly string[] {
+    return Object.freeze([
+      ...VANGUARD_PROTOCOL_CAPABILITIES,
+      ...(this.#createOperationStore === undefined
+        ? []
+        : [VANGUARD_IDEMPOTENT_CREATE_CAPABILITY, VANGUARD_WORKER_FENCING_CAPABILITY]),
+      ...(this.#executionTreeFenced
+        ? [VANGUARD_EXECUTION_TREE_FENCING_CAPABILITY]
+        : []),
+    ]);
+  }
+
+  async create(config: VanguardSessionConfig, operationId?: string): Promise<VanguardSessionStatus> {
     this.#assertOpen();
-    this.#assertSessionCapacity();
-    validateConfig(config);
-    const verificationWasDetected = config.verification === undefined;
-    const verification = config.verification ?? await detectProjectVerification(config.workspace);
-    if (verification === undefined) {
+    const snapshot = snapshotConfig(config);
+    const operationIdSha256 = operationId === undefined ? undefined : createOperationIdDigest(operationId);
+    if (operationIdSha256 !== undefined && this.#createOperationStore === undefined) {
       throw new VanguardEngineError(
-        "verification_not_found",
-        "Could not detect project verification; provide a sealed verification command.",
+        "create_operation_store_required",
+        "Idempotent create requires VanguardEngineOptions.createOperationStore.",
       );
     }
-    const resolvedExtensions = await resolveExtensions({ workspaceRoot: config.workspace });
-    const options = storedOptions(config, verification, verificationWasDetected, resolvedExtensions);
+    // Reserve synchronously before workspace/config discovery yields. Parallel
+    // direct API callers therefore cannot all allocate sessions past the
+    // bounded in-memory capacity. Retries for one deterministic operation
+    // share a single counted reservation.
+    const deterministicSessionId = operationIdSha256 === undefined ? undefined : sessionIdFor(operationIdSha256);
+    const finishLifecycle = this.#beginLifecycleOperation();
+    let releaseReservation = (): void => {};
+    try {
+      releaseReservation = this.#reserveSessionSlot(
+        deterministicSessionId === undefined ? undefined : `session:${deterministicSessionId}`,
+        deterministicSessionId,
+      );
+      const normalized = await normalizeWorkspace(snapshot);
+      this.#assertOpen();
+      if (operationIdSha256 === undefined) {
+        const runConfiguration = await resolveRunConfiguration(normalized);
+        this.#assertOpen();
+        return await this.#createUnkeyed(normalized, runConfiguration);
+      }
+      return await this.#createIdempotent(operationIdSha256, normalized);
+    } finally {
+      releaseReservation();
+      finishLifecycle();
+    }
+  }
+
+  async #createUnkeyed(
+    config: VanguardSessionConfig,
+    runConfiguration: StoredRunConfiguration,
+  ): Promise<VanguardSessionStatus> {
     const session = await createSessionShell(config.workspace);
     const root = path.dirname(session.workspaceRoot);
-    await writeFile(path.join(root, "run-config.json"), JSON.stringify({ version: 1, options }, null, 2), "utf8");
-    const managed = this.#newManagedSession(session, root, "idle");
-    this.#sessions.set(session.id, managed);
-    return this.#status(managed);
+    try {
+      this.#assertOpen();
+      await writeFile(path.join(root, "run-config.json"), JSON.stringify(runConfiguration, null, 2), "utf8");
+      this.#assertOpen();
+      const managed = this.#newManagedSession(session, root, "idle");
+      this.#sessions.set(session.id, managed);
+      return this.#status(managed);
+    } catch (error) {
+      await rm(root, { recursive: true, force: true });
+      throw error;
+    }
+  }
+
+  async #createIdempotent(
+    operationIdSha256: string,
+    normalizedRequest: VanguardSessionConfig,
+  ): Promise<VanguardSessionStatus> {
+    const store = this.#createOperationStore!;
+    this.#assertOpen();
+    const requestSha256 = canonicalDigest(normalizedRequest);
+    const sessionId = `vanguard-session-${operationIdSha256}`;
+    const persisted = await store.readClaim(operationIdSha256);
+    if (persisted !== undefined && persisted.requestSha256 !== requestSha256) {
+      throw new VanguardEngineError(
+        "create_operation_conflict",
+        "operationId is already bound to a different normalized session request.",
+        false,
+        { operationIdSha256, requestedRequestSha256: requestSha256, persistedRequestSha256: persisted.requestSha256 },
+      );
+    }
+    let claim = persisted;
+    if (claim === undefined) {
+      const sourceFingerprintBefore = await fingerprintSessionSource(normalizedRequest.workspace);
+      const runConfiguration = await resolveRunConfiguration(normalizedRequest);
+      this.#assertOpen();
+      const sourceFingerprint = await fingerprintSessionSource(normalizedRequest.workspace);
+      this.#assertOpen();
+      if (sourceFingerprint !== sourceFingerprintBefore) {
+        throw new VanguardEngineError(
+          "create_source_changed",
+          "The source workspace changed while Vanguard resolved the effective session configuration.",
+          true,
+        );
+      }
+      const configSha256 = canonicalDigest(runConfiguration);
+      const proposed: DurableCreateClaim = {
+        version: 1,
+        operationIdSha256,
+        requestSha256,
+        configSha256,
+        sessionId,
+        sourceFingerprint,
+        runConfigurationSha256: configSha256,
+        runConfiguration,
+      };
+      claim = (await store.reserve(proposed)).claim;
+      this.#assertOpen();
+      if (claim.requestSha256 !== requestSha256) {
+        throw new VanguardEngineError(
+          "create_operation_conflict",
+          "operationId was concurrently bound to a different normalized session request.",
+          false,
+          { operationIdSha256, requestedRequestSha256: requestSha256, persistedRequestSha256: claim.requestSha256 },
+        );
+      }
+    }
+    assertClaimMatchesRunConfiguration(claim);
+    const configSha256 = claim.configSha256;
+    let sessionRoot = await store.validatePersistedClaim(claim);
+    const faultContext = Object.freeze({ operationIdSha256, configSha256, sessionId: claim.sessionId, sessionRoot });
+    await this.#createFaultInjector?.("claim_persisted", faultContext);
+    this.#assertOpen();
+
+    const effective = requiredStoredRunConfiguration(claim.runConfiguration);
+    const session = await createSessionShellAt(effective.options.workspace, sessionRoot, async (stagingRoot, stagedSession) => {
+      if (stagedSession.sourceFingerprint !== claim.sourceFingerprint) {
+        throw new VanguardEngineError(
+          "create_source_changed",
+          "The source workspace changed after the durable create claim; recovery is refused.",
+        );
+      }
+      await writeDurableJson(path.join(stagingRoot, "run-config.json"), effective);
+      await writeDurableJson(path.join(stagingRoot, "create-operation.json"), {
+        version: 1,
+        operationIdSha256: claim.operationIdSha256,
+        requestSha256: claim.requestSha256,
+        configSha256: claim.configSha256,
+        sourceFingerprint: claim.sourceFingerprint,
+      });
+    });
+    this.#assertOpen();
+    if (session.id !== claim.sessionId || path.resolve(path.dirname(session.workspaceRoot)) !== path.resolve(sessionRoot)) {
+      throw new VanguardEngineError("create_operation_corrupt", "The durable session does not match its create claim.");
+    }
+    if (session.sourceRoot !== effective.options.workspace || session.sourceFingerprint !== claim.sourceFingerprint) {
+      throw new VanguardEngineError(
+        "create_source_changed",
+        "The source workspace no longer matches the durable create claim; recovery is refused.",
+      );
+    }
+    sessionRoot = await store.validatePersistedClaim(claim);
+    await validateStoredConfiguration(path.join(sessionRoot, "run-config.json"), claim.runConfigurationSha256);
+    await this.#createFaultInjector?.("session_persisted", faultContext);
+    this.#assertOpen();
+
+    const expectedReceipt: DurableCreateReceipt = {
+      version: 1,
+      operationIdSha256,
+      requestSha256,
+      configSha256,
+      sessionId: claim.sessionId,
+      sourceFingerprint: claim.sourceFingerprint,
+      runConfigurationSha256: claim.runConfigurationSha256,
+    };
+    const existingReceipt = await store.readReceipt(operationIdSha256);
+    if (existingReceipt !== undefined) assertReceiptMatches(existingReceipt, expectedReceipt);
+    else await store.commitReceipt(expectedReceipt);
+    await this.#createFaultInjector?.("receipt_persisted", faultContext);
+    await store.validatePersistedClaim(claim);
+    this.#assertOpen();
+    const ownership = await store.acquireOwnership(operationIdSha256, this.#ownerToken);
+    this.#rememberOwnership(ownership);
+    await this.#createFaultInjector?.("ownership_acquired", faultContext);
+    this.#assertOpen();
+    const status = await this.#registerSession(await openCodingSession(sessionRoot), ownership, faultContext);
+    this.#assertOpen();
+    return status;
   }
 
   /** Registers an existing durable session and reconstructs replayable events. */
   async resume(sessionRoot: string): Promise<VanguardSessionStatus> {
     this.#assertOpen();
-    const session = await openCodingSession(sessionRoot);
-    const existing = this.#sessions.get(session.id);
-    if (existing !== undefined) {
-      if (path.resolve(existing.root) !== path.resolve(path.dirname(session.workspaceRoot))) {
-        throw new VanguardEngineError("session_id_conflict", "A different session with this ID is already registered.");
-      }
-      return this.#status(existing);
+    const registeredSessionId = this.#registeredSessionIdForLocation(sessionRoot);
+    const finishLifecycle = this.#beginLifecycleOperation();
+    let releaseReservation = (): void => {};
+    try {
+      releaseReservation = this.#reserveSessionSlot(
+        registeredSessionId === undefined ? `resume:${reservationPath(sessionRoot)}` : `session:${registeredSessionId}`,
+        registeredSessionId,
+      );
+      return await this.#resumeReserved(sessionRoot);
+    } finally {
+      releaseReservation();
+      finishLifecycle();
     }
-    this.#assertSessionCapacity();
+  }
+
+  async #resumeReserved(sessionRoot: string): Promise<VanguardSessionStatus> {
+    const session = await openCodingSession(sessionRoot);
+    const binding = await readCreateOperationBinding(path.join(path.dirname(session.workspaceRoot), "create-operation.json"));
+    let ownership: DurableOwnershipLease | undefined;
+    let faultContext: VanguardCreateFaultContext | undefined;
+    if (binding !== undefined) {
+      if (this.#createOperationStore === undefined) {
+        throw new VanguardEngineError(
+          "create_operation_store_required",
+          "A durable create session may only be resumed through its configured operation store.",
+        );
+      }
+      const claim = await this.#createOperationStore.readClaim(binding.operationIdSha256);
+      if (claim === undefined || claim.sessionId !== session.id || claim.requestSha256 !== binding.requestSha256
+        || claim.configSha256 !== binding.configSha256 || claim.sourceFingerprint !== binding.sourceFingerprint) {
+        throw new VanguardEngineError("create_operation_corrupt", "Durable session binding does not match its operation claim.");
+      }
+      const expectedRoot = await this.#createOperationStore.validatePersistedClaim(claim);
+      if (path.resolve(expectedRoot) !== path.resolve(path.dirname(session.workspaceRoot))) {
+        throw new VanguardEngineError("create_operation_corrupt", "Durable session is outside its claimed operation root.");
+      }
+      this.#assertOpen();
+      ownership = await this.#createOperationStore.acquireOwnership(binding.operationIdSha256, this.#ownerToken);
+      this.#rememberOwnership(ownership);
+      faultContext = Object.freeze({
+        operationIdSha256: binding.operationIdSha256,
+        configSha256: binding.configSha256,
+        sessionId: session.id,
+        sessionRoot: expectedRoot,
+      });
+      await this.#createFaultInjector?.("ownership_acquired", faultContext);
+    }
+    this.#assertOpen();
+    const status = await this.#registerSession(session, ownership, faultContext);
+    this.#assertOpen();
+    return status;
+  }
+
+  async #registerSession(
+    session: CodingSession,
+    ownership: DurableOwnershipLease | undefined,
+    faultContext?: VanguardCreateFaultContext,
+  ): Promise<VanguardSessionStatus> {
+    const inFlight = this.#registrationFlights.get(session.id);
+    if (inFlight !== undefined) {
+      await inFlight;
+      const winner = this.#sessions.get(session.id);
+      if (winner === undefined) throw new VanguardEngineError("session_registration_failed", "Session registration did not publish.");
+      return this.#convergedSessionStatus(winner, session, ownership);
+    }
+    const flight = this.#registerSessionOnce(session, ownership, faultContext);
+    this.#registrationFlights.set(session.id, flight);
+    try {
+      return await flight;
+    } finally {
+      if (this.#registrationFlights.get(session.id) === flight) this.#registrationFlights.delete(session.id);
+    }
+  }
+
+  async #registerSessionOnce(
+    session: CodingSession,
+    ownership: DurableOwnershipLease | undefined,
+    faultContext?: VanguardCreateFaultContext,
+  ): Promise<VanguardSessionStatus> {
+    this.#assertOpen();
+    const existing = this.#sessions.get(session.id);
+    if (existing !== undefined) return this.#convergedSessionStatus(existing, session, ownership);
     await validateStoredConfiguration(path.join(path.dirname(session.workspaceRoot), "run-config.json"));
-    const managed = this.#newManagedSession(session, path.dirname(session.workspaceRoot), "idle");
+    const managed = this.#newManagedSession(session, path.dirname(session.workspaceRoot), "idle", ownership);
     const journal = await FileJournal.open(path.join(managed.root, "run.jsonl"), {
       ...(session.journalGenesisHash === undefined ? {} : { genesisHash: session.journalGenesisHash }),
     });
@@ -138,8 +446,34 @@ export class VanguardEngine {
       for (const publicEvent of presenter.present(event)) this.#record(managed, publicEvent, false);
     }
     managed.state = restoredState(journalEvents);
+    this.#assertOpen();
+    this.#assertSessionOwnership(managed);
+    if (faultContext !== undefined) {
+      await this.#createFaultInjector?.("registration_pre_publish", faultContext);
+      this.#assertOpen();
+      this.#assertSessionOwnership(managed);
+    }
+    const winner = this.#sessions.get(session.id);
+    if (winner !== undefined) return this.#convergedSessionStatus(winner, session, ownership);
     this.#sessions.set(session.id, managed);
     return this.#status(managed);
+  }
+
+  #convergedSessionStatus(
+    existing: ManagedSession,
+    requested: CodingSession,
+    ownership: DurableOwnershipLease | undefined,
+  ): VanguardSessionStatus {
+    if (path.resolve(existing.root) !== path.resolve(path.dirname(requested.workspaceRoot))) {
+      throw new VanguardEngineError("session_id_conflict", "A different session with this ID is already registered.");
+    }
+    if ((existing.ownership === undefined) !== (ownership === undefined)
+      || (ownership !== undefined && (existing.ownership?.ownerToken !== ownership.ownerToken
+        || existing.ownership.epoch !== ownership.epoch))) {
+      throw new VanguardEngineError("session_ownership_lost", "Registered session ownership does not match.");
+    }
+    this.#assertSessionOwnership(existing);
+    return this.#status(existing);
   }
 
   /** Starts one non-blocking advance; events arrive through subscribe/events. */
@@ -152,6 +486,13 @@ export class VanguardEngine {
       throw new VanguardEngineError("invalid_message", "Advance messages may not exceed 16,384 characters.");
     }
     const session = this.#requiredSession(sessionId);
+    this.#assertSessionOwnership(session);
+    if (session.workerUncertain) {
+      throw new VanguardEngineError(
+        "session_worker_uncertain",
+        "A prior worker generation lacks exact close/history proof; this session is permanently fenced.",
+      );
+    }
     if (session.handle !== undefined || session.startTimer !== undefined
       || session.state === "running" || session.state === "cancelling") {
       throw new VanguardEngineError("session_busy", "The session already has an active advance.", true);
@@ -161,6 +502,8 @@ export class VanguardEngine {
     }
     session.state = "running";
     session.cancelRequested = false;
+    session.terminalStatePending = undefined;
+    session.workerGeneration += 1;
     session.steeringBytesThisAdvance = 0;
     // setImmediate guarantees a transport can enqueue the advance response
     // before a very fast worker publishes its first event.
@@ -181,6 +524,7 @@ export class VanguardEngine {
       throw new VanguardEngineError("invalid_message", "Steering messages must be non-empty strings.");
     }
     const session = this.#requiredSession(sessionId);
+    this.#assertSessionOwnership(session);
     if (session.state !== "running" && session.state !== "waiting_for_user") {
       throw new VanguardEngineError("session_not_running", "Steering requires an active session.", true);
     }
@@ -213,6 +557,7 @@ export class VanguardEngine {
   cancel(sessionId: string): VanguardSessionStatus {
     this.#assertOpen();
     const session = this.#requiredSession(sessionId);
+    this.#assertSessionOwnership(session);
     if (session.handle === undefined && session.startTimer === undefined
       && session.state !== "running" && session.state !== "waiting_for_user" && session.state !== "cancelling") {
       throw new VanguardEngineError("session_not_running", "Cancellation requires an active session.", true);
@@ -223,9 +568,45 @@ export class VanguardEngine {
     return this.#status(session);
   }
 
+  /**
+   * Delivers cancellation and waits for the exact current worker generation
+   * to settle. A terminal event alone is never accepted as proof of stop.
+   */
+  async stopAndWait(sessionId: string, timeoutMs = 3_000): Promise<VanguardStopReceipt> {
+    this.#assertOpen();
+    positiveInteger(timeoutMs, "timeoutMs", 300_000);
+    const session = this.#requiredSession(sessionId);
+    const ownershipValid = this.#sessionOwnershipValid(session);
+    const generation = session.workerGeneration;
+    if (session.startTimer !== undefined) {
+      clearImmediate(session.startTimer);
+      session.startTimer = undefined;
+      session.cancelRequested = true;
+      session.terminalStatePending = undefined;
+      session.state = "cancelled";
+      return this.#stopReceipt(session, generation, ownershipValid);
+    }
+    if (session.handle === undefined && session.stopBarrier === undefined) {
+      return this.#stopReceipt(session, generation, ownershipValid && !session.workerUncertain);
+    }
+    session.cancelRequested = true;
+    session.state = "cancelling";
+    this.#cancelWorker(session, "Stop cancellation delivery failed");
+    const barrier = session.stopBarrier;
+    const stopped = barrier === undefined ? session.handle === undefined : await settleWithin(barrier, timeoutMs);
+    return this.#stopReceipt(session, generation, ownershipValid && this.#sessionOwnershipValid(session) && stopped
+      && session.workerGeneration === generation
+      && session.handle === undefined
+      && session.startTimer === undefined
+      && session.stopBarrier === undefined
+      && !session.workerUncertain);
+  }
+
   status(sessionId: string): VanguardSessionStatus {
     this.#assertOpen();
-    return this.#status(this.#requiredSession(sessionId));
+    const session = this.#requiredSession(sessionId);
+    this.#assertSessionOwnership(session);
+    return this.#status(session);
   }
 
   events(sessionId: string, afterCursor = 0, limit = 500): VanguardEventPage {
@@ -235,16 +616,17 @@ export class VanguardEngine {
     }
     const boundedLimit = positiveInteger(limit, "limit", 2_000);
     const session = this.#requiredSession(sessionId);
+    this.#assertSessionOwnership(session);
     const available = session.events.filter((entry) => entry.cursor > afterCursor);
-    return {
+    return Object.freeze({
       sessionId,
-      events: available.slice(0, boundedLimit),
+      events: Object.freeze(available.slice(0, boundedLimit)),
       afterCursor,
       latestCursor: session.nextCursor - 1,
       replayFloorCursor: session.replayFloorCursor,
       gap: afterCursor < session.replayFloorCursor - 1,
       hasMore: available.length > boundedLimit,
-    };
+    });
   }
 
   subscribe(listener: (event: VanguardEngineEvent) => void): () => void {
@@ -253,38 +635,114 @@ export class VanguardEngine {
     return () => this.#listeners.delete(listener);
   }
 
-  async shutdown(): Promise<void> {
-    if (this.#closed) return;
+  shutdown(): Promise<VanguardShutdownReceipt> {
+    if (this.#shutdownComplete !== undefined) return Promise.resolve(this.#shutdownComplete);
+    if (this.#shutdownPromise !== undefined) return this.#shutdownPromise;
+    const pending = this.#performShutdown();
+    this.#shutdownPromise = pending;
+    void pending.then((receipt) => {
+      if (this.#shutdownPromise !== pending) return;
+      this.#shutdownPromise = undefined;
+      if (receipt.complete) this.#shutdownComplete = receipt;
+    }, () => {
+      if (this.#shutdownPromise === pending) this.#shutdownPromise = undefined;
+    });
+    return pending;
+  }
+
+  async #performShutdown(): Promise<VanguardShutdownReceipt> {
     this.#closed = true;
-    const completions: Promise<unknown>[] = [];
+    const completions: Promise<void>[] = [];
     for (const session of this.#sessions.values()) {
       if (session.startTimer !== undefined) {
         clearImmediate(session.startTimer);
         session.startTimer = undefined;
+        session.cancelRequested = true;
+        session.terminalStatePending = undefined;
         session.state = "cancelled";
       }
       if (session.handle !== undefined) {
         session.cancelRequested = true;
+        session.state = "cancelling";
         this.#cancelWorker(session, "Shutdown cancellation failed");
-        completions.push(session.handle.done);
+        if (session.stopBarrier !== undefined) completions.push(session.stopBarrier);
       }
     }
-    await Promise.race([
-      Promise.allSettled(completions),
-      new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, 3_000);
-        timer.unref?.();
-      }),
-    ]);
+    await settleWithin(Promise.allSettled(completions).then(() => undefined), this.#shutdownTimeoutMs);
     this.#listeners.clear();
+    const unresolvedSessionIds = [...this.#sessions.values()]
+      .filter((session) => session.handle !== undefined || session.startTimer !== undefined
+        || session.stopBarrier !== undefined || session.workerUncertain)
+      .map((session) => session.session.id);
+    const unresolved = new Set(unresolvedSessionIds);
+    for (const [operationIdSha256, lease] of this.#ownedLeases) {
+      const sessionId = sessionIdFor(operationIdSha256);
+      if (unresolved.has(sessionId)) continue;
+      try {
+        await this.#createOperationStore?.releaseOwnership(lease);
+        this.#ownedLeases.delete(operationIdSha256);
+      } catch (error) {
+        unresolved.add(sessionId);
+        this.#logger(`Ownership release failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const unresolvedOperations = this.#pendingLifecycleOperations;
+    const finalUnresolved = [...unresolved];
+    const stoppedSessionIds = [...this.#sessions.keys()].filter((sessionId) => !unresolved.has(sessionId));
+    return Object.freeze({
+      version: 1,
+      complete: finalUnresolved.length === 0 && unresolvedOperations === 0,
+      stoppedSessionIds: Object.freeze(stoppedSessionIds),
+      unresolvedSessionIds: Object.freeze(finalUnresolved),
+      unresolvedOperations,
+    });
   }
 
   #startWorker(session: ManagedSession, message: string | undefined): void {
-    let handle: VanguardRunHandle;
+    const generation = session.workerGeneration;
+    try {
+      this.#assertSessionOwnership(session);
+    } catch (error) {
+      session.state = "failed";
+      this.#logger(`Worker start fenced: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    let handle: VanguardRunHandle | undefined;
+    let assigned = false;
+    const bufferedEvents: PublicRunEvent[] = [];
+    const bufferedLogs: string[] = [];
+    let bufferedEventOverflow = false;
+    const acceptEvent = (event: PublicRunEvent): void => {
+      try {
+        if (!assigned) {
+          if (bufferedEventOverflow) return;
+          if (bufferedEvents.length < 256) bufferedEvents.push(event);
+          else {
+            bufferedEventOverflow = true;
+            bufferedEvents.length = 0;
+          }
+          return;
+        }
+        if (handle !== undefined) this.#record(session, event, true, generation, handle);
+      } catch (error) {
+        this.#logger(`Worker event rejected: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    const acceptLog = (line: string): void => {
+      try {
+        if (!assigned) {
+          if (bufferedLogs.length < 256) bufferedLogs.push(line);
+          return;
+        }
+        if (session.workerGeneration === generation && session.handle === handle) this.#logger(line);
+      } catch {
+        // Host loggers are diagnostics only and may not disrupt ownership.
+      }
+    };
     try {
       handle = this.#runner.start(session.root, message, {
-        onEvent: (event) => this.#record(session, event, true),
-        onLog: (line) => this.#logger(line),
+        onEvent: acceptEvent,
+        onLog: acceptLog,
       });
     } catch (error) {
       session.state = "failed";
@@ -294,7 +752,20 @@ export class VanguardEngine {
       return;
     }
     session.handle = handle;
-    void handle.done.then(async (exit) => {
+    assigned = true;
+    if (!bufferedEventOverflow) {
+      for (const event of bufferedEvents) acceptEvent(event);
+    }
+    for (const line of bufferedLogs) acceptLog(line);
+    try {
+      this.#assertSessionOwnership(session);
+    } catch (error) {
+      session.terminalStatePending = "failed";
+      this.#logger(`Worker ownership lost at launch: ${error instanceof Error ? error.message : String(error)}`);
+      this.#cancelWorker(session, "Worker cleanup after ownership loss failed");
+    }
+    const cleanup = handle.done.then(async (exit) => {
+      if (session.workerGeneration !== generation || session.handle !== handle) return;
       session.handle = undefined;
       try {
         session.session = await openCodingSession(session.root);
@@ -303,14 +774,33 @@ export class VanguardEngine {
         // was externally removed while a worker was shutting down.
       }
       if (session.cancelRequested) session.state = "cancelled";
-      else if (session.state !== "completed" && session.state !== "failed" && session.state !== "waiting_for_user") {
-        session.state = exit.code === 0 ? "idle" : "failed";
-      }
+      else if (session.terminalStatePending !== undefined) session.state = session.terminalStatePending;
+      else if (session.state !== "waiting_for_user") session.state = exit.code === 0 ? "idle" : "failed";
+      session.terminalStatePending = undefined;
     }).catch((error: unknown) => {
-      session.handle = undefined;
-      session.state = session.cancelRequested ? "cancelled" : "failed";
+      if (session.workerGeneration === generation && session.handle === handle) {
+        session.terminalStatePending = undefined;
+        session.workerUncertain = true;
+        session.state = session.cancelRequested ? "cancelled" : "failed";
+      }
       this.#logger(`Worker completion failed: ${error instanceof Error ? error.message : String(error)}`);
     });
+    const barrier = cleanup.finally(() => {
+      if (session.workerGeneration === generation && session.stopBarrier === barrier) session.stopBarrier = undefined;
+    });
+    session.stopBarrier = barrier;
+    void barrier;
+    if (bufferedEventOverflow) {
+      // A synchronous runner overflow means public history is incomplete.
+      // Cancel the exact returned handle and retain a fail-closed uncertainty
+      // marker even if process close is later observed.
+      session.workerUncertain = true;
+      session.terminalStatePending = "failed";
+      session.state = "cancelling";
+      this.#logger("Worker emitted more than 256 events before returning its handle; session fenced.");
+      this.#cancelWorker(session, "Worker cleanup after synchronous event overflow failed");
+      return;
+    }
     if (session.cancelRequested) {
       // Cancellation outranks any guidance queued before the deferred launch.
       session.pendingSteering.length = 0;
@@ -323,6 +813,7 @@ export class VanguardEngine {
       // Steering can be queued between advance() and the deferred worker
       // launch. A runner-side backpressure failure must not escape the
       // setImmediate callback or leave a live worker eligible for overlap.
+      session.terminalStatePending = "failed";
       session.state = "failed";
       this.#logger(`Queued steering delivery failed: ${error instanceof Error ? error.message : String(error)}`);
       this.#cancelWorker(session, "Worker cleanup after steering failure failed");
@@ -340,16 +831,35 @@ export class VanguardEngine {
     }
   }
 
-  #record(session: ManagedSession, event: PublicRunEvent, notify: boolean): void {
-    const sanitized = sanitizePublicEvent(event);
-    const envelope: VanguardEngineEvent = {
+  #record(
+    session: ManagedSession,
+    event: PublicRunEvent,
+    notify: boolean,
+    generation?: number,
+    handle?: VanguardRunHandle,
+  ): void {
+    if (generation !== undefined && (session.workerGeneration !== generation || session.handle !== handle)) return;
+    if (generation !== undefined && !this.#sessionOwnershipValid(session)) {
+      session.terminalStatePending = "failed";
+      session.state = "cancelling";
+      this.#cancelWorker(session, "Worker fenced after ownership loss");
+      return;
+    }
+    const sanitized = deepFreeze(sanitizePublicEvent(event));
+    const envelope: VanguardEngineEvent = Object.freeze({
       sessionId: session.session.id,
       cursor: session.nextCursor,
       event: sanitized,
-    };
+    });
     session.nextCursor += 1;
+    const envelopeBytes = Buffer.byteLength(JSON.stringify(envelope), "utf8");
     session.events.push(envelope);
-    while (session.events.length > this.#maxReplayEvents) session.events.shift();
+    session.eventSizes.push(envelopeBytes);
+    session.eventBytes += envelopeBytes;
+    while (session.events.length > this.#maxReplayEvents || session.eventBytes > this.#maxReplayBytesPerSession) {
+      session.events.shift();
+      session.eventBytes -= session.eventSizes.shift() ?? 0;
+    }
     session.replayFloorCursor = session.events[0]?.cursor ?? session.nextCursor;
     if (sanitized.type === "session.ready" && sanitized.materialized === true) {
       // The worker materializes after the conversation contract is journaled.
@@ -358,8 +868,16 @@ export class VanguardEngine {
       session.session = { ...session.session, materialized: true };
     }
     if (sanitized.type === "run.waiting_for_user") session.state = "waiting_for_user";
-    else if (sanitized.type === "run.completed") session.state = "completed";
-    else if (sanitized.type === "run.failed") session.state = "failed";
+    else if (sanitized.type === "run.completed" || sanitized.type === "run.failed") {
+      const terminal = sanitized.type === "run.completed" ? "completed" : "failed";
+      if (session.handle !== undefined || session.startTimer !== undefined || session.state === "running"
+        || session.state === "cancelling" || session.state === "waiting_for_user") {
+        session.terminalStatePending = terminal;
+        // Preserve the established public task-state transition while
+        // workerActive remains the independent, authoritative close proof.
+        session.state = terminal;
+      } else session.state = terminal;
+    }
     else if (sanitized.type === "run.contracted" && session.state !== "running") session.state = "idle";
     if (!notify) return;
     for (const listener of this.#listeners) {
@@ -371,7 +889,12 @@ export class VanguardEngine {
     }
   }
 
-  #newManagedSession(session: CodingSession, root: string, state: VanguardSessionState): ManagedSession {
+  #newManagedSession(
+    session: CodingSession,
+    root: string,
+    state: VanguardSessionState,
+    ownership?: DurableOwnershipLease,
+  ): ManagedSession {
     return {
       session,
       root,
@@ -379,11 +902,18 @@ export class VanguardEngine {
       nextCursor: 1,
       replayFloorCursor: 1,
       events: [],
+      eventSizes: [],
+      eventBytes: 0,
       handle: undefined,
       startTimer: undefined,
       pendingSteering: [],
       steeringBytesThisAdvance: 0,
       cancelRequested: false,
+      workerGeneration: 0,
+      terminalStatePending: undefined,
+      stopBarrier: undefined,
+      ownership,
+      workerUncertain: false,
     };
   }
 
@@ -396,28 +926,134 @@ export class VanguardEngine {
     return session;
   }
 
+  #assertSessionOwnership(session: ManagedSession): void {
+    if (session.ownership === undefined) return;
+    if (this.#createOperationStore === undefined) {
+      throw new VanguardEngineError("session_ownership_lost", "Durable session ownership store is unavailable.");
+    }
+    this.#createOperationStore.assertOwnershipSync(session.ownership);
+  }
+
+  #sessionOwnershipValid(session: ManagedSession): boolean {
+    try {
+      this.#assertSessionOwnership(session);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   #status(managed: ManagedSession): VanguardSessionStatus {
-    return {
+    return Object.freeze({
       sessionId: managed.session.id,
       sessionRoot: managed.root,
       sourceRoot: managed.session.sourceRoot,
       workspaceRoot: managed.session.workspaceRoot,
       materialized: managed.session.materialized,
       state: managed.state,
+      workerActive: managed.handle !== undefined || managed.startTimer !== undefined
+        || managed.stopBarrier !== undefined || managed.workerUncertain,
+      workerGeneration: managed.workerGeneration,
+      ...(managed.ownership === undefined ? {} : { ownerEpoch: managed.ownership.epoch }),
       latestCursor: managed.nextCursor - 1,
       replayFloorCursor: managed.replayFloorCursor,
-    };
+    });
   }
 
   #assertOpen(): void {
     if (this.#closed) throw new VanguardEngineError("engine_closed", "The Vanguard engine is closed.");
   }
 
-  #assertSessionCapacity(): void {
-    if (this.#sessions.size >= this.#maxSessions) {
-      throw new VanguardEngineError("session_capacity", "The engine's bounded session capacity is full.", true);
-    }
+  #stopReceipt(session: ManagedSession, generation: number, stopped: boolean): VanguardStopReceipt {
+    return Object.freeze({
+      version: 1,
+      sessionId: session.session.id,
+      stopped,
+      state: session.state,
+      workerGeneration: generation,
+      ...(session.ownership === undefined ? {} : { ownerEpoch: session.ownership.epoch }),
+    });
   }
+
+  #registeredSessionIdForLocation(location: string): string | undefined {
+    const candidate = reservationPath(location);
+    for (const session of this.#sessions.values()) {
+      const root = reservationPath(session.root);
+      if (root === candidate || root === normalizedPath(path.dirname(candidate))) return session.session.id;
+    }
+    return undefined;
+  }
+
+  #rememberOwnership(lease: DurableOwnershipLease): void {
+    const held = this.#ownedLeases.get(lease.operationIdSha256);
+    if (held !== undefined && (held.ownerToken !== lease.ownerToken || held.epoch !== lease.epoch)) {
+      throw new VanguardEngineError(
+        "session_ownership_lost",
+        "The engine's durable ownership reference changed during registration.",
+      );
+    }
+    if (held === undefined) this.#ownedLeases.set(lease.operationIdSha256, lease);
+  }
+
+  #reserveSessionSlot(sharedKey?: string, registeredSessionId?: string): () => void {
+    if (registeredSessionId !== undefined && this.#sessions.has(registeredSessionId)) return () => {};
+    const key = sharedKey ?? `create:${randomUUID()}`;
+    const current = this.#pendingSessionReservations.get(key);
+    if (current !== undefined) {
+      this.#pendingSessionReservations.set(key, current + 1);
+    } else {
+      if (this.#sessions.size + this.#pendingSessionReservations.size >= this.#maxSessions) {
+        throw new VanguardEngineError("session_capacity", "The engine's bounded session capacity is full.", true);
+      }
+      this.#pendingSessionReservations.set(key, 1);
+    }
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const references = this.#pendingSessionReservations.get(key);
+      if (references === undefined || references <= 1) this.#pendingSessionReservations.delete(key);
+      else this.#pendingSessionReservations.set(key, references - 1);
+    };
+  }
+
+  #beginLifecycleOperation(): () => void {
+    this.#pendingLifecycleOperations += 1;
+    let finished = false;
+    return () => {
+      if (finished) return;
+      finished = true;
+      this.#pendingLifecycleOperations -= 1;
+    };
+  }
+
+}
+
+function reservationPath(location: string): string {
+  if (typeof location !== "string" || location.length === 0 || location.includes("\0")) {
+    throw new VanguardEngineError("invalid_session_root", "sessionRoot must be a non-empty path string.");
+  }
+  return normalizedPath(path.resolve(location));
+}
+
+function normalizedPath(value: string): string {
+  return process.platform === "win32" ? value.toLowerCase() : value;
+}
+
+async function resolveRunConfiguration(config: VanguardSessionConfig): Promise<StoredRunConfiguration> {
+  const verificationWasDetected = config.verification === undefined;
+  const verification = config.verification ?? await detectProjectVerification(config.workspace);
+  if (verification === undefined) {
+    throw new VanguardEngineError(
+      "verification_not_found",
+      "Could not detect project verification; provide a sealed verification command.",
+    );
+  }
+  const resolvedExtensions = await resolveExtensions({ workspaceRoot: config.workspace });
+  return deepFreeze({
+    version: 1,
+    options: storedOptions(config, verification, verificationWasDetected, resolvedExtensions),
+  });
 }
 
 function storedOptions(
@@ -464,78 +1100,312 @@ function storedOptions(
   };
 }
 
-function validateConfig(config: VanguardSessionConfig): void {
-  if (config === null || typeof config !== "object") throw new VanguardEngineError("invalid_config", "Session config is required.");
-  if (typeof config.workspace !== "string" || config.workspace.length === 0) {
-    throw new VanguardEngineError("invalid_config", "workspace must be a non-empty path.");
+function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
+  const raw = ownDataRecord(config, "Session config");
+  const allowed = new Set([
+    "adaptiveVerification", "allowedCommands", "commandTimeoutMs", "editableRoots", "endpoint",
+    "exposeRawProcess", "maxContextBytes", "maxDurationMs", "maxFailedVerificationAttempts",
+    "maxSteps", "model", "protectedPaths", "provider", "publicCheck", "restrictProcess",
+    "securityProfile", "verification", "verifierEvidence", "workspace",
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) throw new VanguardEngineError("invalid_config", `Unsupported session config field '${key}'.`);
   }
-  if (!(["openai", "anthropic", "deepseek", "http"] as const).includes(config.provider)) {
+  const workspace = boundedString(raw.workspace, "workspace", 32_768, true);
+  if (!(["openai", "anthropic", "deepseek", "http"] as const).includes(raw.provider as never)) {
     throw new VanguardEngineError("invalid_config", "provider is unsupported.");
   }
-  if (typeof config.model !== "string" || config.model.length === 0) {
-    throw new VanguardEngineError("invalid_config", "model must be non-empty.");
-  }
-  if (config.provider === "http" && (config.endpoint === undefined || config.endpoint.length === 0)) {
+  const provider = raw.provider as VanguardSessionConfig["provider"];
+  const model = boundedString(raw.model, "model", 4_096, true);
+  if (provider === "http" && (raw.endpoint === undefined || raw.endpoint === "")) {
     throw new VanguardEngineError("invalid_config", "The http provider requires endpoint.");
   }
-  if (config.endpoint !== undefined && typeof config.endpoint !== "string") {
-    throw new VanguardEngineError("invalid_config", "endpoint must be a string.");
-  }
-  if (config.securityProfile !== undefined && config.securityProfile !== "workspace" && config.securityProfile !== "guarded") {
+  const endpoint = raw.endpoint === undefined ? undefined : boundedString(raw.endpoint, "endpoint", 16_384, false);
+  if (raw.securityProfile !== undefined && raw.securityProfile !== "workspace" && raw.securityProfile !== "guarded") {
     throw new VanguardEngineError("invalid_config", "securityProfile must be 'workspace' or 'guarded'.");
   }
-  if (config.verification !== undefined) validateCommand(config.verification, "verification");
-  if (config.publicCheck !== undefined) validateCommand(config.publicCheck, "publicCheck");
+  const verification = raw.verification === undefined ? undefined : cloneCommand(raw.verification, "verification");
+  const publicCheck = raw.publicCheck === undefined ? undefined : cloneCommand(raw.publicCheck, "publicCheck");
+  const allowedCommands = cloneStringArray(raw.allowedCommands, "allowedCommands");
+  const protectedPaths = cloneStringArray(raw.protectedPaths, "protectedPaths");
+  const editableRoots = cloneStringArray(raw.editableRoots, "editableRoots");
   for (const [field, value] of [
-    ["allowedCommands", config.allowedCommands],
-    ["protectedPaths", config.protectedPaths],
-    ["editableRoots", config.editableRoots],
-  ] as const) {
-    if (value !== undefined && (!Array.isArray(value) || value.some((item) => typeof item !== "string"))) {
-      throw new VanguardEngineError("invalid_config", `${field} must be an array of strings.`);
-    }
-  }
-  for (const [field, value] of [
-    ["adaptiveVerification", config.adaptiveVerification],
-    ["restrictProcess", config.restrictProcess],
-    ["exposeRawProcess", config.exposeRawProcess],
+    ["adaptiveVerification", raw.adaptiveVerification],
+    ["restrictProcess", raw.restrictProcess],
+    ["exposeRawProcess", raw.exposeRawProcess],
   ] as const) {
     if (value !== undefined && typeof value !== "boolean") {
       throw new VanguardEngineError("invalid_config", `${field} must be boolean.`);
     }
   }
-  if (config.verifierEvidence !== undefined && config.verifierEvidence !== "full" && config.verifierEvidence !== "summary") {
+  if (raw.verifierEvidence !== undefined && raw.verifierEvidence !== "full" && raw.verifierEvidence !== "summary") {
     throw new VanguardEngineError("invalid_config", "verifierEvidence must be 'full' or 'summary'.");
   }
   try {
     resolveSecurityPolicy({
-      ...(config.securityProfile === undefined ? {} : { profile: config.securityProfile }),
-      ...(config.restrictProcess === undefined ? {} : { restrictProcess: config.restrictProcess }),
-      ...(config.exposeRawProcess === undefined ? {} : { exposeRawProcess: config.exposeRawProcess }),
-      ...(config.verifierEvidence === undefined ? {} : { verifierEvidence: config.verifierEvidence }),
+      ...(raw.securityProfile === undefined ? {} : { profile: raw.securityProfile as SecurityProfile }),
+      ...(raw.restrictProcess === undefined ? {} : { restrictProcess: raw.restrictProcess as boolean }),
+      ...(raw.exposeRawProcess === undefined ? {} : { exposeRawProcess: raw.exposeRawProcess as boolean }),
+      ...(raw.verifierEvidence === undefined ? {} : { verifierEvidence: raw.verifierEvidence as "full" | "summary" }),
     });
   } catch (error) {
     throw new VanguardEngineError("invalid_config", error instanceof Error ? error.message : String(error));
   }
+  for (const [field, value, maximum] of [
+    ["maxSteps", raw.maxSteps, 100_000],
+    ["maxDurationMs", raw.maxDurationMs, 7 * 24 * 60 * 60 * 1_000],
+    ["commandTimeoutMs", raw.commandTimeoutMs, 24 * 60 * 60 * 1_000],
+    ["maxContextBytes", raw.maxContextBytes, 100_000_000],
+    ["maxFailedVerificationAttempts", raw.maxFailedVerificationAttempts, 100],
+  ] as const) {
+    if (value !== undefined) positiveInteger(value as number, field, maximum);
+  }
+  const result: VanguardSessionConfig = {
+    workspace,
+    provider,
+    model,
+    ...(endpoint === undefined ? {} : { endpoint }),
+    ...(verification === undefined ? {} : { verification }),
+    ...(publicCheck === undefined ? {} : { publicCheck }),
+    ...(raw.adaptiveVerification === undefined ? {} : { adaptiveVerification: raw.adaptiveVerification as boolean }),
+    ...(allowedCommands === undefined ? {} : { allowedCommands }),
+    ...(protectedPaths === undefined ? {} : { protectedPaths }),
+    ...(editableRoots === undefined ? {} : { editableRoots }),
+    ...(raw.securityProfile === undefined ? {} : { securityProfile: raw.securityProfile as SecurityProfile }),
+    ...(raw.restrictProcess === undefined ? {} : { restrictProcess: raw.restrictProcess as boolean }),
+    ...(raw.exposeRawProcess === undefined ? {} : { exposeRawProcess: raw.exposeRawProcess as boolean }),
+    ...(raw.verifierEvidence === undefined ? {} : { verifierEvidence: raw.verifierEvidence as "full" | "summary" }),
+    ...(raw.maxSteps === undefined ? {} : { maxSteps: raw.maxSteps as number }),
+    ...(raw.maxDurationMs === undefined ? {} : { maxDurationMs: raw.maxDurationMs as number }),
+    ...(raw.commandTimeoutMs === undefined ? {} : { commandTimeoutMs: raw.commandTimeoutMs as number }),
+    ...(raw.maxContextBytes === undefined ? {} : { maxContextBytes: raw.maxContextBytes as number }),
+    ...(raw.maxFailedVerificationAttempts === undefined
+      ? {}
+      : { maxFailedVerificationAttempts: raw.maxFailedVerificationAttempts as number }),
+  };
+  if (Buffer.byteLength(JSON.stringify(result), "utf8") > 1_048_576) {
+    throw new VanguardEngineError("invalid_config", "Session config exceeds the 1 MiB canonical request limit.");
+  }
+  return deepFreeze(result);
 }
 
-function validateCommand(command: CommandSpec, field: string): void {
-  if (typeof command.command !== "string" || command.command.length === 0 || !Array.isArray(command.args)
-    || command.args.some((argument) => typeof argument !== "string")) {
+function ownDataRecord(value: unknown, field: string): Record<string, unknown> {
+  if (!isPlainObject(value)) throw new VanguardEngineError("invalid_config", `${field} must be a plain object.`);
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const cloned: Record<string, unknown> = {};
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") {
+      throw new VanguardEngineError("invalid_config", `${field} may not contain symbol properties.`);
+    }
+    const descriptor = descriptors[key]!;
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw new VanguardEngineError("invalid_config", `${field} may contain only enumerable data properties.`);
+    }
+    cloned[key] = descriptor.value;
+  }
+  return cloned;
+}
+
+function boundedString(value: unknown, field: string, maximum: number, nonempty: boolean): string {
+  if (typeof value !== "string" || value.includes("\0") || value.length > maximum || (nonempty && value.length === 0)) {
+    throw new VanguardEngineError(
+      "invalid_config",
+      `${field} must be ${nonempty ? "a non-empty " : "a "}string of at most ${maximum} characters.`,
+    );
+  }
+  return value;
+}
+
+async function normalizeWorkspace(config: VanguardSessionConfig): Promise<VanguardSessionConfig> {
+  const requested = path.resolve(config.workspace);
+  let workspace: string;
+  try {
+    workspace = await realpath(requested);
+    if (!(await stat(workspace)).isDirectory()) throw new Error("not a directory");
+  } catch {
+    throw new VanguardEngineError("invalid_config", "workspace must name an existing directory.");
+  }
+  return deepFreeze({ ...config, workspace });
+}
+
+function cloneCommand(command: unknown, field: string): CommandSpec {
+  const raw = ownDataRecord(command, field);
+  if (Object.keys(raw).some((key) => key !== "command" && key !== "args") || raw.args === undefined) {
     throw new VanguardEngineError("invalid_config", `${field} must contain a command and string args.`);
   }
+  const executable = boundedString(raw.command, `${field}.command`, 32_768, true);
+  const args = cloneRequiredStringArray(raw.args, `${field}.args`, 2_048);
+  return Object.freeze({ command: executable, args });
 }
 
-async function validateStoredConfiguration(file: string): Promise<void> {
-  let parsed: { version?: number; options?: Partial<StoredCliOptions> };
+function cloneStringArray(value: unknown, field: string): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  return cloneRequiredStringArray(value, field, 4_096);
+}
+
+function cloneRequiredStringArray(value: unknown, field: string, maximum: number): readonly string[] {
+  if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > maximum) {
+    throw new VanguardEngineError("invalid_config", `${field} must be a bounded array of strings.`);
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (key === "length") continue;
+    if (typeof key !== "string" || !/^(?:0|[1-9][0-9]*)$/u.test(key)
+      || Number(key) >= value.length || !descriptors[key]?.enumerable || !("value" in descriptors[key]!)) {
+      throw new VanguardEngineError("invalid_config", `${field} must contain only indexed string values.`);
+    }
+  }
+  const cloned: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (descriptor === undefined || !("value" in descriptor)) {
+      throw new VanguardEngineError("invalid_config", `${field} may not be sparse or accessor-backed.`);
+    }
+    cloned.push(boundedString(descriptor.value, `${field}[${index}]`, 32_768, false));
+  }
+  return Object.freeze(cloned);
+}
+
+async function validateStoredConfiguration(file: string, expectedSha256?: string): Promise<StoredRunConfiguration> {
+  let parsed: unknown;
   try {
-    parsed = JSON.parse(await readFile(file, "utf8")) as typeof parsed;
+    parsed = JSON.parse(await readFile(file, "utf8")) as unknown;
   } catch {
     throw new VanguardEngineError("session_config_invalid", "Session run configuration is missing or malformed.");
   }
-  if (parsed.version !== 1 || parsed.options === undefined || typeof parsed.options.provider !== "string"
-    || typeof parsed.options.model !== "string") {
+  const configuration = requiredStoredRunConfiguration(parsed);
+  if (expectedSha256 !== undefined && canonicalDigest(configuration) !== expectedSha256) {
+    throw new VanguardEngineError("create_operation_corrupt", "Session run configuration does not match its durable claim.");
+  }
+  return configuration;
+}
+
+async function readCreateOperationBinding(file: string): Promise<DurableSessionCreateBinding | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(file, "utf8")) as unknown;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
+    throw new VanguardEngineError("create_operation_corrupt", "Durable session create binding is malformed.");
+  }
+  if (!isPlainObject(value) || value.version !== 1
+    || !hasExactStringKeys(value, ["configSha256", "operationIdSha256", "requestSha256", "sourceFingerprint", "version"])
+    || !isSha256(value.operationIdSha256) || !isSha256(value.requestSha256)
+    || !isSha256(value.configSha256) || !isSha256(value.sourceFingerprint)) {
+    throw new VanguardEngineError("create_operation_corrupt", "Durable session create binding is invalid.");
+  }
+  return Object.freeze(value as unknown as DurableSessionCreateBinding);
+}
+
+function hasExactStringKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const wanted = [...expected].sort();
+  return actual.length === wanted.length && actual.every((key, index) => key === wanted[index]);
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/u.test(value);
+}
+
+function requiredStoredRunConfiguration(value: unknown): StoredRunConfiguration {
+  if (!isPlainObject(value) || value.version !== 1 || !isPlainObject(value.options)) {
     throw new VanguardEngineError("session_config_invalid", "Session run configuration is unsupported.");
+  }
+  const options = value.options;
+  if (typeof options.workspace !== "string" || !path.isAbsolute(options.workspace)
+    || typeof options.task !== "string"
+    || !(["openai", "anthropic", "deepseek", "http"] as const).includes(options.provider as never)
+    || typeof options.model !== "string" || options.model.length === 0
+    || !isCommandSpec(options.verification)
+    || !isStringArray(options.allowedCommands)
+    || !isStringArray(options.protectedPaths)
+    || !isStringArray(options.editableRoots)
+    || (options.securityProfile !== "workspace" && options.securityProfile !== "guarded")
+    || typeof options.restrictProcess !== "boolean"
+    || typeof options.exposeRawProcess !== "boolean"
+    || (options.verifierEvidence !== "full" && options.verifierEvidence !== "summary")
+    || !isBoundedInteger(options.maxSteps, 100_000)
+    || !isBoundedInteger(options.maxDurationMs, 7 * 24 * 60 * 60 * 1_000)
+    || !isBoundedInteger(options.commandTimeoutMs, 24 * 60 * 60 * 1_000)
+    || !isBoundedInteger(options.maxContextBytes, 100_000_000)
+    || !isBoundedInteger(options.maxFailedVerificationAttempts, 100)
+    || (options.endpoint !== undefined && typeof options.endpoint !== "string")
+    || (options.adaptiveVerification !== undefined && typeof options.adaptiveVerification !== "boolean")
+    || (options.publicCheck !== undefined && !isCommandSpec(options.publicCheck))
+    || (options.extensionInstructions !== undefined && typeof options.extensionInstructions !== "string")) {
+    throw new VanguardEngineError("session_config_invalid", "Session run configuration is unsupported.");
+  }
+  // This also rejects sparse arrays, non-finite numbers, cycles, and values
+  // that cannot have a stable cross-runtime digest.
+  canonicalDigest(value);
+  return deepFreeze(value as unknown as StoredRunConfiguration);
+}
+
+function assertClaimMatchesRunConfiguration(claim: DurableCreateClaim): void {
+  const configuration = requiredStoredRunConfiguration(claim.runConfiguration);
+  if (canonicalDigest(configuration) !== claim.runConfigurationSha256
+    || claim.configSha256 !== claim.runConfigurationSha256) {
+    throw new VanguardEngineError("create_operation_corrupt", "Create claim configuration binding is invalid.");
+  }
+}
+
+function assertReceiptMatches(actual: DurableCreateReceipt, expected: DurableCreateReceipt): void {
+  if (actual.operationIdSha256 !== expected.operationIdSha256
+    || actual.requestSha256 !== expected.requestSha256
+    || actual.configSha256 !== expected.configSha256
+    || actual.sessionId !== expected.sessionId
+    || actual.sourceFingerprint !== expected.sourceFingerprint
+    || actual.runConfigurationSha256 !== expected.runConfigurationSha256) {
+    throw new VanguardEngineError("create_operation_corrupt", "Create receipt conflicts with its durable claim.");
+  }
+}
+
+async function writeDurableJson(file: string, value: unknown): Promise<void> {
+  const handle = await open(file, "wx", 0o600);
+  try {
+    await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+function isCommandSpec(value: unknown): value is CommandSpec {
+  if (!isPlainObject(value) || typeof value.command !== "string" || value.command.length === 0
+    || !Array.isArray(value.args)) return false;
+  for (let index = 0; index < value.args.length; index += 1) {
+    if (!Object.hasOwn(value.args, index) || typeof value.args[index] !== "string") return false;
+  }
+  return true;
+}
+
+function isStringArray(value: unknown): value is readonly string[] {
+  if (!Array.isArray(value)) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.hasOwn(value, index) || typeof value[index] !== "string") return false;
+  }
+  return true;
+}
+
+function isBoundedInteger(value: unknown, maximum: number): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1 && (value as number) <= maximum;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function deepFreeze<T>(value: T, seen = new Set<object>()): T {
+  if (value === null || typeof value !== "object") return value;
+  if (seen.has(value)) throw new VanguardEngineError("invalid_config", "Session config may not be cyclic.");
+  seen.add(value);
+  try {
+    for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child, seen);
+    return Object.freeze(value);
+  } finally {
+    seen.delete(value);
   }
 }
 
@@ -556,4 +1426,18 @@ function positiveInteger(value: number, field: string, maximum: number): number 
     throw new VanguardEngineError("invalid_config", `${field} must be a positive integer no greater than ${maximum}.`);
   }
   return value;
+}
+
+async function settleWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true, () => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

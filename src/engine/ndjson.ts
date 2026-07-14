@@ -81,6 +81,9 @@ export class NdjsonWriter {
   #queuedBytes = 0;
   #tail: Promise<void> = Promise.resolve();
   #closed = false;
+  #outputFailure: Error | undefined;
+  #rejectPendingWrite: ((error: Error) => void) | undefined;
+  readonly #closeAbort = new AbortController();
 
   constructor(output: Writable, options: NdjsonWriterOptions = {}) {
     this.#output = output;
@@ -89,6 +92,12 @@ export class NdjsonWriter {
     if (this.#maxQueueBytes < this.#maxFrameBytes) {
       throw new Error("maxQueueBytes must be at least maxFrameBytes.");
     }
+    // Writable implementations may accept a frame synchronously and report
+    // its failure later through the write callback and/or `error`. Keep a
+    // permanent containment listener so neither path becomes an uncaught host
+    // exception, and bind the error to the exact pending send when possible.
+    this.#output.on("error", (error: Error) => this.#failOutput(error));
+    this.#output.on("close", () => this.#failOutput(new Error("Protocol output closed before its write completed.")));
   }
 
   send(value: unknown): Promise<void> {
@@ -100,33 +109,70 @@ export class NdjsonWriter {
       return Promise.reject(new Error("Protocol output queue exceeded its bounded capacity."));
     }
     this.#queuedBytes += bytes;
-    const operation = this.#tail.then(async () => {
-      if (!this.#output.write(frame, "utf8")) await waitForDrain(this.#output);
-    });
+    const operation = this.#tail.then(() => this.#writeFrame(frame));
     this.#tail = operation.catch(() => {});
     return operation.finally(() => { this.#queuedBytes -= bytes; });
   }
 
-  async close(): Promise<void> {
+  async close(timeoutMs = 3_000): Promise<boolean> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) {
+      throw new Error("NdjsonWriter close timeout must be a positive integer no greater than 300,000 ms.");
+    }
     this.#closed = true;
-    await this.#tail;
+    let timer: NodeJS.Timeout | undefined;
+    const drained = await Promise.race([
+      this.#tail.then(() => this.#outputFailure === undefined),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+    if (timer !== undefined) clearTimeout(timer);
+    if (!drained) {
+      this.#closeAbort.abort();
+      await this.#tail;
+    }
+    return drained;
   }
-}
 
-function waitForDrain(output: Writable): Promise<void> {
-  return new Promise((resolve, reject) => {
-    const cleanup = (): void => {
-      output.off("drain", onDrain);
-      output.off("error", onError);
-      output.off("close", onClose);
-    };
-    const onDrain = (): void => { cleanup(); resolve(); };
-    const onError = (error: Error): void => { cleanup(); reject(error); };
-    const onClose = (): void => { cleanup(); reject(new Error("Protocol output closed during backpressure.")); };
-    output.once("drain", onDrain);
-    output.once("error", onError);
-    output.once("close", onClose);
-  });
+  #writeFrame(frame: string): Promise<void> {
+    if (this.#outputFailure !== undefined) return Promise.reject(this.#outputFailure);
+    const signal = this.#closeAbort.signal;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        if (this.#rejectPendingWrite === rejectFromOutput) this.#rejectPendingWrite = undefined;
+        signal.removeEventListener("abort", onAbort);
+        if (error === undefined) resolve();
+        else reject(error);
+      };
+      const rejectFromOutput = (error: Error): void => finish(error);
+      const onAbort = (): void => finish(new Error("Protocol output write was aborted during shutdown."));
+      this.#rejectPendingWrite = rejectFromOutput;
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        this.#output.write(frame, "utf8", (error?: Error | null) => {
+          if (error !== undefined && error !== null) {
+            this.#failOutput(error);
+            return;
+          }
+          finish(this.#outputFailure);
+        });
+      } catch (error) {
+        this.#failOutput(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  #failOutput(error: Error): void {
+    this.#outputFailure ??= error;
+    this.#rejectPendingWrite?.(this.#outputFailure);
+  }
 }
 
 function boundedPositive(value: number, name: string): number {
