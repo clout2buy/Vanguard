@@ -219,6 +219,7 @@ async function evaluate(input) {
     completionClaims: 0,
     policyBlocks: 0,
     contextCompactions: 0,
+    contextProjections: 0,
     executionQuality: 0,
     changedFiles: 0,
     filesAdded: 0,
@@ -275,7 +276,7 @@ async function evaluate(input) {
     journal = await validateSessionArtifacts(input, scorecard, workspace, violations);
     base.session = workspace;
     base.scorecard = scorecardFile;
-    copyMetrics(scorecard, base);
+    copyMetrics(scorecard, base, journal, violations);
   } catch (error) {
     violations.push(message(error));
   }
@@ -585,28 +586,111 @@ async function runSealedGrader(grader, workspace, timeout) {
   }
 }
 
-function copyMetrics(scorecard, target) {
+function copyMetrics(scorecard, target, journal, violations) {
   const trajectory = isObject(scorecard.trajectory) ? scorecard.trajectory : {};
   const patch = isObject(scorecard.patch) ? scorecard.patch : {};
-  target.steps = safeNumber(scorecard.grade?.steps);
-  target.durationMs = safeNumber(scorecard.durationMs);
-  target.toolFailures = safeNumber(trajectory.toolFailures);
-  target.localTestFailures = safeNumber(trajectory.localTestFailures);
-  target.testHarnessFailures = safeNumber(trajectory.testHarnessFailures);
-  target.toolFrictionFailures = safeNumber(trajectory.toolFrictionFailures);
-  target.verificationFailures = safeNumber(trajectory.verificationFailures);
-  target.completionClaims = safeNumber(trajectory.completionClaims);
-  target.policyBlocks = safeNumber(trajectory.policyBlocks);
-  target.contextCompactions = safeNumber(trajectory.contextCompactions);
-  target.executionQuality = typeof scorecard.grade?.executionQuality?.score === "number"
-    ? scorecard.grade.executionQuality.score
+  target.steps = nonnegativeInteger(scorecard.grade?.steps, "scorecard grade.steps", violations);
+  target.durationMs = nonnegativeNumber(scorecard.durationMs, "scorecard durationMs", violations);
+  const derived = deriveTrajectory(journal.events);
+  for (const field of [
+    "toolFailures", "localTestFailures", "testHarnessFailures", "toolFrictionFailures",
+    "verificationFailures", "completionClaims", "policyBlocks", "contextCompactions", "contextProjections",
+  ]) {
+    const reported = nonnegativeInteger(trajectory[field], `scorecard trajectory.${field}`, violations);
+    if (reported !== derived[field]) {
+      violations.push(`scorecard trajectory.${field} does not match the validated journal`);
+    }
+    target[field] = derived[field];
+  }
+  const derivedQuality = scorecard.grade?.verified === true
+    ? roundMetric(Math.max(0, 1
+      - Math.min(0.32, derived.toolFrictionFailures * 0.08)
+      - Math.min(0.36, derived.verificationFailures * 0.12)
+      - Math.min(0.16, Math.max(0, derived.completionClaims - 1) * 0.04)))
     : 0;
+  const reportedQuality = scorecard.grade?.executionQuality?.score;
+  if (typeof reportedQuality !== "number" || !Number.isFinite(reportedQuality)
+    || reportedQuality < 0 || reportedQuality > 1 || reportedQuality !== derivedQuality) {
+    violations.push("scorecard execution quality does not match the validated journal");
+  }
+  target.executionQuality = derivedQuality;
   target.changedFiles = Array.isArray(patch.changedFiles) ? patch.changedFiles.length : 0;
-  target.filesAdded = safeNumber(patch.filesAdded);
-  target.filesDeleted = safeNumber(patch.filesDeleted);
-  target.filesModified = safeNumber(patch.filesModified);
-  target.beforeLines = safeNumber(patch.beforeLines);
-  target.afterLines = safeNumber(patch.afterLines);
+  target.filesAdded = nonnegativeInteger(patch.filesAdded, "scorecard patch.filesAdded", violations);
+  target.filesDeleted = nonnegativeInteger(patch.filesDeleted, "scorecard patch.filesDeleted", violations);
+  target.filesModified = nonnegativeInteger(patch.filesModified, "scorecard patch.filesModified", violations);
+  target.beforeLines = nonnegativeInteger(patch.beforeLines, "scorecard patch.beforeLines", violations);
+  target.afterLines = nonnegativeInteger(patch.afterLines, "scorecard patch.afterLines", violations);
+}
+
+function deriveTrajectory(events) {
+  const metrics = {
+    toolFailures: 0,
+    localTestFailures: 0,
+    testHarnessFailures: 0,
+    toolFrictionFailures: 0,
+    verificationFailures: 0,
+    completionClaims: 0,
+    policyBlocks: 0,
+    contextCompactions: 0,
+    contextProjections: 0,
+  };
+  let pendingToolNames = [];
+  for (const event of events) {
+    const data = isObject(event.data) ? event.data : {};
+    if (event.type === "model.decided") {
+      pendingToolNames = [];
+      const calls = data.kind === "tools" && Array.isArray(data.calls)
+        ? data.calls
+        : data.kind === "tool" ? [data.call] : [];
+      for (const value of calls) {
+        if (isObject(value) && typeof value.name === "string") pendingToolNames.push(value.name);
+      }
+      if (data.kind === "complete") metrics.completionClaims += 1;
+    }
+    if (event.type === "tool.failed") {
+      metrics.toolFailures += 1;
+      const serialized = asciiLowercase(JSON.stringify(event.data));
+      const output = isObject(data.output) ? data.output : {};
+      const failedToolName = typeof data.tool === "string" ? data.tool : pendingToolNames[0];
+      const localTest = (failedToolName === "process.run" || failedToolName === "project.check")
+        && typeof output.exitCode === "number";
+      const harness = localTest && (
+        serialized.includes("syntaxerror") && serialized.includes("[eval")
+        || serialized.includes("err_eval_esm_cannot_print")
+      );
+      if (harness) {
+        metrics.testHarnessFailures += 1;
+        metrics.toolFrictionFailures += 1;
+      } else if (localTest) {
+        metrics.localTestFailures += 1;
+      } else {
+        metrics.toolFrictionFailures += 1;
+      }
+      if (serialized.includes("process policy")
+        || serialized.includes("evidence policy")
+        || serialized.includes("workspace mutation policy")
+        || serialized.includes("outside the declared editable roots")) {
+        metrics.policyBlocks += 1;
+      }
+    }
+    if (event.type === "tool.completed" || event.type === "tool.failed") {
+      const completedName = typeof data.tool === "string" ? data.tool : undefined;
+      const index = completedName === undefined ? 0 : pendingToolNames.indexOf(completedName);
+      if (index >= 0) pendingToolNames.splice(index, 1);
+      else pendingToolNames.shift();
+    }
+    if (event.type === "verification.completed" && data.passed === false) {
+      metrics.verificationFailures += 1;
+    }
+    if (event.type === "context.compacted") {
+      if (data.operation === "request_projection" && data.durableHistoryChanged === false) {
+        metrics.contextProjections += 1;
+      } else {
+        metrics.contextCompactions += 1;
+      }
+    }
+  }
+  return metrics;
 }
 
 function validateRequest(value) {
@@ -760,8 +844,24 @@ function requireString(value, label) {
   if (typeof value !== "string" || value.length === 0) throw new Error(`${label} must be a non-empty string`);
 }
 
-function safeNumber(value) {
-  return Number.isFinite(value) ? value : 0;
+function nonnegativeInteger(value, label, violations) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    violations.push(`${label} must be a nonnegative safe integer`);
+    return 0;
+  }
+  return value;
+}
+
+function nonnegativeNumber(value, label, violations) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    violations.push(`${label} must be a nonnegative finite number`);
+    return 0;
+  }
+  return value;
+}
+
+function roundMetric(value) {
+  return Math.round(value * 1_000) / 1_000;
 }
 
 function isObject(value) {

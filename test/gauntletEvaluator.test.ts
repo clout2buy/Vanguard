@@ -34,6 +34,7 @@ test("independent gauntlet evaluator accepts only a bound, in-scope, freshly gra
     assert.equal(result.evaluator.integrityPassed, true);
     assert.equal(result.evaluator.graderPassed, true);
     assert.equal(result.canaryDenominatorEligible, true);
+    assert.equal(result.contextProjections, 7, "nondestructive request projections must survive independent evaluation");
     assert.equal("capabilityEligible" in result, false);
     assert.deepEqual(result.evaluator.changedPaths, ["src/answer.mjs"]);
     assert.match(result.evaluator.workspaceManifestSha256, /^[a-f0-9]{64}$/u);
@@ -119,13 +120,16 @@ test("an engine cannot exclude an internal failure by relabeling it as infrastru
     const scorecard = JSON.parse(await readFile(scorecardFile, "utf8"));
     const reason = "Internal parser exploded";
     scorecard.outcome = { status: "failed", reason, steps: 1 };
-    scorecard.grade = { ...scorecard.grade, verified: false, classification: "infrastructure_error", score: null };
+    scorecard.grade = {
+      ...scorecard.grade,
+      verified: false,
+      classification: "infrastructure_error",
+      score: null,
+      executionQuality: { ...scorecard.grade.executionQuality, score: 0 },
+    };
     stdout.outcome = scorecard.outcome;
     stdout.grade = scorecard.grade;
-    const event = { sequence: 1, type: "run.failed", data: { step: 1, reason } };
-    const previousHash = "0".repeat(64);
-    const hash = createHash("sha256").update(previousHash).update("\n").update(JSON.stringify(event)).digest("hex");
-    await writeFile(scorecard.journalFile, `${JSON.stringify({ previousHash, hash, event })}\n`, "utf8");
+    await writeFile(scorecard.journalFile, projectedJournal("run.failed", { step: 1, reason }), "utf8");
     await writeFile(scorecardFile, JSON.stringify(scorecard, null, 2), "utf8");
     await writeFile(fixture.request.candidateOutputFile, `${JSON.stringify(stdout, null, 2)}\n`, "utf8");
     fixture.request.engineExitCode = 1;
@@ -149,13 +153,16 @@ test("a canonically bound provider failure is diagnostic infrastructure but stil
     const scorecard = JSON.parse(await readFile(scorecardFile, "utf8"));
     const reason = "Model failure: Inference endpoint returned HTTP 503";
     scorecard.outcome = { status: "failed", reason, steps: 1 };
-    scorecard.grade = { ...scorecard.grade, verified: false, classification: "infrastructure_error", score: null };
+    scorecard.grade = {
+      ...scorecard.grade,
+      verified: false,
+      classification: "infrastructure_error",
+      score: null,
+      executionQuality: { ...scorecard.grade.executionQuality, score: 0 },
+    };
     stdout.outcome = scorecard.outcome;
     stdout.grade = scorecard.grade;
-    const event = { sequence: 1, type: "run.failed", data: { step: 1, reason } };
-    const previousHash = "0".repeat(64);
-    const hash = createHash("sha256").update(previousHash).update("\n").update(JSON.stringify(event)).digest("hex");
-    await writeFile(scorecard.journalFile, `${JSON.stringify({ previousHash, hash, event })}\n`, "utf8");
+    await writeFile(scorecard.journalFile, projectedJournal("run.failed", { step: 1, reason }), "utf8");
     await writeFile(scorecardFile, JSON.stringify(scorecard, null, 2), "utf8");
     await writeFile(fixture.request.candidateOutputFile, `${JSON.stringify(stdout, null, 2)}\n`, "utf8");
     fixture.request.engineExitCode = 1;
@@ -166,6 +173,46 @@ test("a canonically bound provider failure is diagnostic infrastructure but stil
     assert.equal(result.canaryDenominatorEligible, false);
     assert.equal(result.score, 0);
     assert.equal(result.evaluator.bindingPassed, true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("independent evaluator derives projection telemetry from the validated journal", async () => {
+  const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    const stdout = JSON.parse(await readFile(fixture.request.candidateOutputFile, "utf8"));
+    const scorecardFile = stdout.scorecardFile as string;
+    const scorecard = JSON.parse(await readFile(scorecardFile, "utf8"));
+    scorecard.trajectory.contextProjections = 99;
+    stdout.trajectory.contextProjections = 99;
+    await writeFile(scorecardFile, JSON.stringify(scorecard, null, 2), "utf8");
+    await writeFile(fixture.request.candidateOutputFile, `${JSON.stringify(stdout, null, 2)}\n`, "utf8");
+
+    const result = evaluate(fixture.request);
+    assert.equal(result.verified, false);
+    assert.equal(result.contextProjections, 7, "reported output must use the hash-validated journal count");
+    assert.ok(result.evaluator.violations.some((entry: string) => /contextProjections.*validated journal/u.test(entry)));
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("independent evaluator recomputes execution quality from journaled failures and claims", async () => {
+  const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    const stdout = JSON.parse(await readFile(fixture.request.candidateOutputFile, "utf8"));
+    const scorecardFile = stdout.scorecardFile as string;
+    const scorecard = JSON.parse(await readFile(scorecardFile, "utf8"));
+    scorecard.grade.executionQuality.score = 0.5;
+    stdout.grade.executionQuality.score = 0.5;
+    await writeFile(scorecardFile, JSON.stringify(scorecard, null, 2), "utf8");
+    await writeFile(fixture.request.candidateOutputFile, `${JSON.stringify(stdout, null, 2)}\n`, "utf8");
+
+    const result = evaluate(fixture.request);
+    assert.equal(result.verified, false);
+    assert.equal(result.executionQuality, 1);
+    assert.ok(result.evaluator.violations.some((entry: string) => /execution quality.*validated journal/u.test(entry)));
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -402,10 +449,7 @@ async function createFixture(options: FixtureOptions): Promise<{
       extensions: sealedExtensions,
     },
   }, null, 2), "utf8");
-  const event = { sequence: 1, type: "run.completed", data: { step: 1, answer: "done" } };
-  const previousHash = "0".repeat(64);
-  const hash = createHash("sha256").update(previousHash).update("\n").update(JSON.stringify(event)).digest("hex");
-  await writeFile(journalFile, `${JSON.stringify({ previousHash, hash, event })}\n`, "utf8");
+  await writeFile(journalFile, projectedJournal("run.completed", { step: 1, answer: "done" }), "utf8");
 
   const patch = await patchMetrics(canonicalSource, canonicalWorkspace);
   const scorecard = {
@@ -427,6 +471,7 @@ async function createFixture(options: FixtureOptions): Promise<{
       completionClaims: 1,
       policyBlocks: 0,
       contextCompactions: 0,
+      contextProjections: 7,
     },
     patch,
     grade: {
@@ -484,6 +529,26 @@ function evaluate(request: Record<string, unknown>): any {
   });
   assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`);
   return JSON.parse(completed.stdout);
+}
+
+function projectedJournal(terminalType: "run.completed" | "run.failed", terminalData: Record<string, unknown>): string {
+  const events: Array<{ sequence: number; type: string; data: unknown }> = [
+    { sequence: 1, type: "run.started", data: { task: "fixture task" } },
+    ...Array.from({ length: 7 }, (_unused, index) => ({
+      sequence: index + 2,
+      type: "context.compacted",
+      data: { operation: "request_projection", durableHistoryChanged: false },
+    })),
+    { sequence: 9, type: "model.decided", data: { kind: "complete", answer: "done" } },
+    { sequence: 10, type: terminalType, data: terminalData },
+  ];
+  let previousHash = "0".repeat(64);
+  return events.map((event) => {
+    const hash = createHash("sha256").update(previousHash).update("\n").update(JSON.stringify(event)).digest("hex");
+    const line = JSON.stringify({ previousHash, hash, event });
+    previousHash = hash;
+    return line;
+  }).join("\n") + "\n";
 }
 
 function preflight(caseFile: string) {

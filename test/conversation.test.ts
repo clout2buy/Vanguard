@@ -105,6 +105,30 @@ test("the kernel refuses a context policy that drops the latest human message", 
   assert.equal(decisions, 0);
 });
 
+test("the kernel refuses any custom context policy that drops fresh tool evidence", async () => {
+  const model = new CapturingModel([
+    { kind: "tools", calls: [{ id: "read", name: "workspace.read", input: { path: "README.md" } }] },
+    { kind: "respond", message: "must not run without the read result" },
+  ]);
+  const kernel = new AgentKernel({
+    model,
+    tools: [observeTool("workspace.read")],
+    verifiers: [],
+    journal: new MemoryJournal(),
+    contextPolicy: {
+      select(_task, transcript) {
+        return transcript.filter((entry) => entry.role === "task" || entry.role === "user");
+      },
+    },
+    options: { interactive: true },
+  });
+
+  const outcome = await kernel.advance({ userMessage: "What does this repository do?" });
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /newest unconsumed tool exchange/u);
+  assert.equal(model.requests.length, 1, "the provider must not decide again without its fresh evidence");
+});
+
 test("conversation may inspect read-only tools but a mutation call is refused", async () => {
   let reads = 0;
   let mutations = 0;

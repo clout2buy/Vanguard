@@ -261,6 +261,7 @@ try {
       completionClaims = [int](($Results | Measure-Object -Property completionClaims -Sum).Sum)
       policyBlocks = [int](($Results | Measure-Object -Property policyBlocks -Sum).Sum)
       contextCompactions = [int](($Results | Measure-Object -Property contextCompactions -Sum).Sum)
+      contextProjections = [int](($Results | Measure-Object -Property contextProjections -Sum).Sum)
     }
     patch = [pscustomobject]@{
       changedFiles = [int](($Results | Measure-Object -Property changedFiles -Sum).Sum)

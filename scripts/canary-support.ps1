@@ -18,6 +18,23 @@ function Get-CanaryOptionalProperty {
   return $Property.Value
 }
 
+function Test-CanaryNonnegativeSafeInteger {
+  param($Value)
+
+  if ($null -eq $Value -or $Value -is [bool] -or $Value -is [string]) { return $false }
+  try {
+    $Number = [double]$Value
+    return -not [double]::IsNaN($Number) `
+      -and -not [double]::IsInfinity($Number) `
+      -and $Number -ge 0 `
+      -and $Number -le 9007199254740991 `
+      -and [math]::Floor($Number) -eq $Number
+  }
+  catch {
+    return $false
+  }
+}
+
 function New-CanaryEvidenceBoundary {
   param(
     [Parameter(Mandatory = $true)]
@@ -574,6 +591,48 @@ function Get-CanaryAggregateViolations {
     $ExpectedComparable = $InfrastructureErrors -eq 0
     if ($Aggregate.complete -ne $ExpectedComparable -or $Aggregate.comparable -ne $ExpectedComparable) {
       $Violations += "gauntlet aggregate completeness/comparability flags are inconsistent"
+    }
+
+    $Trajectory = Get-CanaryOptionalProperty -InputObject $Aggregate -Name "trajectory"
+    if ($null -eq $Trajectory -or $Trajectory -is [string] -or $Trajectory -is [ValueType]) {
+      $Violations += "gauntlet aggregate trajectory is missing or malformed"
+    }
+    else {
+      $TrajectoryFields = [ordered]@{
+        totalSteps = "steps"
+        toolFailures = "toolFailures"
+        localTestFailures = "localTestFailures"
+        testHarnessFailures = "testHarnessFailures"
+        toolFrictionFailures = "toolFrictionFailures"
+        verificationFailures = "verificationFailures"
+        completionClaims = "completionClaims"
+        policyBlocks = "policyBlocks"
+        contextCompactions = "contextCompactions"
+        contextProjections = "contextProjections"
+      }
+      foreach ($AggregateField in $TrajectoryFields.Keys) {
+        $CaseField = $TrajectoryFields[$AggregateField]
+        $AggregateValue = Get-CanaryOptionalProperty -InputObject $Trajectory -Name $AggregateField
+        if (-not (Test-CanaryNonnegativeSafeInteger -Value $AggregateValue)) {
+          $Violations += "gauntlet aggregate trajectory.$AggregateField is not a nonnegative safe integer"
+          continue
+        }
+        [long]$ExpectedTotal = 0
+        $CaseValuesValid = $true
+        foreach ($Case in $Cases) {
+          $CaseValue = Get-CanaryOptionalProperty -InputObject $Case -Name $CaseField
+          if (-not (Test-CanaryNonnegativeSafeInteger -Value $CaseValue)) {
+            $Violations += "case '$($Case.id)' metric $CaseField is not a nonnegative safe integer"
+            $CaseValuesValid = $false
+          }
+          else {
+            $ExpectedTotal += [long]$CaseValue
+          }
+        }
+        if ($CaseValuesValid -and [long]$AggregateValue -ne $ExpectedTotal) {
+          $Violations += "gauntlet aggregate trajectory.$AggregateField does not equal the case sum"
+        }
+      }
     }
 
     foreach ($Case in $Cases) {

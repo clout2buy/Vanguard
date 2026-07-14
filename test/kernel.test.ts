@@ -53,6 +53,16 @@ const trustedReviewDefinition = (name: string): ToolDefinition => ({
   evidenceAuthority: "independent-review",
 });
 
+test("kernel rejects a context budget smaller than an empty JSON transcript", () => {
+  assert.throws(() => new AgentKernel({
+    model: new ScriptedModel([]),
+    tools: [],
+    verifiers: [],
+    journal: new MemoryJournal(),
+    options: { maxContextBytes: 1 },
+  }), /at least two context bytes/u);
+});
+
 test("requires independent verification before completion", async () => {
   let attempt = 0;
   const verifier: VerifierPort = {
@@ -588,10 +598,11 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
     verifiers: [passingVerifier],
     journal: new MemoryJournal(),
     workingState: ledger,
-    // Exercise total transcript elision without relying on an impossible byte
-    // budget: the real policies now correctly reserve the task and fail closed
-    // when even that irreducible anchor cannot fit.
-    contextPolicy: { select: () => [] },
+    // Exercise historical/task projection while preserving the newest causal
+    // tool exchange, which every policy is now required to retain exactly.
+    contextPolicy: {
+      select: (_task, transcript) => transcript.filter((entry) => entry.role !== "task"),
+    },
   });
   const outcome = await kernel.run("long task");
   assert.equal(outcome.status, "completed");
@@ -734,6 +745,115 @@ test("observation stagnation survives resume, compaction, and runtime re-groundi
   assert.equal(outcome.status, "failed");
   assert.match(outcome.status === "failed" ? outcome.reason : "", /observation stagnation/i);
   assert.equal(outcome.steps, 3);
+});
+
+test("resume repairs an interrupted soft observation-stagnation transition before provider use", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute() { return { ok: true, output: "unchanged" }; },
+  };
+  const repeated = (id: string): ModelDecision => ({
+    kind: "tools",
+    calls: [{ id, name: "workspace.read", input: { path: "src/index.ts" } }],
+  });
+  const originalJournal = new MemoryJournal();
+  const original = new AgentKernel({
+    model: new ScriptedModel([repeated("one"), repeated("two"), { kind: "complete", answer: "done" }]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: originalJournal,
+    options: { observationStagnationSoftLimit: 1, observationStagnationHardLimit: 3 },
+  });
+  assert.equal((await original.run("repair the soft guard transaction")).status, "completed");
+  const completedTools = originalJournal.events.filter((event) => event.type === "tool.completed");
+  const softBatchSequence = completedTools[1]!.sequence;
+  const interrupted = originalJournal.events.filter((event) => event.sequence <= softBatchSequence);
+
+  const resumedJournal = new MemoryJournal();
+  const resumedModel = new CapturingModel([{ kind: "complete", answer: "resumed safely" }]);
+  const resumed = new AgentKernel({
+    model: resumedModel,
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: resumedJournal,
+    options: { observationStagnationSoftLimit: 1, observationStagnationHardLimit: 3 },
+  });
+  assert.equal((await resumed.run(
+    "repair the soft guard transaction",
+    new AbortController().signal,
+    interrupted,
+  )).status, "completed");
+  const resumedTypes = resumedJournal.events.map((event) => event.type);
+  assert.ok(resumedTypes.indexOf("recovery.replan_required") < resumedTypes.indexOf("runtime.note"));
+  assert.ok(resumedTypes.indexOf("runtime.note") < resumedTypes.indexOf("model.decided"));
+  assert.match(JSON.stringify(resumedModel.requests[0]?.transcript), /Reconnaissance is stagnant/u);
+
+  const recoverySequence = originalJournal.events.find((event) => event.type === "recovery.replan_required"
+    && event.sequence > softBatchSequence)!.sequence;
+  const afterRecoveryBeforeNote = originalJournal.events.filter((event) => event.sequence <= recoverySequence);
+  const noteRepairJournal = new MemoryJournal();
+  const noteRepair = new AgentKernel({
+    model: new ScriptedModel([{ kind: "complete", answer: "continued" }]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: noteRepairJournal,
+    options: { observationStagnationSoftLimit: 1, observationStagnationHardLimit: 3 },
+  });
+  assert.equal((await noteRepair.run(
+    "repair the soft guard transaction",
+    new AbortController().signal,
+    afterRecoveryBeforeNote,
+  )).status, "completed");
+  assert.equal(noteRepairJournal.events.filter((event) => event.type === "recovery.replan_required").length, 0,
+    "a durable recovery event must not be duplicated");
+  assert.equal(noteRepairJournal.events.filter((event) => event.type === "runtime.note").length, 1,
+    "the missing model-visible note must be repaired");
+});
+
+test("resume cannot escape a hard observation-stagnation bound through a completion claim", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute() { return { ok: true, output: "unchanged" }; },
+  };
+  const repeated = (id: string): ModelDecision => ({
+    kind: "tools",
+    calls: [{ id, name: "workspace.read", input: { path: "src/index.ts" } }],
+  });
+  const originalJournal = new MemoryJournal();
+  const original = new AgentKernel({
+    model: new ScriptedModel([repeated("one"), repeated("two"), repeated("three")]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: originalJournal,
+    options: { observationStagnationSoftLimit: 1, observationStagnationHardLimit: 2 },
+  });
+  assert.equal((await original.run("enforce the durable hard guard")).status, "failed");
+  const hardBatchSequence = originalJournal.events.filter((event) => event.type === "tool.completed")[2]!.sequence;
+  const interrupted = originalJournal.events.filter((event) => event.sequence <= hardBatchSequence);
+
+  let providerCalls = 0;
+  const resumed = new AgentKernel({
+    model: {
+      async decide() {
+        providerCalls += 1;
+        return { kind: "complete" as const, answer: "must not escape" };
+      },
+    },
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { observationStagnationSoftLimit: 1, observationStagnationHardLimit: 2 },
+  });
+  const outcome = await resumed.run(
+    "enforce the durable hard guard",
+    new AbortController().signal,
+    interrupted,
+  );
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /observation stagnation/i);
+  assert.equal(providerCalls, 0, "restored hard-bound state must terminate before a model decision");
 });
 
 test("only one failed-verifier recovery epoch refreshes repeated observation evidence", async () => {

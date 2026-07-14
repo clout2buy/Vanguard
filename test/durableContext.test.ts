@@ -10,6 +10,12 @@ import {
   normalizeUsage,
 } from "../src/index.js";
 
+test("sticky context accepts the smallest representable empty JSON transcript budget", () => {
+  const policy = new StickyContextPolicy();
+  assert.deepEqual(policy.select("", [], 2), []);
+  assert.throws(() => policy.select("", [], 1), /at least two bytes/u);
+});
+
 function toolChunk(index: number, ok = true): TranscriptEntry[] {
   return [
     { role: "decision", content: { kind: "tools", calls: [{ id: `c${index}`, name: "workspace.read", input: { path: `src/${index}.ts` } }] } },

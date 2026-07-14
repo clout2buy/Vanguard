@@ -32,9 +32,8 @@ import {
   workingStateTailEntries,
 } from "./contracts.js";
 import { compareOrdinal } from "../deterministicText.js";
-import { validateJsonSchema } from "../jsonSchema.js";
-import { EvidenceContextPolicy } from "./contextPolicy.js";
-import { ContextBudgetExceededError } from "./stickyContext.js";
+import { validateJsonSchema, validateSchemaDefinition } from "../jsonSchema.js";
+import { ContextBudgetExceededError, StickyContextPolicy } from "./stickyContext.js";
 import { journalWorkspaceGeneration } from "./evidenceAuthority.js";
 import { logicalRunEvents } from "./logicalHistory.js";
 import { SealedVerificationState, withSealedVerificationState } from "./verificationState.js";
@@ -142,6 +141,13 @@ interface ObservationStagnationState {
   consecutiveReplays: number;
   /** A failed sealed-verifier claim may open at most one fresh reconnaissance epoch. */
   verifierRecoveryUsed: boolean;
+  /** The soft-bound recovery event is durable even if its paired note is interrupted. */
+  guidanceRecorded: boolean;
+  /** The model-visible runtime note was durably journaled for this replay epoch. */
+  guidanceDelivered: boolean;
+  /** Latest successful observation batch, retained to repair an interrupted guard transition. */
+  lastBatchFingerprints: string[];
+  lastBatchTools: string[];
 }
 
 interface PendingObservationBatch {
@@ -232,7 +238,7 @@ export class AgentKernel {
     this.#tools = new Map(dependencies.tools.map((tool) => [tool.name, tool]));
     this.#verifiers = dependencies.verifiers;
     this.#journal = dependencies.journal;
-    this.#contextPolicy = dependencies.contextPolicy ?? new EvidenceContextPolicy();
+    this.#contextPolicy = dependencies.contextPolicy ?? new StickyContextPolicy();
     this.#workingState = dependencies.workingState;
     this.#workspaceState = dependencies.workspaceState;
     this.#taskAddendum = dependencies.taskAddendum;
@@ -245,6 +251,11 @@ export class AgentKernel {
     this.#options = { ...DEFAULT_OPTIONS, ...dependencies.options };
 
     for (const tool of dependencies.tools) {
+      // AgentKernel is a public engine boundary: callers can supply ToolPorts
+      // directly without passing through the custom-tool or MCP registries.
+      // Reject unsupported schema semantics once, before a model can be shown
+      // a contract that Vanguard cannot actually enforce.
+      validateSchemaDefinition(tool.definition.inputSchema, `Tool '${tool.name}' input schema`);
       const authority = tool.definition.evidenceAuthority;
       if ((authority === "independent-execution" && tool.definition.effect !== "execute")
         || (authority === "independent-review" && tool.definition.effect !== "review")) {
@@ -272,13 +283,13 @@ export class AgentKernel {
       || this.#options.maxRepeatedAction < 1
       || this.#options.maxFailedVerificationAttempts < 1
       || this.#options.maxCompletionEvidenceAttempts < 1
-      || this.#options.maxContextBytes < 1
+      || this.#options.maxContextBytes < 2
       || this.#options.maxConversationTurnSteps < 1
       || this.#options.maxConsecutiveNarrations < 1
       || this.#options.observationStagnationSoftLimit < 1
       || this.#options.observationStagnationHardLimit <= this.#options.observationStagnationSoftLimit
     ) {
-      throw new Error("Run budgets must be positive integers, and the observation stagnation hard limit must exceed its soft limit.");
+      throw new Error("Run budgets must be positive integers (with at least two context bytes), and the observation stagnation hard limit must exceed its soft limit.");
     }
   }
 
@@ -344,6 +355,35 @@ export class AgentKernel {
       (type, data) => this.#record(type, data),
       this.#recoveryConfiguration,
     );
+
+    const emitObservationStagnationGuidance = async (repeatedBatches: number): Promise<void> => {
+      const batchFingerprint = observationBatchFingerprint(observationStagnation.lastBatchFingerprints);
+      const note = "[Vanguard runtime] Reconnaissance is stagnant: "
+        + `${repeatedBatches} consecutive successful observe-only batches returned evidence already seen `
+        + `in workspace generation ${workspaceGeneration}. Stop rereading unchanged evidence. Summarize what is known, `
+        + "choose a materially different targeted observation, or take the next planned non-observe action. "
+        + "Compaction and periodic re-grounding do not reset this guard.";
+      if (!observationStagnation.guidanceRecorded) {
+        await this.#record("recovery.replan_required", {
+          operation: "successful-observation.stagnation",
+          fingerprint: batchFingerprint,
+          tools: [...observationStagnation.lastBatchTools],
+          workspaceGeneration,
+          repeatedBatches,
+          feedback: {
+            action: "replan_and_checkpoint",
+            instruction: "Use existing evidence; choose a materially different observation or advance the plan.",
+          },
+        });
+        observationStagnation.guidanceRecorded = true;
+      }
+      if (!observationStagnation.guidanceDelivered) {
+        await this.#record("runtime.note", { text: note, kind: "observation-stagnation" });
+        observationStagnation.guidanceDelivered = true;
+        transcript.push({ role: "runtime", content: note });
+        stepsSinceReground = 0;
+      }
+    };
 
     const observeWorkspaceBoundary = async (
       cause: string,
@@ -537,6 +577,21 @@ export class AgentKernel {
       throw new Error("Nothing to advance: provide a task or a user message.");
     }
 
+    // A successful tool batch and its guard transition are separate journal
+    // appends. Repair that tiny crash window before invoking the provider:
+    // soft guidance is delivered exactly once, and a restored hard bound can
+    // never be escaped by immediately claiming completion.
+    if (observationStagnation.consecutiveReplays >= this.#options.observationStagnationSoftLimit
+      && !observationStagnation.guidanceDelivered) {
+      await emitObservationStagnationGuidance(observationStagnation.consecutiveReplays);
+    }
+    if (observationStagnation.consecutiveReplays >= this.#options.observationStagnationHardLimit) {
+      return this.#fail(
+        observationStagnationFailureReason(observationStagnation.consecutiveReplays, workspaceGeneration),
+        restored.completedSteps,
+      );
+    }
+
     const turnStartStep = restored.completedSteps;
     for (let step = restored.completedSteps + 1; step <= this.#options.maxSteps; step += 1) {
       if (signal.aborted) {
@@ -594,6 +649,10 @@ export class AgentKernel {
         const latestHuman = [...transcript].reverse().find((entry) => entry.role === "user");
         if (latestHuman !== undefined && !selectedTranscript.includes(latestHuman)) {
           throw new Error("Context policy dropped the exact latest human message.");
+        }
+        const freshToolExchange = newestUnconsumedToolExchange(transcript);
+        if (freshToolExchange.length > 0 && !containsContiguousEntries(selectedTranscript, freshToolExchange)) {
+          throw new Error("Context policy dropped or rewrote the newest unconsumed tool exchange.");
         }
         const fullContextBytes = Buffer.byteLength(JSON.stringify([...transcript, ...reservedTail]));
         const selectedContextBytes = Buffer.byteLength(JSON.stringify([...selectedTranscript, ...reservedTail]));
@@ -923,34 +982,14 @@ export class AgentKernel {
         onReview: () => { mutationNeedsReview = false; },
         onMeaningfulNonObserveProgress: () => resetObservationStagnation(observationStagnation),
         onSuccessfulObservationBatch: async (fingerprints, tools) => {
-          const repeatedBatches = trackSuccessfulObservations(observationStagnation, fingerprints);
-          if (repeatedBatches === this.#options.observationStagnationSoftLimit) {
-            const batchFingerprint = observationBatchFingerprint(fingerprints);
-            const note = "[Vanguard runtime] Reconnaissance is stagnant: "
-              + `${repeatedBatches} consecutive successful observe-only batches returned evidence already seen `
-              + `in workspace generation ${workspaceGeneration}. Stop rereading unchanged evidence. Summarize what is known, `
-              + "choose a materially different targeted observation, or take the next planned non-observe action. "
-              + "Compaction and periodic re-grounding do not reset this guard.";
-            await this.#record("recovery.replan_required", {
-              operation: "successful-observation.stagnation",
-              fingerprint: batchFingerprint,
-              tools: [...tools],
-              workspaceGeneration,
-              repeatedBatches,
-              feedback: {
-                action: "replan_and_checkpoint",
-                instruction: "Use existing evidence; choose a materially different observation or advance the plan.",
-              },
-            });
-            await this.#record("runtime.note", { text: note, kind: "observation-stagnation" });
-            transcript.push({ role: "runtime", content: note });
-            stepsSinceReground = 0;
+          const repeatedBatches = trackSuccessfulObservations(observationStagnation, fingerprints, tools);
+          if (repeatedBatches >= this.#options.observationStagnationSoftLimit
+            && !observationStagnation.guidanceDelivered) {
+            await emitObservationStagnationGuidance(repeatedBatches);
           }
           if (repeatedBatches >= this.#options.observationStagnationHardLimit) {
             return {
-              reason: "Successful-observation stagnation guard stopped the run after "
-                + `${repeatedBatches} consecutive unchanged observe-only replays in workspace generation `
-                + `${workspaceGeneration}, despite explicit replan guidance.`,
+              reason: observationStagnationFailureReason(repeatedBatches, workspaceGeneration),
             };
           }
           return undefined;
@@ -1409,7 +1448,15 @@ function toolEvidenceId(modelDecisionSequence: number, callIndex: number): strin
 }
 
 function freshObservationStagnationState(): ObservationStagnationState {
-  return { seen: new Set<string>(), consecutiveReplays: 0, verifierRecoveryUsed: false };
+  return {
+    seen: new Set<string>(),
+    consecutiveReplays: 0,
+    verifierRecoveryUsed: false,
+    guidanceRecorded: false,
+    guidanceDelivered: false,
+    lastBatchFingerprints: [],
+    lastBatchTools: [],
+  };
 }
 
 function resetObservationStagnation(
@@ -1418,6 +1465,10 @@ function resetObservationStagnation(
 ): void {
   state.seen.clear();
   state.consecutiveReplays = 0;
+  state.guidanceRecorded = false;
+  state.guidanceDelivered = false;
+  state.lastBatchFingerprints = [];
+  state.lastBatchTools = [];
   if (renewVerifierRecovery) state.verifierRecoveryUsed = false;
 }
 
@@ -1432,11 +1483,16 @@ function openVerifierRecoveryEpoch(state: ObservationStagnationState): boolean {
 function trackSuccessfulObservations(
   state: ObservationStagnationState,
   fingerprints: readonly string[],
+  tools: readonly string[] = [],
 ): number {
+  state.lastBatchFingerprints = [...fingerprints];
+  state.lastBatchTools = [...tools];
   const novel = fingerprints.some((fingerprint) => !state.seen.has(fingerprint));
   for (const fingerprint of fingerprints) state.seen.add(fingerprint);
   if (novel) {
     state.consecutiveReplays = 0;
+    state.guidanceRecorded = false;
+    state.guidanceDelivered = false;
     return 0;
   }
   state.consecutiveReplays += 1;
@@ -1465,6 +1521,15 @@ function observationBatchFingerprint(fingerprints: readonly string[]): string {
   return createHash("sha256")
     .update(JSON.stringify([...fingerprints].sort(compareOrdinal)), "utf8")
     .digest("hex");
+}
+
+function observationStagnationFailureReason(
+  repeatedBatches: number,
+  workspaceGeneration: number,
+): string {
+  return "Successful-observation stagnation guard stopped the run after "
+    + `${repeatedBatches} consecutive unchanged observe-only replays in workspace generation `
+    + `${workspaceGeneration}, after durable replan guidance.`;
 }
 
 function restoreSession(
@@ -1545,7 +1610,18 @@ function restoreSession(
     if (event.type === "runtime.note") {
       const data = recordValue(event.data);
       if (typeof data?.text === "string") transcript.push({ role: "runtime", content: data.text });
+      if (data?.kind === "observation-stagnation") {
+        observationStagnation.guidanceRecorded = true;
+        observationStagnation.guidanceDelivered = true;
+      }
       stepsSinceReground = 0;
+      continue;
+    }
+    if (event.type === "recovery.replan_required") {
+      const data = recordValue(event.data);
+      if (data?.operation === "successful-observation.stagnation") {
+        observationStagnation.guidanceRecorded = true;
+      }
       continue;
     }
     if (event.type === "run.waiting_for_user") {
@@ -1698,6 +1774,7 @@ function restoreSession(
               replayedObservations,
               currentWorkspaceGeneration,
             ),
+            [...new Set(pendingObservationBatch.calls.map((batchCall) => batchCall.name))],
           );
         }
         pendingObservationBatch = undefined;
@@ -1746,6 +1823,43 @@ function restoreSession(
 
 function stableFingerprint(name: string, input: JsonValue): string {
   return `${name}:${JSON.stringify(input, objectKeySorter)}`;
+}
+
+/**
+ * Return the newest model tool decision and its still-unconsumed adjacent
+ * observations. At the next decision boundary this is causal input, not
+ * historical material: every context policy must preserve it byte-exact.
+ */
+function newestUnconsumedToolExchange(
+  transcript: readonly TranscriptEntry[],
+): readonly TranscriptEntry[] {
+  let decisionIndex = -1;
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    if (transcript[index]?.role === "decision") {
+      decisionIndex = index;
+      break;
+    }
+  }
+  if (decisionIndex < 0) return [];
+  const decision = normalizeDecision(transcript[decisionIndex]!.content);
+  if (decision?.kind !== "tools") return [];
+  let end = decisionIndex + 1;
+  while (transcript[end]?.role === "observation") end += 1;
+  return transcript.slice(decisionIndex, end);
+}
+
+function containsContiguousEntries(
+  transcript: readonly TranscriptEntry[],
+  required: readonly TranscriptEntry[],
+): boolean {
+  if (required.length === 0) return true;
+  const serializedRequired = required.map((entry) => JSON.stringify(entry));
+  for (let start = 0; start + required.length <= transcript.length; start += 1) {
+    if (serializedRequired.every((entry, offset) => JSON.stringify(transcript[start + offset]) === entry)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function hasTopLevelHistoricalElisionMarker(input: JsonValue): boolean {

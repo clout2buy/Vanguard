@@ -48,6 +48,26 @@ test("context policy never returns orphan tool calls or observations", () => {
   assert.equal(selected.some((entry) => entry.role === "observation"), true);
 });
 
+test("evidence policy fails closed when the newest tool result cannot fit byte-exact", () => {
+  const policy = new EvidenceContextPolicy();
+  const transcript = [
+    { role: "task" as const, content: "repair" },
+    {
+      role: "decision" as const,
+      content: { kind: "tools", calls: [{ id: "fresh", name: "workspace.read", input: { path: "large.ts" } }] },
+    },
+    {
+      role: "observation" as const,
+      content: { callId: "fresh", tool: "workspace.read", ok: true, output: "x".repeat(20_000) },
+    },
+  ];
+  assert.throws(
+    () => policy.select("repair", transcript, 10_000),
+    (error: unknown) => error instanceof ContextBudgetExceededError
+      && error.requiredBytes > error.budgetBytes,
+  );
+});
+
 test("context policy renders old tool payloads as inert summaries while preserving recent evidence", () => {
   const policy = new EvidenceContextPolicy();
   const hugeScript = `import assert from 'node:assert/strict';${"x".repeat(50_000)}`;

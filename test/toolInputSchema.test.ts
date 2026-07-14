@@ -94,6 +94,81 @@ test("kernel enforces every tool input schema before invoking its implementation
   assert.match(failures[3]!, /count.*above maximum/u);
 });
 
+test("public AgentKernel rejects unsupported tool-schema semantics before execution", () => {
+  let invoked = false;
+  const tool: ToolPort = {
+    name: "fixture.unsupported",
+    definition: {
+      name: "fixture.unsupported",
+      description: "Must never run under a schema Vanguard cannot enforce.",
+      inputSchema: {
+        type: "object",
+        anyOf: [
+          { properties: { safe: { enum: [true] } } },
+          { properties: { fallback: { type: "string" } } },
+        ],
+      },
+      effect: "observe",
+    },
+    async execute() {
+      invoked = true;
+      return { ok: true, output: null };
+    },
+  };
+
+  assert.throws(
+    () => new AgentKernel({
+      model: new ScriptedModel([]),
+      tools: [tool],
+      verifiers: [],
+      journal: new MemoryJournal(),
+    }),
+    /unsupported schema keys: anyOf/u,
+  );
+  assert.equal(invoked, false);
+});
+
+test("schema enforcement treats prototype-named inputs as own JSON properties", async () => {
+  let invoked = 0;
+  const tool: ToolPort = {
+    name: "fixture.prototype-safe",
+    definition: {
+      name: "fixture.prototype-safe",
+      description: "Reject undeclared own keys and require own properties.",
+      inputSchema: {
+        type: "object",
+        properties: { allowed: { type: "string" }, constructor: { type: "string" } },
+        required: ["allowed", "constructor"],
+        additionalProperties: false,
+      },
+      effect: "observe",
+    },
+    async execute() {
+      invoked += 1;
+      return { ok: true, output: null };
+    },
+  };
+  const ownProto = JSON.parse('{"allowed":"ok","constructor":"own","__proto__":{"polluted":true}}') as JsonValue;
+  const missingOwnConstructor = { allowed: "ok" } as JsonValue;
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "tools", calls: [{ id: "proto", name: tool.name, input: ownProto }] },
+      { kind: "tools", calls: [{ id: "required", name: tool.name, input: missingOwnConstructor }] },
+      { kind: "complete", answer: "invalid inputs were contained" },
+    ]),
+    tools: [tool],
+    verifiers: [passingVerifier],
+    journal,
+  });
+
+  assert.equal((await kernel.run("validate prototype-named JSON keys")).status, "completed");
+  assert.equal(invoked, 0);
+  const failures = journal.events.filter((event) => event.type === "tool.failed");
+  assert.match(JSON.stringify(failures[0]?.data), /__proto__.*additional property/u);
+  assert.match(JSON.stringify(failures[1]?.data), /constructor.*required/u);
+});
+
 test("fixed commands tolerate provider noise while keeping command and argv runtime-owned", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-fixed-schema-"));
   try {

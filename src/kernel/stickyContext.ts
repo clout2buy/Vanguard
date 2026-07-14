@@ -31,8 +31,8 @@ export class StickyContextPolicy implements ContextPolicyPort {
     maxBytes: number,
     reservedTail: readonly TranscriptEntry[] = [],
   ): readonly TranscriptEntry[] {
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 256) {
-      throw new Error("Context byte budget must be an integer of at least 256 bytes.");
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 2) {
+      throw new Error("Context byte budget must be an integer of at least two bytes.");
     }
 
     // Keep the codec's durable task re-anchor inside this policy's hard byte

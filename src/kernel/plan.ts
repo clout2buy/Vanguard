@@ -729,6 +729,8 @@ function evidenceSchema(): JsonValue {
         properties: {
           kind: { type: "string", enum: ["tool"] },
           evidenceId: { type: "string", description: "Exact runtime-owned evidenceId from one successful tool observation." },
+          callId: { type: "string", description: "Optional copied legacy identifier; ignored when evidenceId is present." },
+          tool: { type: "string", description: "Optional copied tool label; runtime identity remains journal-derived." },
         },
         required: ["kind", "evidenceId"],
         additionalProperties: false,
@@ -738,6 +740,7 @@ function evidenceSchema(): JsonValue {
         properties: {
           kind: { type: "string", enum: ["tool"] },
           callId: { type: "string", description: "Exact callId from one successful tool observation." },
+          tool: { type: "string", description: "Optional copied tool label; runtime identity remains journal-derived." },
         },
         required: ["kind", "callId"],
         additionalProperties: false,

@@ -41,8 +41,15 @@ export class EvidenceContextPolicy implements ContextPolicyPort {
       .filter((index) => index >= 0);
     const newestUserIndex = findLastIndex(chunks, (chunk) =>
       chunk.entries.some((entry) => entry.role === "user"));
+    const newestDecisionIndex = findLastIndex(chunks, (chunk) =>
+      chunk.entries.some((entry) => entry.role === "decision"));
+    const freshToolIndex = newestDecisionIndex >= 0
+      && isToolDecision(chunks[newestDecisionIndex]!.entries[0]!)
+      ? newestDecisionIndex
+      : -1;
     const requiredIndices = new Set(taskIndices);
     if (newestUserIndex >= 0) requiredIndices.add(newestUserIndex);
+    if (freshToolIndex >= 0) requiredIndices.add(freshToolIndex);
     const requiredEntries = [...requiredIndices]
       .sort((left, right) => left - right)
       .flatMap((index) => chunks[index]!.entries);

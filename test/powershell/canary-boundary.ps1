@@ -260,6 +260,16 @@ try {
     classification = "verified"
     canaryDenominatorEligible = $true
     exitCode = 0
+    steps = 1
+    toolFailures = 0
+    localTestFailures = 0
+    testHarnessFailures = 0
+    toolFrictionFailures = 0
+    verificationFailures = 0
+    completionClaims = 1
+    policyBlocks = 0
+    contextCompactions = 0
+    contextProjections = 7
     evaluator = [pscustomobject]@{
       bindingPassed = $true
       integrityPassed = $true
@@ -280,6 +290,18 @@ try {
     complete = $true
     comparable = $true
     score = 1.0
+    trajectory = [pscustomobject]@{
+      totalSteps = 1
+      toolFailures = 0
+      localTestFailures = 0
+      testHarnessFailures = 0
+      toolFrictionFailures = 0
+      verificationFailures = 0
+      completionClaims = 1
+      policyBlocks = 0
+      contextCompactions = 0
+      contextProjections = 7
+    }
     hostCaseEvaluation = [pscustomobject]@{
       bindingFailures = 0
       integrityFailures = 0
@@ -293,6 +315,15 @@ try {
     -Provider "deepseek" -Model "fixture" -EvaluationExitCode 0 `
     -RequestedCaseIds @("verified-case"))
   Assert-CanaryTest ($ValidAggregateViolations.Count -eq 0) "A valid independently scored aggregate was rejected: $($ValidAggregateViolations -join '; ')"
+
+  $ForgedTrajectoryAggregate = $ValidAggregate | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+  $ForgedTrajectoryAggregate.trajectory.contextProjections = 99
+  $ForgedTrajectoryViolations = @(Get-CanaryAggregateViolations `
+    -Aggregate $ForgedTrajectoryAggregate -InfrastructureProbe $false `
+    -PinnedCommit $Pinned -ArtifactHash "artifact" `
+    -Provider "deepseek" -Model "fixture" -EvaluationExitCode 0)
+  Assert-CanaryTest (($ForgedTrajectoryViolations -join "`n") -match "contextProjections does not equal the case sum") `
+    "An aggregate with forged projection totals was accepted."
 
   $MissingBoundaryAggregate = $ValidAggregate | ConvertTo-Json -Depth 10 | ConvertFrom-Json
   $MissingBoundaryAggregate.PSObject.Properties.Remove("evidenceBoundary")
@@ -330,6 +361,16 @@ try {
     classification = "infrastructure_error"
     canaryDenominatorEligible = $false
     exitCode = 1
+    steps = 0
+    toolFailures = 0
+    localTestFailures = 0
+    testHarnessFailures = 0
+    toolFrictionFailures = 0
+    verificationFailures = 0
+    completionClaims = 0
+    policyBlocks = 0
+    contextCompactions = 0
+    contextProjections = 0
     evaluator = [pscustomobject]@{
       bindingPassed = $true
       integrityPassed = $true
@@ -350,6 +391,18 @@ try {
     complete = $false
     comparable = $false
     score = 1.0
+    trajectory = [pscustomobject]@{
+      totalSteps = 1
+      toolFailures = 0
+      localTestFailures = 0
+      testHarnessFailures = 0
+      toolFrictionFailures = 0
+      verificationFailures = 0
+      completionClaims = 1
+      policyBlocks = 0
+      contextCompactions = 0
+      contextProjections = 7
+    }
     hostCaseEvaluation = [pscustomobject]@{
       bindingFailures = 0
       integrityFailures = 0
