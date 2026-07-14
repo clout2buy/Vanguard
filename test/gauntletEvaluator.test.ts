@@ -154,6 +154,42 @@ test("a canonically bound provider failure is diagnostic infrastructure but stil
   }
 });
 
+test("case-file transport preserves an exact trailing-newline task without PowerShell JSON", async () => {
+  const fixture = await createFixture({ candidateValue: 42 });
+  try {
+    const task = fixture.request.task as string;
+    assert.equal(task.endsWith("\n"), true);
+    const caseFile = path.join(fixture.root, "case.json");
+    await writeFile(path.join(fixture.root, "TASK.md"), task, "utf8");
+    await writeFile(caseFile, JSON.stringify({
+      id: "fixture",
+      version: 1,
+      track: "repair",
+      workspace: "source",
+      task: "TASK.md",
+      grader: "grader.mjs",
+      publicCheck: fixture.request.publicCheck,
+      protected: fixture.request.protectedPaths,
+      editableRoots: fixture.request.editableRoots,
+      maxSteps: fixture.request.maxSteps,
+    }, null, 2), "utf8");
+    const completed = spawnSync(process.execPath, [
+      evaluator,
+      "--case-file", caseFile,
+      "--candidate-output-file", fixture.request.candidateOutputFile,
+      "--engine-exit-code", String(fixture.request.engineExitCode),
+      "--provider", String(fixture.request.provider),
+      "--model", String(fixture.request.model),
+    ], { cwd: root, encoding: "utf8", timeout: 20_000 });
+    assert.equal(completed.status, 0, `${completed.stdout}\n${completed.stderr}`);
+    const result = JSON.parse(completed.stdout);
+    assert.equal(result.verified, true);
+    assert.equal(result.evaluator.bindingPassed, true);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 interface FixtureOptions {
   readonly candidateValue: number;
   readonly mutateProtected?: boolean;

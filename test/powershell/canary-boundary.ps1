@@ -33,6 +33,12 @@ try {
   Assert-CanaryTest `
     ($PrivateRunnerSource -notmatch '\$(?:Case|CandidateCase)\.(?:version|maxDurationMs|maxContextBytes|rawProcess)\b') `
     "The private gauntlet runner directly reads an optional case property under strict mode."
+  Assert-CanaryTest `
+    ($PrivateRunnerSource -notmatch 'EvaluationRequest|EvaluationJson|--request-base64') `
+    "The private gauntlet runner still serializes the sealed task through PowerShell."
+  Assert-CanaryTest `
+    ($PrivateRunnerSource -match '--case-file') `
+    "The private gauntlet runner does not use the evaluator's pinned case-file transport."
 
   $Pinned = Resolve-CanaryCommit -RepositoryRoot $Root -Commit "HEAD~1"
   $Active = Resolve-CanaryCommit -RepositoryRoot $Root -Commit "HEAD"

@@ -16,10 +16,11 @@ const JOURNAL_GENESIS = "0".repeat(64);
 const IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
 const OUTPUT_LIMIT = 20_000;
 
-const encoded = argument("--request-base64");
 let request;
 try {
-  request = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+  request = process.argv.includes("--case-file")
+    ? await requestFromCaseFile()
+    : JSON.parse(Buffer.from(argument("--request-base64"), "base64").toString("utf8"));
   validateRequest(request);
 } catch (error) {
   process.stderr.write(`Evaluator request is invalid: ${message(error)}\n`);
@@ -28,6 +29,86 @@ try {
 
 const result = await evaluate(request);
 process.stdout.write(`${JSON.stringify(result)}\n`);
+
+async function requestFromCaseFile() {
+  const caseFile = await realpath(path.resolve(argument("--case-file")));
+  const caseRoot = path.dirname(caseFile);
+  const definition = parseSingleObject(await readFile(caseFile, "utf8"), "case definition");
+  validateCaseDefinition(definition);
+  const sourceWorkspace = await confinedCasePath(caseRoot, definition.workspace, "workspace", "directory");
+  const taskFile = await confinedCasePath(caseRoot, definition.task, "task", "file");
+  const grader = await confinedCasePath(caseRoot, definition.grader, "grader", "file");
+  const engineExitCodeText = argument("--engine-exit-code");
+  if (!/^-?\d+$/u.test(engineExitCodeText)) throw new Error("engine exit code is invalid");
+  const engineExitCode = Number(engineExitCodeText);
+  if (!Number.isSafeInteger(engineExitCode)) throw new Error("engine exit code is invalid");
+  return {
+    caseId: definition.id,
+    caseVersion: definition.version ?? 1,
+    track: definition.track,
+    candidateOutputFile: path.resolve(argument("--candidate-output-file")),
+    engineExitCode,
+    sourceWorkspace,
+    grader,
+    provider: argument("--provider"),
+    model: argument("--model"),
+    task: await readFile(taskFile, "utf8"),
+    maxSteps: definition.maxSteps,
+    graderTimeoutMs: 600_000,
+    editableRoots: definition.editableRoots,
+    protectedPaths: definition.protected,
+    publicCheck: definition.publicCheck,
+  };
+}
+
+function validateCaseDefinition(value) {
+  if (!isObject(value)) throw new Error("case definition must be an object");
+  const allowed = new Set([
+    "id", "version", "track", "workspace", "task", "grader", "publicCheck", "rawProcess",
+    "protected", "editableRoots", "maxSteps", "maxDurationMs", "maxContextBytes",
+  ]);
+  for (const key of Object.keys(value)) {
+    if (!allowed.has(key)) throw new Error(`case definition contains unsupported field '${key}'`);
+  }
+  for (const field of ["id", "track", "workspace", "task", "grader"]) requireString(value[field], field);
+  if (value.version !== undefined && (!Number.isSafeInteger(value.version) || value.version < 1)) {
+    throw new Error("case version is invalid");
+  }
+  if (!Number.isSafeInteger(value.maxSteps) || value.maxSteps < 1) throw new Error("case maxSteps is invalid");
+  if (!Array.isArray(value.editableRoots) || !value.editableRoots.every((entry) => typeof entry === "string")) {
+    throw new Error("case editableRoots is invalid");
+  }
+  if (!Array.isArray(value.protected) || !value.protected.every((entry) => typeof entry === "string")) {
+    throw new Error("case protected paths are invalid");
+  }
+  if (!isObject(value.publicCheck) || typeof value.publicCheck.command !== "string"
+    || !Array.isArray(value.publicCheck.args)
+    || !value.publicCheck.args.every((entry) => typeof entry === "string")) {
+    throw new Error("case publicCheck is invalid");
+  }
+}
+
+async function confinedCasePath(root, relative, label, expectedType) {
+  if (typeof relative !== "string" || relative.length === 0 || path.isAbsolute(relative)) {
+    throw new Error(`case ${label} path is invalid`);
+  }
+  const canonicalRoot = await realpath(root);
+  const lexical = path.resolve(canonicalRoot, relative);
+  if (!isWithin(canonicalRoot, lexical)) throw new Error(`case ${label} escapes its case root`);
+  const canonical = await realpath(lexical);
+  if (!isWithin(canonicalRoot, canonical)) throw new Error(`case ${label} resolves outside its case root`);
+  const details = await lstat(canonical);
+  if ((expectedType === "file" && !details.isFile())
+    || (expectedType === "directory" && !details.isDirectory())) {
+    throw new Error(`case ${label} is not a ${expectedType}`);
+  }
+  return canonical;
+}
+
+function isWithin(root, target) {
+  const relative = path.relative(root, target);
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
 
 async function evaluate(input) {
   const base = {

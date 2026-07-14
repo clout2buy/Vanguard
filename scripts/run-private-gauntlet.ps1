@@ -152,29 +152,19 @@ try {
     $ExitCode = $LASTEXITCODE
     $EngineOutputFile = Join-Path $ResultsRoot "engine-$($Case.id)-$([guid]::NewGuid().ToString('N')).json"
     [IO.File]::WriteAllText($EngineOutputFile, $Raw, [Text.UTF8Encoding]::new($false))
-    $EvaluationRequest = [pscustomobject]@{
-      caseId = [string]$Case.id
-      caseVersion = [int]$CaseOptions.version
-      track = [string]$Case.track
-      candidateOutputFile = $EngineOutputFile
-      engineExitCode = [int]$ExitCode
-      sourceWorkspace = $Workspace
-      grader = $Grader
-      provider = $Provider
-      model = $Model
-      task = $Task
-      maxSteps = [int]$Case.maxSteps
-      graderTimeoutMs = 600000
-      editableRoots = @($Case.editableRoots | ForEach-Object { [string]$_ })
-      protectedPaths = @($Case.protected | ForEach-Object { [string]$_ })
-      publicCheck = [pscustomobject]@{
-        command = [string]$Case.publicCheck.command
-        args = @($Case.publicCheck.args | ForEach-Object { [string]$_ })
-      }
-    }
-    $EvaluationJson = ConvertTo-Json -Compress -Depth 10 -InputObject $EvaluationRequest
-    $EvaluationPayload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($EvaluationJson))
-    $EvaluationRaw = (& node $Evaluator --request-base64 $EvaluationPayload | Out-String)
+    # The evaluator derives its sealed request directly from the pinned case
+    # file. Do not round-trip task text through Windows PowerShell's
+    # ConvertTo-Json: PS 5.1 can exhibit runaway allocation for particular
+    # multiline strings, and duplicating case fields weakens request binding.
+    $EvaluatorArguments = @(
+      $Evaluator,
+      "--case-file", $CaseFile.FullName,
+      "--candidate-output-file", $EngineOutputFile,
+      "--engine-exit-code", [string]$ExitCode,
+      "--provider", $Provider,
+      "--model", $Model
+    )
+    $EvaluationRaw = (& node @EvaluatorArguments | Out-String)
     $EvaluatorExit = $LASTEXITCODE
     if ($EvaluatorExit -ne 0) {
       throw "Independent evaluator failed for '$($Case.id)' with exit code $EvaluatorExit. $EvaluationRaw"
