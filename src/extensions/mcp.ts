@@ -4,7 +4,8 @@ import { NdjsonFramer, NdjsonWriter } from "../engine/ndjson.js";
 import { createSecretRedactor } from "../engine/security.js";
 import { WorkspaceBoundary } from "../runtime/workspace.js";
 import type { McpServerDeclaration } from "./config.js";
-import { ExtensionPermissionPolicy, validateJsonSchema, validateSchemaDefinition } from "./customTools.js";
+import { ExtensionPermissionPolicy } from "./customTools.js";
+import { validateJsonSchema, validateSchemaDefinition } from "../jsonSchema.js";
 import type { ExtensionAuditPort } from "./hooks.js";
 import { compareOrdinal } from "../deterministicText.js";
 

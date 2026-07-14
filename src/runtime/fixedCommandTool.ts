@@ -19,7 +19,9 @@ export class FixedCommandTool implements ToolPort {
     this.definition = {
       name,
       description,
-      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      // The provider may add harmless narration fields. They are intentionally
+      // ignored because the immutable command and argv remain runtime-owned.
+      inputSchema: { type: "object", additionalProperties: true },
       effect: "execute",
       evidenceAuthority: "independent-execution",
     };

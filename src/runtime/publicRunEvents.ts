@@ -149,12 +149,16 @@ export class PublicRunEventPresenter {
       const data = objectValue(event.data);
       const full = typeof data.fullBytes === "number" ? data.fullBytes : undefined;
       const selected = typeof data.selectedBytes === "number" ? data.selectedBytes : undefined;
+      const requestProjection = data.operation === "request_projection"
+        && data.durableHistoryChanged === false;
       return [{
         type: "context.compacted",
         agentId,
         sequence: event.sequence,
         status: "info",
-        title: "Context compacted",
+        // Preserve the event type for protocol compatibility, but distinguish
+        // a per-request view from a rewrite of durable logical history.
+        title: requestProjection ? "Context projected" : "Context compacted",
         ...(full === undefined || selected === undefined ? {} : { detail: `${formatBytes(full)} → ${formatBytes(selected)}` }),
       }];
     }

@@ -1,6 +1,9 @@
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import type { CustomToolDeclaration, ExtensionEffect, ExtensionPermissions } from "./config.js";
 import { compareOrdinal, lowercaseInvariant } from "../deterministicText.js";
+import { validateJsonSchema, validateSchemaDefinition } from "../jsonSchema.js";
+
+export { validateJsonSchema, validateSchemaDefinition } from "../jsonSchema.js";
 
 export interface CustomToolImplementation {
   readonly definition: ToolDefinition & { readonly effect: ExtensionEffect };
@@ -138,90 +141,6 @@ class GuardedCustomTool implements ToolPort {
       clearTimeout(timer);
       context.signal.removeEventListener("abort", abort);
     }
-  }
-}
-
-export function validateJsonSchema(value: JsonValue, schema: JsonValue): readonly string[] {
-  const errors: string[] = [];
-  validateNode(value, schema, "$", errors);
-  return errors;
-}
-
-export function validateSchemaDefinition(schema: JsonValue, label: string): void {
-  if (schema === null || Array.isArray(schema) || typeof schema !== "object") throw new Error(`${label} must be an object.`);
-  const allowed = new Set(["type", "properties", "required", "additionalProperties", "items", "enum", "minLength", "maxLength", "minimum", "maximum"]);
-  const unknown = Object.keys(schema).filter((key) => !allowed.has(key));
-  if (unknown.length > 0) throw new Error(`${label} has unsupported schema keys: ${unknown.sort().join(", ")}.`);
-  if (schema.type !== undefined && !["object", "array", "string", "number", "integer", "boolean", "null"].includes(String(schema.type))) {
-    throw new Error(`${label} has an unsupported type.`);
-  }
-  if (schema.properties !== undefined) {
-    if (schema.properties === null || Array.isArray(schema.properties) || typeof schema.properties !== "object") throw new Error(`${label}.properties must be an object.`);
-    for (const [name, child] of Object.entries(schema.properties)) validateSchemaDefinition(child, `${label}.properties.${name}`);
-  }
-  if (schema.items !== undefined) validateSchemaDefinition(schema.items, `${label}.items`);
-  if (schema.required !== undefined && (!Array.isArray(schema.required) || !schema.required.every((item) => typeof item === "string"))) {
-    throw new Error(`${label}.required must be an array of strings.`);
-  }
-  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") {
-    throw new Error(`${label}.additionalProperties must be boolean.`);
-  }
-  if (schema.enum !== undefined && !Array.isArray(schema.enum)) throw new Error(`${label}.enum must be an array.`);
-  for (const numeric of ["minLength", "maxLength", "minimum", "maximum"] as const) {
-    if (schema[numeric] !== undefined && typeof schema[numeric] !== "number") throw new Error(`${label}.${numeric} must be numeric.`);
-  }
-}
-
-function validateNode(value: JsonValue, schema: JsonValue, at: string, errors: string[]): void {
-  if (schema === null || Array.isArray(schema) || typeof schema !== "object") {
-    errors.push(`${at}: invalid schema.`);
-    return;
-  }
-  if (Array.isArray(schema.enum) && !schema.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) {
-    errors.push(`${at}: value is not in enum.`);
-  }
-  const type = schema.type;
-  if (typeof type === "string" && !matchesType(value, type)) {
-    errors.push(`${at}: expected ${type}.`);
-    return;
-  }
-  if (typeof value === "string") {
-    if (typeof schema.minLength === "number" && value.length < schema.minLength) errors.push(`${at}: shorter than minLength.`);
-    if (typeof schema.maxLength === "number" && value.length > schema.maxLength) errors.push(`${at}: longer than maxLength.`);
-  }
-  if (typeof value === "number") {
-    if (typeof schema.minimum === "number" && value < schema.minimum) errors.push(`${at}: below minimum.`);
-    if (typeof schema.maximum === "number" && value > schema.maximum) errors.push(`${at}: above maximum.`);
-  }
-  if (Array.isArray(value) && schema.items !== undefined) {
-    value.forEach((item, index) => validateNode(item, schema.items as JsonValue, `${at}[${index}]`, errors));
-  }
-  if (value !== null && !Array.isArray(value) && typeof value === "object") {
-    const properties = schema.properties !== null && schema.properties !== undefined && !Array.isArray(schema.properties) && typeof schema.properties === "object"
-      ? schema.properties as Record<string, JsonValue>
-      : {};
-    const required = Array.isArray(schema.required) ? schema.required.filter((item): item is string => typeof item === "string") : [];
-    for (const name of required) if (!(name in value)) errors.push(`${at}.${name}: required.`);
-    if (schema.additionalProperties === false) {
-      for (const name of Object.keys(value)) if (!(name in properties)) errors.push(`${at}.${name}: additional property is not allowed.`);
-    }
-    for (const [name, child] of Object.entries(value)) {
-      const childSchema = properties[name];
-      if (childSchema !== undefined) validateNode(child, childSchema, `${at}.${name}`, errors);
-    }
-  }
-}
-
-function matchesType(value: JsonValue, type: string): boolean {
-  switch (type) {
-    case "object": return value !== null && !Array.isArray(value) && typeof value === "object";
-    case "array": return Array.isArray(value);
-    case "string": return typeof value === "string";
-    case "number": return typeof value === "number" && Number.isFinite(value);
-    case "integer": return typeof value === "number" && Number.isSafeInteger(value);
-    case "boolean": return typeof value === "boolean";
-    case "null": return value === null;
-    default: return false;
   }
 }
 

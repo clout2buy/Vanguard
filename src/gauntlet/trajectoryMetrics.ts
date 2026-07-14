@@ -12,7 +12,10 @@ export interface TrajectoryMetrics {
   readonly verificationAttempts: number;
   readonly verificationFailures: number;
   readonly policyBlocks: number;
+  /** Durable/logical history rewrites. Legacy unclassified events count here. */
   readonly contextCompactions: number;
+  /** Per-request bounded views that leave durable/logical history unchanged. */
+  readonly contextProjections: number;
   readonly recoveryDecisions: number;
   readonly retriesScheduled: number;
   readonly retriesExhausted: number;
@@ -35,6 +38,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   let verificationFailures = 0;
   let policyBlocks = 0;
   let contextCompactions = 0;
+  let contextProjections = 0;
   let recoveryDecisions = 0;
   let retriesScheduled = 0;
   let retriesExhausted = 0;
@@ -95,7 +99,13 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       verificationAttempts += 1;
       if (data?.passed === false) verificationFailures += 1;
     }
-    if (event.type === "context.compacted") contextCompactions += 1;
+    if (event.type === "context.compacted") {
+      if (data?.operation === "request_projection" && data.durableHistoryChanged === false) {
+        contextProjections += 1;
+      } else {
+        contextCompactions += 1;
+      }
+    }
     if (event.type === "recovery.decided") {
       recoveryDecisions += 1;
       if (data?.retry === true) retriesScheduled += 1;
@@ -126,6 +136,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     verificationFailures,
     policyBlocks,
     contextCompactions,
+    contextProjections,
     recoveryDecisions,
     retriesScheduled,
     retriesExhausted,

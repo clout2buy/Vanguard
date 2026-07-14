@@ -52,11 +52,149 @@ test("file tools write atomically, read, and enumerate workspace files", async (
       path: "src/answer.txt",
       sha256: contentHash("forty-two"),
       contents: "forty-two",
+      totalBytes: 9,
+      range: { startByte: 0, endByte: 9 },
+      truncated: false,
+      nextCursor: null,
     });
 
     const listResult = await list.execute({}, context);
     assert.equal(listResult.ok, true);
     assert.deepEqual(listResult.output, { files: [path.join("src", "answer.txt")] });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-pages-"));
+  try {
+    const contents = "alpha αβγ\n".repeat(4_000);
+    await writeFile(path.join(root, "large.txt"), contents);
+    const reader = new ReadFileTool(new WorkspaceBoundary(root));
+
+    const first = await reader.execute({ path: "large.txt" }, context);
+    assert.equal(first.ok, true);
+    type ReadPage = {
+      contents: string;
+      sha256: string;
+      totalBytes: number;
+      range: { startByte: number; endByte: number };
+      truncated: boolean;
+      nextCursor: string | null;
+    };
+    const firstOutput = first.output as ReadPage;
+    assert.equal(firstOutput.sha256, contentHash(contents));
+    assert.equal(firstOutput.totalBytes, Buffer.byteLength(contents));
+    assert.deepEqual(firstOutput.range, { startByte: 0, endByte: Buffer.byteLength(firstOutput.contents) });
+    assert.equal(Buffer.byteLength(firstOutput.contents) <= 8 * 1_024, true);
+    assert.equal(firstOutput.contents.includes("\ufffd"), false);
+    assert.equal(firstOutput.truncated, true);
+    assert.equal(typeof firstOutput.nextCursor, "string");
+
+    const pages = [firstOutput.contents];
+    let current = firstOutput;
+    while (current.nextCursor !== null) {
+      const next = await reader.execute({ path: "large.txt", cursor: current.nextCursor }, context);
+      assert.equal(next.ok, true);
+      const nextOutput = next.output as ReadPage;
+      assert.equal(nextOutput.sha256, firstOutput.sha256);
+      assert.equal(nextOutput.totalBytes, firstOutput.totalBytes);
+      assert.equal(nextOutput.range.startByte, current.range.endByte);
+      assert.equal(Buffer.byteLength(nextOutput.contents) <= 8 * 1_024, true);
+      assert.equal(nextOutput.contents.includes("\ufffd"), false);
+      pages.push(nextOutput.contents);
+      current = nextOutput;
+    }
+    assert.equal(pages.length > 2, true);
+    assert.equal(pages.join(""), contents);
+    assert.equal(current.range.endByte, Buffer.byteLength(contents));
+    assert.equal(current.truncated, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace.read supports exact byte ranges and rejects ambiguous or unknown input", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-range-"));
+  try {
+    await writeFile(path.join(root, "value.txt"), "0123456789");
+    await writeFile(path.join(root, "unicode.txt"), "αβ");
+    const reader = new ReadFileTool(new WorkspaceBoundary(root));
+
+    const ranged = await reader.execute({
+      path: "value.txt",
+      range: { startByte: 2, endByte: 5 },
+    }, context);
+    assert.equal(ranged.ok, true);
+    assert.deepEqual(ranged.output, {
+      path: "value.txt",
+      sha256: contentHash("0123456789"),
+      contents: "234",
+      totalBytes: 10,
+      range: { startByte: 2, endByte: 5 },
+      truncated: true,
+      nextCursor: Buffer.from(JSON.stringify({
+        version: 1,
+        path: "value.txt",
+        sha256: contentHash("0123456789"),
+        offset: 5,
+      }), "utf8").toString("base64url"),
+    });
+
+    await assert.rejects(
+      reader.execute({ path: "value.txt", unexpected: true }, context),
+      /workspace\.read received unknown field: unexpected/u,
+    );
+    await assert.rejects(
+      reader.execute({ path: "value.txt", range: { startByte: 0, endByte: 1, extra: 1 } }, context),
+      /unknown field: extra/u,
+    );
+    await assert.rejects(
+      reader.execute({
+        path: "value.txt",
+        cursor: (ranged.output as { nextCursor: string }).nextCursor,
+        range: { startByte: 0, endByte: 1 },
+      }, context),
+      /mutually exclusive/u,
+    );
+    await assert.rejects(
+      reader.execute({ path: "value.txt", range: { startByte: 0, endByte: 1 }, maxBytes: 4 }, context),
+      /cannot be combined/u,
+    );
+    await assert.rejects(
+      reader.execute({ path: "value.txt", maxBytes: 3 }, context),
+      /from 4 through 32768/u,
+    );
+    await assert.rejects(
+      reader.execute({ path: "unicode.txt", range: { startByte: 0, endByte: 1 } }, context),
+      /UTF-8 character boundaries/u,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace.read cursors reject cross-file use and file drift", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-cursor-"));
+  try {
+    await writeFile(path.join(root, "one.txt"), "abcdefghij");
+    await writeFile(path.join(root, "two.txt"), "abcdefghij");
+    const reader = new ReadFileTool(new WorkspaceBoundary(root));
+
+    const first = await reader.execute({ path: "one.txt", maxBytes: 4 }, context);
+    const cursor = (first.output as { nextCursor: string }).nextCursor;
+    await assert.rejects(
+      reader.execute({ path: "two.txt", cursor }, context),
+      /issued for a different path/u,
+    );
+
+    await writeFile(path.join(root, "one.txt"), "abcdXfghij");
+    const stale = await reader.execute({ path: "one.txt", cursor }, context);
+    assert.equal(stale.ok, false);
+    assert.match(JSON.stringify(stale.output), /changed since the read cursor was issued/u);
+    assert.match(JSON.stringify(stale.output), /expectedSha256/u);
+    assert.match(JSON.stringify(stale.output), /actualSha256/u);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

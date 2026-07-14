@@ -8,6 +8,7 @@ export * from "./kernel/fileJournal.js";
 export * from "./kernel/memoryJournal.js";
 export * from "./kernel/run.js";
 export * from "./kernel/recovery.js";
+export * from "./kernel/verificationState.js";
 export * from "./gauntlet/trajectoryMetrics.js";
 export * from "./gauntlet/diffMetrics.js";
 export * from "./gauntlet/executionQuality.js";

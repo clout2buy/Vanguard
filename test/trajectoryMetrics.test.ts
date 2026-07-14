@@ -26,6 +26,7 @@ test("trajectory metrics distinguish clean completion from recovery and policy f
     verificationFailures: 1,
     policyBlocks: 1,
     contextCompactions: 0,
+    contextProjections: 0,
     recoveryDecisions: 0,
     retriesScheduled: 0,
     retriesExhausted: 0,
@@ -35,6 +36,19 @@ test("trajectory metrics distinguish clean completion from recovery and policy f
     failuresByDisposition: {},
     toolCallsByName: { "workspace.read": 1, "process.run": 1 },
   });
+});
+
+test("trajectory metrics distinguish request projection from durable compaction", () => {
+  const metrics = analyzeTrajectory([
+    {
+      sequence: 1,
+      type: "context.compacted",
+      data: { operation: "request_projection", durableHistoryChanged: false },
+    },
+    { sequence: 2, type: "context.compacted", data: { legacy: true } },
+  ]);
+  assert.equal(metrics.contextProjections, 1);
+  assert.equal(metrics.contextCompactions, 1);
 });
 
 test("trajectory metrics treat a non-zero local test exit as productive evidence", () => {

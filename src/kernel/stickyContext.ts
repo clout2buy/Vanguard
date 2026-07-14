@@ -16,10 +16,11 @@ export class ContextBudgetExceededError extends Error {
 /**
  * A deterministic, causality-safe context selector for long runs.
  *
- * The task and latest user correction are irreducible. Recent tool decisions
- * remain paired with all observations when they fit; oversized exchanges are
- * inert forensic text, never altered executable calls. Older history becomes
- * one bounded digest carrying a cumulative hash and structural outcomes.
+ * The task, latest user correction, and newest tool exchange that has not yet
+ * been consumed by another model decision are irreducible. That fresh exchange
+ * remains byte-exact even when it is large; only older exchanges may become
+ * inert forensic text. Older history becomes one bounded digest carrying a
+ * cumulative hash and structural outcomes.
  * This permits occasional explicit cache-boundary resets while guaranteeing
  * that the serialized transcript never exceeds the runtime's byte budget.
  */
@@ -48,24 +49,35 @@ export class StickyContextPolicy implements ContextPolicyPort {
       .filter((index) => index >= 0);
     const newestUserIndex = findLastIndex(chunks, (chunk) =>
       chunk.entries.some((entry) => entry.role === "user"));
+    // At a decision boundary, the final model decision has not yet been
+    // consumed by another model turn. If it is a tool batch, its complete
+    // call/result exchange is fresh causal evidence. Summarizing or dropping
+    // it would ask the model to proceed without the evidence it just gathered.
+    const newestDecisionIndex = findLastIndex(chunks, (chunk) =>
+      chunk.entries.some((entry) => entry.role === "decision"));
+    const freshToolIndex = newestDecisionIndex >= 0
+      && isToolDecision(chunks[newestDecisionIndex]!.entries[0])
+      ? newestDecisionIndex
+      : -1;
 
     // A restored or legacy transcript can lack a task entry. Synthesize the
     // durable anchor from the kernel-owned task in that case.
     const taskEntries = taskIndices.length > 0
       ? taskIndices.flatMap((index) => chunks[index]!.entries)
       : [{ role: "task", content: task } satisfies TranscriptEntry];
-    const latestUserEntries = newestUserIndex >= 0 ? chunks[newestUserIndex]!.entries : [];
-    const irreducible = [...taskEntries, ...latestUserEntries];
+    const requiredIndices = new Set<number>(taskIndices);
+    if (newestUserIndex >= 0) requiredIndices.add(newestUserIndex);
+    if (freshToolIndex >= 0) requiredIndices.add(freshToolIndex);
+    const irreducible = assembleRequired(chunks, taskIndices, taskEntries, requiredIndices);
     const irreducibleBytes = serializedBytes([...irreducible, ...reservedTail]);
     if (irreducibleBytes > maxBytes) {
       throw new ContextBudgetExceededError(irreducibleBytes, maxBytes);
     }
 
-    const selected = new Set<number>(taskIndices);
-    if (newestUserIndex >= 0) selected.add(newestUserIndex);
+    const selected = new Set<number>(requiredIndices);
 
-    // Keep a bounded tail. Oversized tool observations are replaced with
-    // canonical hash summaries while retaining exact call/result pairing.
+    // Keep a bounded tail. Oversized historical tool observations are replaced
+    // with canonical hash summaries while retaining exact call/result pairing.
     const recentBudget = Math.max(512, Math.floor(maxBytes * 0.55));
     const compacted = new Map<number, readonly TranscriptEntry[]>();
     let recentBytes = 0;
@@ -114,9 +126,9 @@ export class StickyContextPolicy implements ContextPolicyPort {
       selected.delete(index);
       result = assemble();
     }
-    // Then shed the oldest recent chunks, but never the latest user message.
+    // Then shed the oldest recent chunks, but never mandatory human/fresh data.
     const removableRecent = [...selected]
-      .filter((index) => !taskIndices.includes(index) && index !== newestUserIndex)
+      .filter((index) => !requiredIndices.has(index))
       .sort((left, right) => left - right);
     for (const index of removableRecent) {
       if (serializedBytes([...result, ...reservedTail]) <= maxBytes) break;
@@ -129,7 +141,7 @@ export class StickyContextPolicy implements ContextPolicyPort {
       // At this point only the irreducible entries plus a bounded digest may
       // remain. Drop the digest before failing; history integrity is less
       // important than never violating the provider/runtime budget.
-      result = [...taskEntries, ...latestUserEntries];
+      result = assembleRequired(chunks, taskIndices, taskEntries, requiredIndices);
     }
     const withoutDigestBytes = serializedBytes([...result, ...reservedTail]);
     if (withoutDigestBytes > maxBytes) {
@@ -141,6 +153,21 @@ export class StickyContextPolicy implements ContextPolicyPort {
 
 interface ContextChunk {
   readonly entries: readonly TranscriptEntry[];
+}
+
+/** Rebuild mandatory context in transcript order without splitting chunks. */
+function assembleRequired(
+  chunks: readonly ContextChunk[],
+  taskIndices: readonly number[],
+  taskEntries: readonly TranscriptEntry[],
+  requiredIndices: ReadonlySet<number>,
+): TranscriptEntry[] {
+  const result: TranscriptEntry[] = [...taskEntries];
+  for (const [index, chunk] of chunks.entries()) {
+    if (taskIndices.includes(index) || !requiredIndices.has(index)) continue;
+    result.push(...chunk.entries);
+  }
+  return result;
 }
 
 /** Never places a boundary between a tool decision and its observations. */

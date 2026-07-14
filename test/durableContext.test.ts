@@ -3,6 +3,7 @@ import test from "node:test";
 import type { JsonValue, SerializableModelRequest, TranscriptEntry } from "../src/index.js";
 import {
   AnthropicMessagesCodec,
+  ContextBudgetExceededError,
   OpenAIChatCompletionsCodec,
   StickyContextPolicy,
   UsageLedger,
@@ -88,6 +89,9 @@ test("thousands of huge events can never overflow the selected byte budget", () 
       { role: "observation", content: { callId: `h${index}`, tool: "workspace.read", ok: true, output: { contents: "o".repeat(20_000) } } },
     );
   }
+  // The huge exchanges are historical. A final small exchange is the fresh
+  // evidence that must remain exact for the next model decision.
+  toolHeavy.push(...toolChunk(2_001));
   const selectedTools = policy.select("t", toolHeavy, 25_000);
   assert.ok(Buffer.byteLength(JSON.stringify(selectedTools)) <= 25_000);
 });
@@ -115,6 +119,7 @@ test("sticky compaction turns an oversized tool exchange into inert forensic tex
       role: "observation",
       content: { callId: "old-plan", tool: "plan.update", ok: false, error: "missing summary" },
     },
+    ...toolChunk(1),
   ], 5_000);
 
   const serialized = JSON.stringify(selected);
@@ -133,6 +138,120 @@ test("sticky compaction turns an oversized tool exchange into inert forensic tex
   "the compacted exchange must not occupy an executable decision slot");
   assert.doesNotMatch(serialized, /vanguardElided/);
   assert.doesNotMatch(serialized, /should-never-replay/);
+});
+
+test("the latest Ward-scale tool batch stays byte-exact above the historical compaction ceiling", () => {
+  const policy = new StickyContextPolicy();
+  const latestBatch: TranscriptEntry[] = [
+    {
+      role: "decision",
+      content: {
+        kind: "tools",
+        calls: [
+          { id: "ward-read", name: "workspace.read", input: { path: "src/world/ward.ts" } },
+          { id: "ward-search", name: "workspace.search", input: { query: "registerWard", path: "src" } },
+          { id: "ward-list", name: "workspace.list", input: { path: "test/fixtures/ward" } },
+        ],
+        continuation: {
+          role: "assistant",
+          reasoning_content: `opaque-provider-state:${"r".repeat(3_000)}`,
+          tool_calls: [
+            { id: "ward-read", type: "function", function: { name: "workspace_read", arguments: "{\"path\":\"src/world/ward.ts\"}" } },
+            { id: "ward-search", type: "function", function: { name: "workspace_search", arguments: "{\"query\":\"registerWard\",\"path\":\"src\"}" } },
+            { id: "ward-list", type: "function", function: { name: "workspace_list", arguments: "{\"path\":\"test/fixtures/ward\"}" } },
+          ],
+        },
+      },
+    },
+    {
+      role: "observation",
+      content: {
+        callId: "ward-read",
+        tool: "workspace.read",
+        ok: true,
+        output: { contents: `LATEST_WARD_SOURCE:${"s".repeat(6_000)}` },
+      },
+    },
+    {
+      role: "observation",
+      content: {
+        callId: "ward-search",
+        tool: "workspace.search",
+        ok: true,
+        output: { matches: [`LATEST_WARD_MATCH:${"m".repeat(4_000)}`] },
+      },
+    },
+    {
+      role: "observation",
+      content: {
+        callId: "ward-list",
+        tool: "workspace.list",
+        ok: true,
+        output: { files: [`LATEST_WARD_FIXTURE:${"f".repeat(2_000)}`] },
+      },
+    },
+  ];
+  const transcript: TranscriptEntry[] = [
+    { role: "task", content: "repair the Ward mod without weakening its tests" },
+    { role: "user", content: "Keep the public registration API unchanged." },
+  ];
+  for (let index = 1; index <= 180; index += 1) transcript.push(...toolChunk(index));
+  transcript.push(...latestBatch);
+  const reservedTail: TranscriptEntry[] = [
+    { role: "history", content: `[Vanguard inert runtime-state data]\n${"p".repeat(1_500)}` },
+  ];
+  const latestBytes = Buffer.byteLength(JSON.stringify(latestBatch));
+  assert.ok(latestBytes > 8_000, `fixture must cross the old 8KB summary ceiling, got ${latestBytes}`);
+  assert.ok(Buffer.byteLength(JSON.stringify([...transcript, ...reservedTail])) > 32_000,
+    "fixture must force context selection");
+
+  const selected = policy.select(transcript[0]!.content as string, transcript, 32_000, reservedTail);
+  assert.ok(Buffer.byteLength(JSON.stringify([...selected, ...reservedTail])) <= 32_000);
+  const decisionIndex = selected.indexOf(latestBatch[0]!);
+  assert.ok(decisionIndex >= 0, "the fresh batch decision must survive by identity");
+  assert.deepEqual(selected.slice(decisionIndex, decisionIndex + latestBatch.length), latestBatch,
+    "every fresh call, continuation byte, and observation must survive unchanged");
+  assert.match(JSON.stringify(selected), /LATEST_WARD_SOURCE/);
+  assert.match(JSON.stringify(selected), /opaque-provider-state/);
+
+  const rebuilt = JSON.parse(JSON.stringify(transcript)) as TranscriptEntry[];
+  assert.equal(
+    JSON.stringify(policy.select("repair the Ward mod without weakening its tests", rebuilt, 32_000, reservedTail)),
+    JSON.stringify(selected),
+    "resume reconstruction must keep the same fresh batch and boundary byte-for-byte",
+  );
+});
+
+test("a truly over-budget fresh tool batch fails explicitly instead of being summarized", () => {
+  const policy = new StickyContextPolicy();
+  const fresh: TranscriptEntry[] = [
+    {
+      role: "decision",
+      content: {
+        kind: "tools",
+        calls: [{ id: "fresh-read", name: "workspace.read", input: { path: "src/huge.ts" } }],
+      },
+    },
+    {
+      role: "observation",
+      content: {
+        callId: "fresh-read",
+        tool: "workspace.read",
+        ok: true,
+        output: { contents: `FRESH_UNSUMMARIZABLE_EVIDENCE:${"x".repeat(20_000)}` },
+      },
+    },
+  ];
+  assert.throws(
+    () => policy.select("repair", [
+      { role: "task", content: "repair" },
+      ...toolChunk(1),
+      ...fresh,
+    ], 10_000),
+    (error: unknown) => error instanceof ContextBudgetExceededError
+      && error.requiredBytes > error.budgetBytes
+      && error.budgetBytes === 10_000,
+  );
 });
 
 test("an irreducible latest correction fails explicitly instead of violating the budget", () => {

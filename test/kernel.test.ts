@@ -606,6 +606,255 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
   });
 });
 
+test("successful observation stagnation detects reordered and reshaped batches before step exhaustion", async () => {
+  let reads = 0;
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute(input) {
+      reads += 1;
+      const target = (input as { path: string }).path;
+      return { ok: true, output: { path: target, contents: `stable:${target}` } };
+    },
+  };
+  const batch = (...paths: string[]): ModelDecision => ({
+    kind: "tools",
+    calls: paths.map((path, index) => ({ id: `${path}-${index}`, name: "workspace.read", input: { path } })),
+  });
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      batch("a.ts", "b.ts"),
+      batch("b.ts", "a.ts"),
+      batch("a.ts"),
+      batch("b.ts"),
+    ]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal,
+    options: {
+      maxSteps: 20,
+      observationStagnationSoftLimit: 2,
+      observationStagnationHardLimit: 3,
+    },
+  });
+
+  const outcome = await kernel.run("inspect without looping forever");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /observation stagnation/i);
+  assert.equal(outcome.steps, 4, "the independent guard must stop well before the general step budget");
+  assert.equal(reads, 6);
+  const replan = journal.events.find((event) => event.type === "recovery.replan_required"
+    && (event.data as { operation?: string }).operation === "successful-observation.stagnation");
+  assert.ok(replan, "the hard bound must be preceded by actionable soft replan guidance");
+  assert.match(JSON.stringify(journal.events), /materially different targeted observation/);
+});
+
+test("distinct large-repository reconnaissance never consumes the observation stagnation budget", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute(input) { return { ok: true, output: input }; },
+  };
+  const decisions: ModelDecision[] = Array.from({ length: 24 }, (_, index) => ({
+    kind: "tools",
+    calls: [{ id: `read-${index}`, name: "workspace.read", input: { path: `src/module-${index}.ts` } }],
+  }));
+  decisions.push({ kind: "complete", answer: "survey complete" });
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel(decisions),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal,
+    options: {
+      maxSteps: 30,
+      observationStagnationSoftLimit: 1,
+      observationStagnationHardLimit: 2,
+    },
+  });
+
+  assert.equal((await kernel.run("map a large repository")).status, "completed");
+  assert.equal(journal.events.some((event) => event.type === "recovery.replan_required"
+    && (event.data as { operation?: string }).operation === "successful-observation.stagnation"), false);
+});
+
+test("observation stagnation survives resume, compaction, and runtime re-grounding notes", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute() { return { ok: true, output: "unchanged" }; },
+  };
+  const repeated: ModelDecision = {
+    kind: "tools",
+    calls: [{ id: "same", name: "workspace.read", input: { path: "src/index.ts" } }],
+  };
+  const firstJournal = new MemoryJournal();
+  const first = new AgentKernel({
+    model: new ScriptedModel([repeated, repeated]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: firstJournal,
+    options: {
+      maxSteps: 20,
+      maxModelRecoveryAttempts: 1,
+      observationStagnationSoftLimit: 1,
+      observationStagnationHardLimit: 2,
+    },
+  });
+  assert.equal((await first.run("resume a bounded reconnaissance")).status, "failed");
+  const sequence = firstJournal.events.at(-1)!.sequence;
+  await firstJournal.append({
+    sequence: sequence + 1,
+    type: "context.compacted",
+    data: { fullEntries: 10, selectedEntries: 5, fullBytes: 1000, selectedBytes: 500 },
+  });
+  await firstJournal.append({
+    sequence: sequence + 2,
+    type: "runtime.note",
+    data: { text: "[Vanguard re-grounding] Re-read the task contract and continue." },
+  });
+
+  const resumed = new AgentKernel({
+    model: new ScriptedModel([repeated]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: {
+      maxSteps: 20,
+      observationStagnationSoftLimit: 1,
+      observationStagnationHardLimit: 2,
+    },
+  });
+  const outcome = await resumed.run(
+    "resume a bounded reconnaissance",
+    new AbortController().signal,
+    firstJournal.events,
+  );
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /observation stagnation/i);
+  assert.equal(outcome.steps, 3);
+});
+
+test("only one failed-verifier recovery epoch refreshes repeated observation evidence", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute() { return { ok: true, output: "same source" }; },
+  };
+  let verifierAttempts = 0;
+  const failingVerifier: VerifierPort = {
+    name: "sealed grader",
+    async verify() {
+      verifierAttempts += 1;
+      return { verifier: "sealed grader", passed: false, evidence: `failure ${verifierAttempts}` };
+    },
+  };
+  const repeated = (id: string): ModelDecision => ({
+    kind: "tools",
+    calls: [{ id, name: "workspace.read", input: { path: "src/index.ts" } }],
+  });
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      repeated("one"), repeated("two"), { kind: "complete", answer: "claim one" },
+      repeated("three"), repeated("four"), { kind: "complete", answer: "claim two" },
+      repeated("five"),
+    ]),
+    tools: [read],
+    verifiers: [failingVerifier],
+    journal: new MemoryJournal(),
+    options: {
+      maxSteps: 20,
+      maxFailedVerificationAttempts: 3,
+      observationStagnationSoftLimit: 1,
+      observationStagnationHardLimit: 2,
+    },
+  });
+
+  const outcome = await kernel.run("use verifier feedback without looping");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /observation stagnation/i);
+  assert.equal(verifierAttempts, 2, "later failed claims must not mint unlimited reconnaissance epochs");
+});
+
+test("a new user message resets durable observation stagnation state", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute() { return { ok: true, output: "unchanged" }; },
+  };
+  const repeated = (id: string): ModelDecision => ({
+    kind: "tools",
+    calls: [{ id, name: "workspace.read", input: { path: "README.md" } }],
+  });
+  const firstJournal = new MemoryJournal();
+  const options = {
+    interactive: true,
+    observationStagnationSoftLimit: 1,
+    observationStagnationHardLimit: 2,
+  } as const;
+  const first = new AgentKernel({
+    model: new ScriptedModel([
+      repeated("one"), repeated("two"), { kind: "ask_user", question: "Continue with the same target?" },
+    ]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: firstJournal,
+    options,
+  });
+  assert.equal((await first.run("inspect with steering")).status, "waiting_for_user");
+
+  const resumed = new AgentKernel({
+    model: new ScriptedModel([
+      repeated("three"), repeated("four"), { kind: "complete", answer: "done" },
+    ]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options,
+  });
+  const outcome = await resumed.advance(
+    { userMessage: "Yes; I changed the requirements, inspect it again." },
+    new AbortController().signal,
+    firstJournal.events,
+  );
+  assert.equal(outcome.status, "completed");
+});
+
+test("successful non-observe progress opens a fresh observation epoch", async () => {
+  const read: ToolPort = {
+    name: "workspace.read",
+    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    async execute() { return { ok: true, output: "unchanged" }; },
+  };
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: true, output: "independent check passed" }; },
+  };
+  const repeated = (id: string): ModelDecision => ({
+    kind: "tools",
+    calls: [{ id, name: "workspace.read", input: { path: "README.md" } }],
+  });
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      repeated("one"), repeated("two"),
+      { kind: "tools", calls: [{ id: "check", name: "project.check", input: {} }] },
+      repeated("three"), repeated("four"),
+      { kind: "complete", answer: "done" },
+    ]),
+    tools: [read, check],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: {
+      observationStagnationSoftLimit: 1,
+      observationStagnationHardLimit: 2,
+    },
+  });
+
+  assert.equal((await kernel.run("advance after reconnaissance")).status, "completed");
+});
+
 test("kernel snapshots working state once and passes the identical snapshot object", async () => {
   const snapshot = { revision: 7, summary: "stable identity" };
   let snapshotCalls = 0;

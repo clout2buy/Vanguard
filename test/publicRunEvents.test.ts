@@ -86,4 +86,17 @@ test("public event stream presents verifier and compaction state", () => {
     data: { fullBytes: 900_000, selectedBytes: 250_000 },
   });
   assert.match(compacted[0]?.detail ?? "", /900\.0 KB → 250\.0 KB/);
+
+  const projected = presenter.present({
+    sequence: 5,
+    type: "context.compacted",
+    data: {
+      operation: "request_projection",
+      durableHistoryChanged: false,
+      fullBytes: 900_000,
+      selectedBytes: 250_000,
+    },
+  });
+  assert.equal(projected[0]?.type, "context.compacted", "the public wire type remains backward compatible");
+  assert.equal(projected[0]?.title, "Context projected");
 });

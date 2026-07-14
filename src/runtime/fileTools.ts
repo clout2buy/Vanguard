@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { TextDecoder } from "node:util";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
@@ -8,31 +9,134 @@ import { WorkspaceMutationPolicy } from "./mutationPolicy.js";
 import { WorkspaceVersionLedger } from "./versionLedger.js";
 
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
+const DEFAULT_READ_PAGE_BYTES = 8 * 1024;
+const MAX_READ_PAGE_BYTES = 32 * 1024;
+const READ_CURSOR_VERSION = 1;
+
+interface ReadByteRange {
+  readonly startByte: number;
+  readonly endByte: number;
+}
+
+interface ReadCursorPayload {
+  readonly version: typeof READ_CURSOR_VERSION;
+  readonly path: string;
+  readonly sha256: string;
+  readonly offset: number;
+}
 
 export class ReadFileTool implements ToolPort {
   readonly name = "workspace.read";
-  readonly definition = toolDefinition(this.name, "Read a UTF-8 file and return its contents and SHA-256 version.", {
-    path: { type: "string", description: "Workspace-relative file path." },
-  }, ["path"], "observe");
+  readonly definition = toolDefinition(
+    this.name,
+    "Read one bounded UTF-8 byte range and return the full-file SHA-256. Continue sequentially with nextCursor.",
+    {
+      path: { type: "string", description: "Workspace-relative file path." },
+      cursor: {
+        type: "string",
+        description: "Opaque nextCursor from a prior read of the same unchanged file; mutually exclusive with range.",
+      },
+      range: {
+        type: "object",
+        description: "Optional exact UTF-8 byte range: startByte is inclusive and endByte is exclusive.",
+        properties: {
+          startByte: { type: "integer", minimum: 0 },
+          endByte: { type: "integer", minimum: 0 },
+        },
+        required: ["startByte", "endByte"],
+        additionalProperties: false,
+      },
+      maxBytes: {
+        type: "integer",
+        minimum: 4,
+        maximum: MAX_READ_PAGE_BYTES,
+        description: `Sequential page size in bytes; defaults to ${DEFAULT_READ_PAGE_BYTES} and cannot exceed ${MAX_READ_PAGE_BYTES}.`,
+      },
+    },
+    ["path"],
+    "observe",
+  );
 
   constructor(
     private readonly workspace: WorkspaceBoundary,
-    private readonly maxBytes = 1_000_000,
+    private readonly maxFileBytes = 1_000_000,
     private readonly versions?: WorkspaceVersionLedger,
   ) {}
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
-    const relativePath = stringField(objectInput(input), "path");
+    const fields = objectInput(input);
+    rejectUnknownFields(fields, ["path", "cursor", "range", "maxBytes"], this.name);
+    const relativePath = stringField(fields, "path");
+    const cursor = optionalReadCursor(fields);
+    const requestedRange = optionalReadRange(fields);
+    const pageBytes = optionalIntegerField(fields, "maxBytes") ?? DEFAULT_READ_PAGE_BYTES;
+    if (pageBytes < 4 || pageBytes > MAX_READ_PAGE_BYTES) {
+      throw new Error(`Field 'maxBytes' must be an integer from 4 through ${MAX_READ_PAGE_BYTES}.`);
+    }
+    if (cursor !== undefined && requestedRange !== undefined) {
+      throw new Error("Fields 'cursor' and 'range' are mutually exclusive.");
+    }
+    if (requestedRange !== undefined && fields.maxBytes !== undefined) {
+      throw new Error("Field 'maxBytes' cannot be combined with an exact 'range'.");
+    }
+
     const file = await this.workspace.existing(relativePath);
     const metadata = await stat(file);
     if (!metadata.isFile()) return { ok: false, output: { error: "Path is not a file." } };
-    if (metadata.size > this.maxBytes) {
+    if (metadata.size > this.maxFileBytes) {
       return { ok: false, output: { error: "File exceeds read limit.", bytes: metadata.size } };
     }
-    const contents = await readFile(file, "utf8");
-    const sha256 = contentHash(contents);
+
+    const bytes = await readFile(file);
+    if (bytes.byteLength > this.maxFileBytes) {
+      return { ok: false, output: { error: "File exceeds read limit.", bytes: bytes.byteLength } };
+    }
+    if (!isValidUtf8(bytes)) {
+      return { ok: false, output: { error: "File is not valid UTF-8." } };
+    }
+
+    const sha256 = contentHash(bytes);
+    if (cursor !== undefined) {
+      if (cursor.path !== relativePath) {
+        throw new Error("Field 'cursor' was issued for a different path.");
+      }
+      if (cursor.sha256 !== sha256) {
+        return {
+          ok: false,
+          output: {
+            error: "File changed since the read cursor was issued.",
+            expectedSha256: cursor.sha256,
+            actualSha256: sha256,
+          },
+        };
+      }
+    }
+
+    const range = requestedRange ?? sequentialReadRange(bytes, cursor?.offset ?? 0, pageBytes);
+    validateReadRange(range, bytes);
+    const contents = bytes.subarray(range.startByte, range.endByte).toString("utf8");
+    const truncated = range.endByte < bytes.byteLength;
+    const nextCursor = truncated
+      ? encodeReadCursor({
+        version: READ_CURSOR_VERSION,
+        path: relativePath,
+        sha256,
+        offset: range.endByte,
+      })
+      : null;
     this.versions?.record(relativePath, sha256);
-    return { ok: true, output: { path: relativePath, sha256, contents } };
+    return {
+      ok: true,
+      output: {
+        path: relativePath,
+        sha256,
+        contents,
+        totalBytes: bytes.byteLength,
+        range: { startByte: range.startByte, endByte: range.endByte },
+        truncated,
+        nextCursor,
+      },
+    };
   }
 }
 
@@ -347,6 +451,136 @@ function countOccurrences(contents: string, target: string): number {
 
 function isMissing(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function rejectUnknownFields(
+  fields: Record<string, JsonValue>,
+  allowed: readonly string[],
+  toolName: string,
+): void {
+  const allowedFields = new Set(allowed);
+  const unknown = Object.keys(fields).filter((field) => !allowedFields.has(field)).sort();
+  if (unknown.length > 0) {
+    throw new Error(`${toolName} received unknown field${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}.`);
+  }
+}
+
+function optionalIntegerField(fields: Record<string, JsonValue>, name: string): number | undefined {
+  const value = fields[name];
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new Error(`Field '${name}' must be an integer.`);
+  }
+  return value;
+}
+
+function optionalReadRange(fields: Record<string, JsonValue>): ReadByteRange | undefined {
+  const value = fields.range;
+  if (value === undefined) return undefined;
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    throw new Error("Field 'range' must be an object.");
+  }
+  rejectUnknownFields(value, ["startByte", "endByte"], "workspace.read range");
+  const startByte = optionalIntegerField(value, "startByte");
+  const endByte = optionalIntegerField(value, "endByte");
+  if (startByte === undefined || endByte === undefined) {
+    throw new Error("Field 'range' requires integer 'startByte' and 'endByte' values.");
+  }
+  return { startByte, endByte };
+}
+
+function optionalReadCursor(fields: Record<string, JsonValue>): ReadCursorPayload | undefined {
+  const value = fields.cursor;
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error("Field 'cursor' must be a string.");
+  if (value.length === 0 || value.length > 8_192) throw new Error("Field 'cursor' is invalid.");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  } catch {
+    throw new Error("Field 'cursor' is invalid.");
+  }
+  if (parsed === null || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error("Field 'cursor' is invalid.");
+  }
+  const payload = parsed as Record<string, unknown>;
+  const fieldsInCursor = Object.keys(payload).sort();
+  if (fieldsInCursor.join(",") !== "offset,path,sha256,version") {
+    throw new Error("Field 'cursor' is invalid.");
+  }
+  if (
+    payload.version !== READ_CURSOR_VERSION
+    || typeof payload.path !== "string"
+    || typeof payload.sha256 !== "string"
+    || !/^[0-9a-f]{64}$/u.test(payload.sha256)
+    || typeof payload.offset !== "number"
+    || !Number.isSafeInteger(payload.offset)
+    || payload.offset < 0
+  ) {
+    throw new Error("Field 'cursor' is invalid.");
+  }
+  return {
+    version: READ_CURSOR_VERSION,
+    path: payload.path,
+    sha256: payload.sha256,
+    offset: payload.offset,
+  };
+}
+
+function encodeReadCursor(payload: ReadCursorPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+}
+
+function sequentialReadRange(bytes: Buffer, startByte: number, maxBytes: number): ReadByteRange {
+  if (!Number.isSafeInteger(startByte) || startByte < 0 || startByte > bytes.byteLength) {
+    throw new Error("Read cursor offset is outside the file.");
+  }
+  if (!isUtf8Boundary(bytes, startByte)) {
+    throw new Error("Read cursor offset is not on a UTF-8 character boundary.");
+  }
+  let endByte = Math.min(startByte + maxBytes, bytes.byteLength);
+  while (endByte > startByte && endByte < bytes.byteLength && !isUtf8Boundary(bytes, endByte)) {
+    endByte -= 1;
+  }
+  return { startByte, endByte };
+}
+
+function validateReadRange(range: ReadByteRange, bytes: Buffer): void {
+  const { startByte, endByte } = range;
+  if (
+    !Number.isSafeInteger(startByte)
+    || !Number.isSafeInteger(endByte)
+    || startByte < 0
+    || endByte < startByte
+    || endByte > bytes.byteLength
+  ) {
+    throw new Error("Field 'range' must be within the file and use startByte <= endByte.");
+  }
+  if (endByte - startByte > MAX_READ_PAGE_BYTES) {
+    throw new Error(`Field 'range' cannot exceed ${MAX_READ_PAGE_BYTES} bytes.`);
+  }
+  if (bytes.byteLength > 0 && startByte === endByte) {
+    throw new Error("Field 'range' must not be empty for a non-empty file.");
+  }
+  if (!isUtf8Boundary(bytes, startByte) || !isUtf8Boundary(bytes, endByte)) {
+    throw new Error("Field 'range' must begin and end on UTF-8 character boundaries.");
+  }
+}
+
+function isUtf8Boundary(bytes: Buffer, offset: number): boolean {
+  if (offset === 0 || offset === bytes.byteLength) return true;
+  const byte = bytes[offset];
+  return byte !== undefined && (byte & 0b1100_0000) !== 0b1000_0000;
+}
+
+function isValidUtf8(bytes: Buffer): boolean {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function toolDefinition(
