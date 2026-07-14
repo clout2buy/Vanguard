@@ -60,7 +60,7 @@ export async function createSessionCheckpoint(
   journal: FileJournal,
   label?: string,
 ): Promise<SessionCheckpoint> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "session.checkpoint", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "session.checkpoint", () =>
     createSessionCheckpointUnlocked(session, journal, label));
 }
 
@@ -74,7 +74,7 @@ async function createSessionCheckpointUnlocked(
     throw new Error("Checkpoint labels must contain 1 to 200 characters.");
   }
   await recoverSessionRestoreUnlocked(session);
-  const container = path.dirname(session.workspaceRoot);
+  const container = path.dirname(session.metadataFile);
   const parent = path.join(container, "time-travel", "checkpoints");
   await mkdir(parent, { recursive: true });
   const id = `checkpoint-${randomUUID()}`;
@@ -128,12 +128,12 @@ async function createSessionCheckpointUnlocked(
 }
 
 export async function listSessionCheckpoints(session: CodingSession): Promise<readonly SessionCheckpoint[]> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "session.list", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "session.list", () =>
     listSessionCheckpointsUnlocked(session));
 }
 
 async function listSessionCheckpointsUnlocked(session: CodingSession): Promise<readonly SessionCheckpoint[]> {
-  const directory = path.join(path.dirname(session.workspaceRoot), "time-travel", "checkpoints");
+  const directory = path.join(path.dirname(session.metadataFile), "time-travel", "checkpoints");
   let children: string[];
   try {
     children = await readdir(directory);
@@ -158,7 +158,7 @@ export async function restoreSessionCheckpoint(
   confirmation: string,
   options: { readonly simulateCrashAfterOldMove?: boolean } = {},
 ): Promise<RestoreResult> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "session.restore", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "session.restore", () =>
     restoreSessionCheckpointUnlocked(session, journal, checkpointId, confirmation, options));
 }
 
@@ -173,7 +173,7 @@ async function restoreSessionCheckpointUnlocked(
   assertCheckpointConfirmation(checkpointId, confirmation);
   await recoverSessionRestoreUnlocked(session);
   const checkpoint = await loadSessionCheckpoint(session, checkpointId);
-  const container = path.dirname(session.workspaceRoot);
+  const container = path.dirname(session.metadataFile);
   const timeTravelRoot = path.join(container, "time-travel");
   const newWorkspace = path.join(container, "workspace.restore-new");
   const backupWorkspace = path.join(container, "workspace.restore-backup");
@@ -233,12 +233,12 @@ async function restoreSessionCheckpointUnlocked(
 
 /** Any interrupted swap is rolled back to the pre-restore workspace. */
 export async function recoverSessionRestore(session: CodingSession): Promise<boolean> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "session.restore-recovery", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "session.restore-recovery", () =>
     recoverSessionRestoreUnlocked(session));
 }
 
 async function recoverSessionRestoreUnlocked(session: CodingSession): Promise<boolean> {
-  const container = path.dirname(session.workspaceRoot);
+  const container = path.dirname(session.metadataFile);
   const markerFile = path.join(container, "time-travel", "restore.json");
   try {
     const marker = JSON.parse(await readFile(markerFile, "utf8")) as Partial<RestoreMarker>;
@@ -285,7 +285,7 @@ export async function forkSessionCheckpoint(
   parentJournal: FileJournal,
   checkpointId: string,
 ): Promise<ForkResult> {
-  return withSessionLease(path.dirname(parent.workspaceRoot), "session.fork", () =>
+  return withSessionLease(path.dirname(parent.metadataFile), "session.fork", () =>
     forkSessionCheckpointUnlocked(parent, parentJournal, checkpointId));
 }
 
@@ -296,14 +296,14 @@ async function forkSessionCheckpointUnlocked(
 ): Promise<ForkResult> {
   requireMaterialized(parent);
   const checkpoint = await loadSessionCheckpoint(parent, checkpointId);
-  const checkpointRoot = path.join(path.dirname(parent.workspaceRoot), "time-travel", "checkpoints", checkpointId);
+  const checkpointRoot = path.join(path.dirname(parent.metadataFile), "time-travel", "checkpoints", checkpointId);
   const lineage: SessionLineage = {
     parentSessionId: parent.id,
     parentCheckpointId: checkpointId,
     parentJournalHash: checkpoint.journalHash,
   };
   const child = await createForkedCodingSession(parent, path.join(checkpointRoot, "workspace"), lineage);
-  const childContainer = path.dirname(child.workspaceRoot);
+  const childContainer = path.dirname(child.metadataFile);
   const childJournalFile = path.join(childContainer, "run.jsonl");
   try {
     await copyFile(path.join(checkpointRoot, "run.jsonl"), childJournalFile);
@@ -342,7 +342,7 @@ async function forkSessionCheckpointUnlocked(
 
 async function loadSessionCheckpoint(session: CodingSession, checkpointId: string): Promise<SessionCheckpoint> {
   if (!isCheckpointId(checkpointId)) throw new Error("Checkpoint ID is malformed.");
-  const file = path.join(path.dirname(session.workspaceRoot), "time-travel", "checkpoints", checkpointId, "checkpoint.json");
+  const file = path.join(path.dirname(session.metadataFile), "time-travel", "checkpoints", checkpointId, "checkpoint.json");
   const parsed = JSON.parse(await readFile(file, "utf8")) as Partial<SessionCheckpoint>;
   if (
     parsed.version !== 1 || parsed.id !== checkpointId || parsed.sessionId !== session.id

@@ -106,7 +106,7 @@ export interface TransactionTestOptions {
 }
 
 export async function reviewSessionChanges(session: CodingSession, journal: FileJournal): Promise<PatchManifest> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "change.review", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "change.review", () =>
     reviewSessionChangesUnlocked(session, journal));
 }
 
@@ -115,7 +115,7 @@ async function reviewSessionChangesUnlocked(session: CodingSession, journal: Fil
   const baseline = await loadSessionBaseline(session);
   const candidate = await snapshotTree(session.workspaceRoot);
   const manifest = buildPatchManifest(session.id, baseline, candidate);
-  const directory = path.join(path.dirname(session.workspaceRoot), "reviews");
+  const directory = path.join(path.dirname(session.metadataFile), "reviews");
   await mkdir(directory, { recursive: true });
   const file = path.join(directory, `${manifest.manifestHash}.json`);
   let created = false;
@@ -221,7 +221,12 @@ export async function applyReviewedManifest(
   confirmation: string,
   testOptions: TransactionTestOptions = {},
 ): Promise<ApplyResult> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "change.apply", () =>
+  // In-place sessions already write to the real project; "applying" the
+  // pristine baseline over it would silently revert the agent's work.
+  if (session.inPlace === true) {
+    throw new Error("In-place sessions have no apply step: changes are already live in the project.");
+  }
+  return withSessionLease(path.dirname(session.metadataFile), "change.apply", () =>
     applyReviewedManifestUnlocked(session, journal, manifestHash, confirmation, testOptions));
 }
 
@@ -317,7 +322,7 @@ export async function undoAppliedTransaction(
   confirmation: string,
   testOptions: TransactionTestOptions = {},
 ): Promise<UndoResult> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "change.undo", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "change.undo", () =>
     undoAppliedTransactionUnlocked(session, journal, transactionId, confirmation, testOptions));
 }
 
@@ -375,12 +380,12 @@ async function undoAppliedTransactionUnlocked(
 
 /** Rolls incomplete apply/revert operations back to their last committed state. */
 export async function recoverApplyTransactions(session: CodingSession): Promise<readonly string[]> {
-  return withSessionLease(path.dirname(session.workspaceRoot), "change.recovery", () =>
+  return withSessionLease(path.dirname(session.metadataFile), "change.recovery", () =>
     recoverApplyTransactionsUnlocked(session));
 }
 
 async function recoverApplyTransactionsUnlocked(session: CodingSession): Promise<readonly string[]> {
-  const directory = path.join(path.dirname(session.workspaceRoot), "transactions");
+  const directory = path.join(path.dirname(session.metadataFile), "transactions");
   let children: string[];
   try {
     children = await readdir(directory);
@@ -440,7 +445,7 @@ async function stageTransaction(
   manifest: PatchManifest,
   transitions: readonly PathTransition[],
 ): Promise<ApplyTransaction> {
-  const parent = path.join(path.dirname(session.workspaceRoot), "transactions");
+  const parent = path.join(path.dirname(session.metadataFile), "transactions");
   await mkdir(parent, { recursive: true });
   const id = `apply-${randomUUID()}`;
   const temporary = path.join(parent, `.${id}.tmp`);
@@ -596,7 +601,7 @@ async function loadReviewedManifest(
   journal: FileJournal,
   manifestHash: string,
 ): Promise<PatchManifest> {
-  const manifest = await loadPatchManifest(path.join(path.dirname(session.workspaceRoot), "reviews", `${manifestHash}.json`));
+  const manifest = await loadPatchManifest(path.join(path.dirname(session.metadataFile), "reviews", `${manifestHash}.json`));
   if (manifest.sessionId !== session.id) throw new Error("Reviewed manifest belongs to a different session.");
   const reviewed = (await journal.readValidated()).some((event) =>
     event.type === "change.reviewed"
@@ -675,7 +680,7 @@ async function updateTransactionByRoot(root: string, transaction: ApplyTransacti
 }
 
 function transactionRoot(session: CodingSession, id: string): string {
-  return path.join(path.dirname(session.workspaceRoot), "transactions", id);
+  return path.join(path.dirname(session.metadataFile), "transactions", id);
 }
 
 async function withSourceLock<T>(sourceRoot: string, action: () => Promise<T>): Promise<T> {

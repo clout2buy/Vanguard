@@ -34,7 +34,20 @@ export interface CodingSession {
   readonly journalGenesisHash?: string;
   /** Cryptographic branch point for forked sessions. */
   readonly lineage?: SessionLineage;
+  /**
+   * In-place sessions edit the real project directly: workspaceRoot is the
+   * source tree and the session-container copy becomes the pristine baseline
+   * for review, drift detection, and undo. Persisted metadata always stores
+   * the canonical container workspace path; the flip happens at open time.
+   */
+  readonly inPlace?: true;
+  /** Pristine baseline copy for in-place sessions. */
+  readonly pristineRoot?: string;
   readonly createdAt: string;
+}
+
+export interface CreateSessionOptions {
+  readonly inPlace?: boolean;
 }
 
 export interface MaterializeSessionWorkspaceOptions {
@@ -46,8 +59,8 @@ export interface MaterializeSessionWorkspaceOptions {
   readonly copyWorkspace?: (sourceRoot: string, destinationRoot: string) => Promise<void>;
 }
 
-export async function createCodingSession(source: string): Promise<CodingSession> {
-  return materializeSessionWorkspace(await createSessionShell(source));
+export async function createCodingSession(source: string, options: CreateSessionOptions = {}): Promise<CodingSession> {
+  return materializeSessionWorkspace(await createSessionShell(source, options));
 }
 
 /**
@@ -55,7 +68,7 @@ export async function createCodingSession(source: string): Promise<CodingSession
  * copying the project. Conversation happens against the read-only original;
  * the disposable workspace copy is created only when a task contract exists.
  */
-export async function createSessionShell(source: string): Promise<CodingSession> {
+export async function createSessionShell(source: string, options: CreateSessionOptions = {}): Promise<CodingSession> {
   const sourceRoot = await realpath(path.resolve(source));
   if (!(await stat(sourceRoot)).isDirectory()) throw new Error("Workspace must be a directory.");
   const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-session-"));
@@ -69,6 +82,7 @@ export async function createSessionShell(source: string): Promise<CodingSession>
     baselineFile: path.join(container, "baseline.json"),
     materialized: false,
     sourceFingerprint: await fingerprintSessionSource(sourceRoot),
+    ...(options.inPlace === true ? { inPlace: true as const } : {}),
     createdAt: new Date().toISOString(),
   };
   await writeSessionMetadata(session);
@@ -169,6 +183,16 @@ export async function materializeSessionWorkspace(
     ...(sourceChanged ? { sourceChangedDuringConversation: true } : {}),
   };
   await writeSessionMetadata(materialized);
+  // The copy just made is the pristine baseline for an in-place session;
+  // the agent works directly on the real source tree. Metadata above keeps
+  // the canonical container workspace path so open-time validation holds.
+  if (session.inPlace === true) {
+    return {
+      ...materialized,
+      workspaceRoot: session.sourceRoot,
+      pristineRoot: path.join(container, "workspace"),
+    };
+  }
   return materialized;
 }
 
@@ -244,10 +268,14 @@ export async function openCodingSession(location: string): Promise<CodingSession
     throw new Error("Session workspace does not belong to the requested session container.");
   }
   const lineage = validateLineage(parsed.lineage);
+  const inPlace = parsed.inPlace === true;
+  const resolvedSource = await realpath(sourcePath);
   return {
     id: parsed.id,
-    sourceRoot: await realpath(sourcePath),
-    workspaceRoot,
+    sourceRoot: resolvedSource,
+    // An in-place session works directly on the real source tree; the
+    // validated container workspace is its pristine baseline copy.
+    workspaceRoot: inPlace && materialized ? resolvedSource : workspaceRoot,
     metadataFile,
     baselineFile: path.join(container, "baseline.json"),
     materialized,
@@ -255,6 +283,8 @@ export async function openCodingSession(location: string): Promise<CodingSession
     ...(parsed.sourceChangedDuringConversation === true ? { sourceChangedDuringConversation: true } : {}),
     ...(typeof parsed.journalGenesisHash === "string" ? { journalGenesisHash: parsed.journalGenesisHash } : {}),
     ...(lineage === undefined ? {} : { lineage }),
+    ...(inPlace ? { inPlace: true as const } : {}),
+    ...(inPlace && materialized ? { pristineRoot: workspaceRoot } : {}),
     createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : new Date(0).toISOString(),
   };
 }
@@ -347,15 +377,21 @@ async function writeSessionMetadata(session: CodingSession): Promise<void> {
 }
 
 async function writeSessionMetadataTo(file: string, session: CodingSession): Promise<void> {
+  // Metadata always stores the canonical container workspace path, even when
+  // an in-place session object carries the flipped source-tree workspaceRoot.
+  const canonicalWorkspaceRoot = session.inPlace === true
+    ? path.join(path.dirname(file), "workspace")
+    : session.workspaceRoot;
   await atomicWriteJson(file, {
     id: session.id,
     sourceRoot: session.sourceRoot,
-    workspaceRoot: session.workspaceRoot,
+    workspaceRoot: canonicalWorkspaceRoot,
     materialized: session.materialized,
     ...(session.sourceFingerprint === undefined ? {} : { sourceFingerprint: session.sourceFingerprint }),
     ...(session.sourceChangedDuringConversation === true ? { sourceChangedDuringConversation: true } : {}),
     ...(session.journalGenesisHash === undefined ? {} : { journalGenesisHash: session.journalGenesisHash }),
     ...(session.lineage === undefined ? {} : { lineage: session.lineage }),
+    ...(session.inPlace === true ? { inPlace: true } : {}),
     createdAt: session.createdAt,
   });
 }

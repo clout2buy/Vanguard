@@ -155,7 +155,10 @@ async function main(): Promise<void> {
 async function changeCommand(command: "review" | "apply" | "undo", args: readonly string[]): Promise<void> {
   const values = parseArgumentMap(args);
   const session = await openCodingSession(required(values, "--session"));
-  const container = path.dirname(session.workspaceRoot);
+  if (session.inPlace === true && command !== "review") {
+    throw new Error("This is an in-place session: changes are already live in the project, so apply/undo transactions do not exist. Use 'vanguard session restore' to roll back to a checkpoint.");
+  }
+  const container = path.dirname(session.metadataFile);
   const journal = await openSessionJournal(session, path.join(container, "run.jsonl"));
   if (command === "review") {
     process.stdout.write(`${JSON.stringify(await reviewSessionChanges(session, journal), null, 2)}\n`);
@@ -181,7 +184,7 @@ async function sessionCommand(args: readonly string[]): Promise<void> {
   if (subcommand === undefined) throw new Error("Session command requires checkpoint, list, restore, or fork.");
   const values = parseArgumentMap(args.slice(1));
   const session = await openCodingSession(required(values, "--session"));
-  const container = path.dirname(session.workspaceRoot);
+  const container = path.dirname(session.metadataFile);
   const journal = await openSessionJournal(session, path.join(container, "run.jsonl"));
   if (subcommand === "checkpoint") {
     const result = await createSessionCheckpoint(session, journal, single(values, "--label"));
@@ -205,7 +208,7 @@ async function sessionCommand(args: readonly string[]): Promise<void> {
       parentSessionId: result.parentSessionId,
       parentJournalHash: result.parentJournalHash,
       sessionId: result.session.id,
-      sessionRoot: path.dirname(result.session.workspaceRoot),
+      sessionRoot: path.dirname(result.session.metadataFile),
       workspaceRoot: result.session.workspaceRoot,
       journalFile: result.journalFile,
     }, null, 2)}\n`);
@@ -223,8 +226,8 @@ function openSessionJournal(session: CodingSession, file: string): Promise<FileJ
 async function runCommand(resuming: boolean, args: readonly string[]): Promise<void> {
   const opened = resuming
     ? await openCodingSession(parseResumeSession(args))
-    : await createCodingSession(requiredArgument(args, "--workspace"));
-  const container = path.dirname(opened.workspaceRoot);
+    : await createCodingSession(requiredArgument(args, "--workspace"), { inPlace: inPlaceRequested(args) });
+  const container = path.dirname(opened.metadataFile);
   await withSessionLease(container, resuming ? "run.resume" : "run.start", async () => {
     const session = resuming ? await openCodingSession(container) : opened;
     const configurationFile = path.join(container, "run-config.json");
@@ -267,8 +270,8 @@ async function advanceCommand(args: readonly string[]): Promise<void> {
   const sessionPath = single(values, "--session");
   const message = single(values, "--message");
   if (sessionPath === undefined) {
-    const session = await createSessionShell(required(values, "--workspace"));
-    const container = path.dirname(session.workspaceRoot);
+    const session = await createSessionShell(required(values, "--workspace"), { inPlace: inPlaceRequested(args) });
+    const container = path.dirname(session.metadataFile);
     await withSessionLease(container, "advance", async () => {
       const options = await parseOptions(args, { requireTask: false });
       await writeFile(path.join(container, "run-config.json"), JSON.stringify({ version: 1, options }, null, 2));
@@ -277,7 +280,7 @@ async function advanceCommand(args: readonly string[]): Promise<void> {
     return;
   }
   const opened = await openCodingSession(sessionPath);
-  const container = path.dirname(opened.workspaceRoot);
+  const container = path.dirname(opened.metadataFile);
   await withSessionLease(container, "advance", async () => {
     const session = await openCodingSession(container);
     const options = await readRunConfiguration(path.join(container, "run-config.json"));
@@ -295,7 +298,7 @@ async function advanceSessionUnlocked(
   options: CliOptions,
   message: string | undefined,
 ): Promise<void> {
-  const container = path.dirname(session.workspaceRoot);
+  const container = path.dirname(session.metadataFile);
   const journalFile = path.join(container, "run.jsonl");
   const scorecardFile = path.join(container, "scorecard.json");
   const configurationFile = path.join(container, "run-config.json");
@@ -331,6 +334,16 @@ async function advanceSessionUnlocked(
     // workspace must not strand the session on resume.
     if (!session.materialized) {
       session = await materializeSessionWorkspace(session);
+      if (session.inPlace === true) {
+        process.stderr.write(`[Vanguard] IN-PLACE MODE: edits write directly to ${session.workspaceRoot}. A pristine baseline was captured for review and checkpoint rollback.\n`);
+        streamPublicEvent({
+          type: "session.mode",
+          agentId: "main",
+          status: "info",
+          title: "In-place mode",
+          detail: `Edits write directly to ${session.workspaceRoot}`,
+        });
+      }
       emitSessionReady(session, container, journalFile, scorecardFile, true);
       if (session.sourceChangedDuringConversation === true) {
         process.stderr.write("[Vanguard] The original project changed during the conversation; the workspace copy uses the current state. Stale-content preconditions will force fresh reads before any edit.\n");
@@ -433,7 +446,7 @@ async function buildExecutionRuntime(
   interactive: boolean,
   userChannel?: UserChannelPort,
 ): Promise<ExecutionRuntime> {
-  const container = path.dirname(session.workspaceRoot);
+  const container = path.dirname(session.metadataFile);
   const workspace = new WorkspaceBoundary(session.workspaceRoot);
   const versions = new WorkspaceVersionLedger();
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
@@ -560,7 +573,7 @@ async function buildExecutionRuntime(
       new WriteFileTool(workspace, versions, mutationPolicy),
       new ReplaceTextTool(workspace, versions, mutationPolicy),
       new DeleteFileTool(workspace, versions, mutationPolicy),
-      new ReviewChangesTool(session.sourceRoot, session.workspaceRoot),
+      new ReviewChangesTool(session.pristineRoot ?? session.sourceRoot, session.workspaceRoot),
       new ImageInspectionTool(workspace),
       new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
       new SyntaxCheckTool(new PostEditSyntaxChecker(new SyntaxCommandRunner(), workspace)),
@@ -999,6 +1012,16 @@ function parseResumeSession(args: readonly string[]): string {
     throw new Error("Resume usage: vanguard resume --session SESSION_PATH");
   }
   return args[1];
+}
+
+/**
+ * In-place mode is an explicit opt-in: the agent edits the real project tree
+ * directly and the session copy becomes the pristine review/undo baseline.
+ */
+function inPlaceRequested(args: readonly string[]): boolean {
+  if (args.includes("--in-place")) return true;
+  const environment = process.env.VANGUARD_IN_PLACE?.trim().toLowerCase() ?? "";
+  return environment === "1" || environment === "true" || environment === "yes";
 }
 
 function requiredArgument(args: readonly string[], name: string): string {

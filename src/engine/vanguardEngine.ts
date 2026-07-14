@@ -220,7 +220,7 @@ export class VanguardEngine {
     runConfiguration: StoredRunConfiguration,
   ): Promise<VanguardSessionStatus> {
     const session = await createSessionShell(config.workspace);
-    const root = path.dirname(session.workspaceRoot);
+    const root = path.dirname(session.metadataFile);
     try {
       this.#assertOpen();
       await writeFile(path.join(root, "run-config.json"), JSON.stringify(runConfiguration, null, 2), "utf8");
@@ -312,7 +312,7 @@ export class VanguardEngine {
       });
     });
     this.#assertOpen();
-    if (session.id !== claim.sessionId || path.resolve(path.dirname(session.workspaceRoot)) !== path.resolve(sessionRoot)) {
+    if (session.id !== claim.sessionId || path.resolve(path.dirname(session.metadataFile)) !== path.resolve(sessionRoot)) {
       throw new VanguardEngineError("create_operation_corrupt", "The durable session does not match its create claim.");
     }
     if (session.sourceRoot !== effective.options.workspace || session.sourceFingerprint !== claim.sourceFingerprint) {
@@ -370,7 +370,7 @@ export class VanguardEngine {
 
   async #resumeReserved(sessionRoot: string): Promise<VanguardSessionStatus> {
     const session = await openCodingSession(sessionRoot);
-    const binding = await readCreateOperationBinding(path.join(path.dirname(session.workspaceRoot), "create-operation.json"));
+    const binding = await readCreateOperationBinding(path.join(path.dirname(session.metadataFile), "create-operation.json"));
     let ownership: DurableOwnershipLease | undefined;
     let faultContext: VanguardCreateFaultContext | undefined;
     if (binding !== undefined) {
@@ -386,7 +386,7 @@ export class VanguardEngine {
         throw new VanguardEngineError("create_operation_corrupt", "Durable session binding does not match its operation claim.");
       }
       const expectedRoot = await this.#createOperationStore.validatePersistedClaim(claim);
-      if (path.resolve(expectedRoot) !== path.resolve(path.dirname(session.workspaceRoot))) {
+      if (path.resolve(expectedRoot) !== path.resolve(path.dirname(session.metadataFile))) {
         throw new VanguardEngineError("create_operation_corrupt", "Durable session is outside its claimed operation root.");
       }
       this.#assertOpen();
@@ -435,8 +435,8 @@ export class VanguardEngine {
     this.#assertOpen();
     const existing = this.#sessions.get(session.id);
     if (existing !== undefined) return this.#convergedSessionStatus(existing, session, ownership);
-    await validateStoredConfiguration(path.join(path.dirname(session.workspaceRoot), "run-config.json"));
-    const managed = this.#newManagedSession(session, path.dirname(session.workspaceRoot), "idle", ownership);
+    await validateStoredConfiguration(path.join(path.dirname(session.metadataFile), "run-config.json"));
+    const managed = this.#newManagedSession(session, path.dirname(session.metadataFile), "idle", ownership);
     const journal = await FileJournal.open(path.join(managed.root, "run.jsonl"), {
       ...(session.journalGenesisHash === undefined ? {} : { genesisHash: session.journalGenesisHash }),
     });
@@ -464,7 +464,7 @@ export class VanguardEngine {
     requested: CodingSession,
     ownership: DurableOwnershipLease | undefined,
   ): VanguardSessionStatus {
-    if (path.resolve(existing.root) !== path.resolve(path.dirname(requested.workspaceRoot))) {
+    if (path.resolve(existing.root) !== path.resolve(path.dirname(requested.metadataFile))) {
       throw new VanguardEngineError("session_id_conflict", "A different session with this ID is already registered.");
     }
     if ((existing.ownership === undefined) !== (ownership === undefined)

@@ -322,7 +322,7 @@ export class TransactionalDelegateMerger implements DelegateMergePort {
     if (session.sourceRoot !== await realpath(this.#parentWorkspace)) {
       throw new Error("Delegate session is not based on this parent workspace.");
     }
-    const journal = await FileJournal.open(path.join(path.dirname(session.workspaceRoot), "run.jsonl"), {
+    const journal = await FileJournal.open(path.join(path.dirname(session.metadataFile), "run.jsonl"), {
       ...(session.journalGenesisHash === undefined ? {} : { genesisHash: session.journalGenesisHash }),
     });
     const events = await journal.readValidated();
