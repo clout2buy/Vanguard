@@ -10,22 +10,22 @@ manifest.
 
 The model can use the durable lifecycle tools plus two Kimi-style orchestration surfaces:
 
-- `delegate.agent` launches one isolated `coder`, `explore`, or `plan` child,
+- `delegate_agent` launches one isolated `coder`, `explore`, or `plan` child,
   either in the foreground with a bounded wait or in the background. `explore`
   and `plan` are runtime-enforced read-only profiles, not prompt conventions.
-- `delegate.swarm` substitutes 2-6 distinct values into a `{{item}}` prompt
+- `delegate_swarm` substitutes 2-6 distinct values into a `{{item}}` prompt
   template and schedules the resulting children together. Scheduler concurrency,
   depth, time, child-count, and aggregate-step caps remain authoritative.
 
 The lower-level lifecycle tools remain available:
 
-- `delegate.start` queues a self-contained task with one or more editable
+- `delegate_start` queues a self-contained task with one or more editable
   workspace-relative scopes and a reserved step budget. It returns immediately.
-- `delegate.status` reads the durable record without waiting.
-- `delegate.wait` waits at most 120 seconds and returns the current state; a
+- `delegate_status` reads the durable record without waiting.
+- `delegate_wait` waits at most 120 seconds and returns the current state; a
   timeout never implies cancellation.
-- `delegate.cancel` stops queued or running work and never applies its files.
-- `delegate.merge` requires an exact copy of the successful child's 64-character
+- `delegate_cancel` stops queued or running work and never applies its files.
+- `delegate_merge` requires an exact copy of the successful child's 64-character
   review hash. It transactionally applies that reviewed patch to the disposable
   parent workspace.
 
@@ -69,7 +69,7 @@ The parent offers delegation tools only when it has a trusted public project
 check in addition to the sealed completion verifier. An explicitly private
 verifier is never made indirectly model-callable through a child.
 
-`delegate.merge` then uses the existing Phase-5 transaction machinery. The
+`delegate_merge` then uses the existing Phase-5 transaction machinery. The
 exact manifest hash is mandatory; original-parent drift, candidate drift,
 links, unsupported filesystem changes, and conflicting edits are refused.
 Ordinary partial failures roll back. A hash-chained prior `change.applied` event

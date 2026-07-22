@@ -30,7 +30,7 @@ export class WorkspaceMutationPolicy {
   describe(): string {
     const editable = this.#editableRoots.length === 0 ? "the entire workspace" : this.#editableRoots.join(", ");
     const protectedText = this.#protectedPaths.length === 0 ? "none" : this.#protectedPaths.join(", ");
-    return `Editable roots: ${editable}. Protected paths: ${protectedText}. Use workspace.delete for unwanted files.`;
+    return `Editable roots: ${editable}. Protected paths: ${protectedText}. Use delete_file for unwanted files.`;
   }
 
   writableAbsoluteRoots(workspaceRoot: string): readonly string[] {

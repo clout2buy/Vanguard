@@ -380,14 +380,14 @@ function toolDetail(name: string, input: JsonValue | undefined): string | undefi
   const fields = objectValue(input);
   const path = stringValue(fields.path);
   if (path !== undefined) return path;
-  if (name === "process.run") {
+  if (name === "run_command") {
     const command = stringValue(fields.command) ?? "process";
     const args = Array.isArray(fields.args) ? fields.args.filter((item): item is string => typeof item === "string") : [];
     return boundedText([command, ...args].join(" "), 180);
   }
-  if (name === "project.check") return "trusted project verification";
+  if (name === "check_project") return "trusted project verification";
   if (name === "run.checkpoint") return "durable working state";
-  if (name === "plan.update") return "engineering plan revision";
+  if (name === "update_plan") return "engineering plan revision";
   return undefined;
 }
 

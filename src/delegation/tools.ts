@@ -22,7 +22,7 @@ type AgentProfile = "coder" | "explore" | "plan";
  * children receive no mutating, process, extension, or nested-delegation tools.
  */
 export class DelegateAgentTool implements ToolPort {
-  readonly name = "delegate.agent";
+  readonly name = "delegate_agent";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Launch one isolated subagent. coder can produce a reviewed patch; explore and plan are runtime-enforced read-only. Background mode returns immediately; foreground returns the final child record or a still-running record at the bounded timeout.",
@@ -54,7 +54,7 @@ export class DelegateAgentTool implements ToolPort {
     const maxSteps = fields.maxSteps === undefined ? 24 : integerField(fields, "maxSteps");
     const background = booleanField(fields, "runInBackground", false);
     const timeoutMs = fields.timeoutMs === undefined ? 120_000 : integerField(fields, "timeoutMs");
-    if (timeoutMs > 600_000) throw new Error("delegate.agent timeoutMs may not exceed 600000.");
+    if (timeoutMs > 600_000) throw new Error("delegate_agent timeoutMs may not exceed 600000.");
     const record = await this.coordinator.start({
       task: profilePrompt(profile, description, prompt),
       scopes,
@@ -68,10 +68,10 @@ export class DelegateAgentTool implements ToolPort {
 /** Item-template fan-out equivalent to Kimi's AgentSwarm, with Vanguard's
  * stricter scheduler budgets and transactional patch boundary retained. */
 export class DelegateSwarmTool implements ToolPort {
-  readonly name = "delegate.swarm";
+  readonly name = "delegate_swarm";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Fan one prompt template out to distinct isolated subagents. Use {{item}} in promptTemplate. Results are aggregated; coder patches remain candidates and each requires an explicit delegate.merge.",
+    description: "Fan one prompt template out to distinct isolated subagents. Use {{item}} in promptTemplate. Results are aggregated; coder patches remain candidates and each requires an explicit delegate_merge.",
     inputSchema: {
       type: "object",
       properties: {
@@ -96,17 +96,17 @@ export class DelegateSwarmTool implements ToolPort {
     const fields = objectInput(input);
     const description = stringField(fields, "description");
     const template = stringField(fields, "promptTemplate");
-    if (!template.includes("{{item}}")) throw new Error("delegate.swarm promptTemplate must contain {{item}}.");
+    if (!template.includes("{{item}}")) throw new Error("delegate_swarm promptTemplate must contain {{item}}.");
     const items = stringArray(fields.items, "items");
-    if (items.length < 2 || items.length > 6) throw new Error("delegate.swarm requires 2 through 6 items.");
+    if (items.length < 2 || items.length > 6) throw new Error("delegate_swarm requires 2 through 6 items.");
     const prompts = items.map((item) => template.split("{{item}}").join(item));
-    if (new Set(prompts).size !== prompts.length) throw new Error("delegate.swarm items produced duplicate prompts.");
+    if (new Set(prompts).size !== prompts.length) throw new Error("delegate_swarm items produced duplicate prompts.");
     const profile = profileField(fields.subagentType);
     const scopes = stringArray(fields.scopes, "scopes");
     const maxSteps = fields.maxSteps === undefined ? 24 : integerField(fields, "maxSteps");
     const background = booleanField(fields, "runInBackground", false);
     const timeoutMs = fields.timeoutMs === undefined ? 120_000 : integerField(fields, "timeoutMs");
-    if (timeoutMs > 600_000) throw new Error("delegate.swarm timeoutMs may not exceed 600000.");
+    if (timeoutMs > 600_000) throw new Error("delegate_swarm timeoutMs may not exceed 600000.");
     const records: DelegateRecord[] = [];
     for (let index = 0; index < prompts.length; index += 1) {
       records.push(await this.coordinator.start({
@@ -159,14 +159,14 @@ function jsonOk(value: unknown): ToolResult {
  * Hypothesis racing: when a fix has resisted sequential attempts, run 2-3
  * competing approaches as isolated children simultaneously and keep the
  * first that completes. Losers are cancelled; the winner's reviewed patch
- * still requires the ordinary explicit delegate.merge confirmation, so
+ * still requires the ordinary explicit delegate_merge confirmation, so
  * racing changes speed, never safety.
  */
 export class DelegateRaceTool implements ToolPort {
-  readonly name = "delegate.race";
+  readonly name = "delegate_race";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Race 2-3 competing fix hypotheses as isolated children; the first to complete wins and the rest are cancelled. Use after sequential attempts at the same failure have not landed. Each variant must be a self-contained task describing a DIFFERENT approach. The winner's patch still needs delegate.merge.",
+    description: "Race 2-3 competing fix hypotheses as isolated children; the first to complete wins and the rest are cancelled. Use after sequential attempts at the same failure have not landed. Each variant must be a self-contained task describing a DIFFERENT approach. The winner's patch still needs delegate_merge.",
     inputSchema: {
       type: "object",
       properties: {
@@ -191,7 +191,7 @@ export class DelegateRaceTool implements ToolPort {
     const fields = objectInput(input);
     const variants = stringArray(fields.variants, "variants");
     if (variants.length < 2 || variants.length > 3) {
-      throw new Error("delegate.race requires 2 or 3 variants.");
+      throw new Error("delegate_race requires 2 or 3 variants.");
     }
     const scopes = stringArray(fields.scopes, "scopes");
     const maxSteps = integerField(fields, "maxSteps");
@@ -238,7 +238,7 @@ export class DelegateRaceTool implements ToolPort {
           answer: winner.answer ?? null,
           review: (winner.review ?? null) as JsonValue,
           cancelled: ids.filter((id) => id !== winner!.id),
-          note: "Merge the winner with delegate.merge using its review confirmation; losers were cancelled and must not be merged.",
+          note: "Merge the winner with delegate_merge using its review confirmation; losers were cancelled and must not be merged.",
         } as unknown as JsonValue,
       };
     }
@@ -258,10 +258,10 @@ export class DelegateRaceTool implements ToolPort {
 }
 
 export class DelegateStartTool implements ToolPort {
-  readonly name = "delegate.start";
+  readonly name = "delegate_start";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Start a real isolated Vanguard child for a scoped coding subtask. Returns immediately; use delegate.status or delegate.wait to observe it.",
+    description: "Start a real isolated Vanguard child for a scoped coding subtask. Returns immediately; use delegate_status or delegate_wait to observe it.",
     inputSchema: {
       type: "object",
       properties: {
@@ -291,7 +291,7 @@ export class DelegateStartTool implements ToolPort {
 }
 
 export class DelegateStatusTool implements ToolPort {
-  readonly name = "delegate.status";
+  readonly name = "delegate_status";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Read one isolated child's durable status, answer, step count, and reviewed patch summary.",
@@ -307,14 +307,14 @@ export class DelegateStatusTool implements ToolPort {
 }
 
 export class DelegateWaitTool implements ToolPort {
-  readonly name = "delegate.wait";
+  readonly name = "delegate_wait";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Wait for one child to settle, bounded by timeoutMs. A timed-out wait returns the still-running status and does not cancel it.",
     inputSchema: {
       type: "object",
       properties: {
-        id: { type: "string", description: "Child id returned by delegate.start." },
+        id: { type: "string", description: "Child id returned by delegate_start." },
         timeoutMs: { type: "integer", minimum: 1, maximum: 120_000, description: "Bounded wait; defaults to 30000." },
       },
       required: ["id"],
@@ -328,13 +328,13 @@ export class DelegateWaitTool implements ToolPort {
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
     const timeoutMs = fields.timeoutMs === undefined ? 30_000 : integerField(fields, "timeoutMs");
-    if (timeoutMs > 120_000) throw new Error("delegate.wait timeoutMs may not exceed 120000.");
+    if (timeoutMs > 120_000) throw new Error("delegate_wait timeoutMs may not exceed 120000.");
     return ok(await this.coordinator.wait(stringField(fields, "id"), timeoutMs));
   }
 }
 
 export class DelegateCancelTool implements ToolPort {
-  readonly name = "delegate.cancel";
+  readonly name = "delegate_cancel";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Cancel a queued or running child. Cancellation never applies its candidate patch.",
@@ -350,10 +350,10 @@ export class DelegateCancelTool implements ToolPort {
 }
 
 export class DelegateMergeTool implements ToolPort {
-  readonly name = "delegate.merge";
+  readonly name = "delegate_merge";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Transactionally apply a completed child's reviewed patch to the disposable parent workspace. manifestHash must exactly match delegate.status; drift or conflicts are refused.",
+    description: "Transactionally apply a completed child's reviewed patch to the disposable parent workspace. manifestHash must exactly match delegate_status; drift or conflicts are refused.",
     inputSchema: {
       type: "object",
       properties: {
@@ -377,7 +377,7 @@ export class DelegateMergeTool implements ToolPort {
 function idSchema(): JsonValue {
   return {
     type: "object",
-    properties: { id: { type: "string", description: "Child id returned by delegate.start." } },
+    properties: { id: { type: "string", description: "Child id returned by delegate_start." } },
     required: ["id"],
     additionalProperties: false,
   };

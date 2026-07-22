@@ -7,6 +7,7 @@ import { asciiLowercase, compareOrdinal } from "../deterministicText.js";
 import {
   SESSION_EXCLUDED_DIRECTORIES,
   atomicWriteJson,
+  createFsLimiter,
   readTreeSnapshot,
   snapshotTree,
   type TreeSnapshot,
@@ -381,6 +382,74 @@ export async function loadSessionBaseline(session: CodingSession): Promise<TreeS
 const LARGE_FILE_IDENTITY_BYTES = 8 * 1024 * 1024;
 const FILE_IO_CONCURRENCY = 8;
 
+/**
+ * Mirror of the tree-snapshot racy-mtime rule: a cached digest is served only
+ * when size, mtime, and ctime are identical to the hashed observation AND the
+ * mtime is strictly older than that observation by this slop, so coarse
+ * filesystem timestamps can never bless a same-window rewrite.
+ */
+const FINGERPRINT_RACY_MTIME_SLOP_MS = 2_000;
+
+interface FingerprintCacheEntry {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly ctimeMs: number;
+  readonly digest: string;
+  readonly hashedAtMs: number;
+}
+
+/**
+ * Stat-validated digest cache for repeated fingerprints of one source root.
+ * Session flows fingerprint the same tree several times (shell creation, the
+ * materialization bracket, engine create idempotency); each pass after the
+ * first only re-reads files whose stats changed, which turns a full-content
+ * walk into a stat walk without weakening content identity.
+ */
+class SourceFingerprintCache {
+  readonly #entries = new Map<string, FingerprintCacheEntry>();
+
+  lookup(absolutePath: string, stats: Stats): string | undefined {
+    const cached = this.#entries.get(absolutePath);
+    if (cached === undefined) return undefined;
+    if (cached.size !== stats.size || cached.mtimeMs !== stats.mtimeMs || cached.ctimeMs !== stats.ctimeMs) return undefined;
+    if (cached.mtimeMs + FINGERPRINT_RACY_MTIME_SLOP_MS >= cached.hashedAtMs) return undefined;
+    return cached.digest;
+  }
+
+  store(absolutePath: string, stats: Stats, digest: string): void {
+    this.#entries.set(absolutePath, {
+      size: stats.size,
+      mtimeMs: stats.mtimeMs,
+      ctimeMs: stats.ctimeMs,
+      digest,
+      hashedAtMs: Date.now(),
+    });
+  }
+
+  retainOnly(seen: ReadonlySet<string>): void {
+    for (const key of this.#entries.keys()) {
+      if (!seen.has(key)) this.#entries.delete(key);
+    }
+  }
+}
+
+const SOURCE_FINGERPRINT_CACHE_ROOTS = 8;
+const sourceFingerprintCaches = new Map<string, SourceFingerprintCache>();
+
+/** One digest cache per resolved root, capped so temporary roots cannot pile up. */
+function sourceFingerprintCacheFor(root: string): SourceFingerprintCache {
+  const key = path.resolve(root);
+  const existing = sourceFingerprintCaches.get(key);
+  if (existing !== undefined) return existing;
+  if (sourceFingerprintCaches.size >= SOURCE_FINGERPRINT_CACHE_ROOTS) {
+    const oldest = sourceFingerprintCaches.keys().next().value;
+    if (oldest !== undefined) sourceFingerprintCaches.delete(oldest);
+  }
+  const created = new SourceFingerprintCache();
+  sourceFingerprintCaches.set(key, created);
+  return created;
+}
+
 /** Run async jobs with bounded parallelism; results keep job order. */
 async function runFilePool<T>(jobs: readonly (() => Promise<T>)[], limit = FILE_IO_CONCURRENCY): Promise<T[]> {
   const results = new Array<T>(jobs.length);
@@ -411,28 +480,37 @@ async function runFilePool<T>(jobs: readonly (() => Promise<T>)[], limit = FILE_
  * unchanged. Assets that big are not what a coding session is guarding.
  */
 export async function fingerprintSessionSource(root: string): Promise<string> {
+  const cache = sourceFingerprintCacheFor(root);
   const entries: string[] = [];
   const hashJobs: Array<() => Promise<string | undefined>> = [];
-  const queue = [root];
-  while (queue.length > 0) {
-    const directory = queue.shift()!;
-    const children = await readdir(directory, { withFileTypes: true });
-    children.sort((left, right) => compareOrdinal(left.name, right.name));
-    for (const entry of children) {
+  const seenFiles = new Set<string>();
+  const limitFs = createFsLimiter(FINGERPRINT_FS_CONCURRENCY);
+
+  const walk = async (directory: string): Promise<void> => {
+    const children = await limitFs(() => readdir(directory, { withFileTypes: true }));
+    const subdirectories: string[] = [];
+    await Promise.all(children.map(async (entry) => {
       const absolute = path.join(directory, entry.name);
       const relative = path.relative(root, absolute).replaceAll("\\", "/");
-      const details = await lstat(absolute);
+      const details = await limitFs(() => lstat(absolute));
       if (details.isSymbolicLink()) {
-        entries.push(JSON.stringify(["link", relative, await readlink(absolute)]));
+        const target = await limitFs(() => readlink(absolute));
+        entries.push(JSON.stringify(["link", relative, target]));
       } else if (details.isDirectory()) {
         if (!SESSION_EXCLUDED_DIRECTORIES.has(entry.name)) {
           entries.push(JSON.stringify(["directory", relative, details.mode & 0o7777]));
-          queue.push(absolute);
+          subdirectories.push(absolute);
         }
       } else if (details.isFile()) {
         if (details.size > LARGE_FILE_IDENTITY_BYTES) {
           entries.push(JSON.stringify(["file", relative, details.mode & 0o7777, details.size, `large:${details.size}`]));
-          continue;
+          return;
+        }
+        const cached = cache.lookup(absolute, details);
+        if (cached !== undefined) {
+          seenFiles.add(absolute);
+          entries.push(JSON.stringify(["file", relative, details.mode & 0o7777, details.size, cached]));
+          return;
         }
         hashJobs.push(async () => {
           const digest = await hashStableFileOrLocked(absolute, details);
@@ -441,21 +519,31 @@ export async function fingerprintSessionSource(root: string): Promise<string> {
           // to the session model: excluded from fingerprints and copies
           // alike, exactly like SESSION_EXCLUDED_DIRECTORIES. A file that
           // later becomes readable enters the fingerprint as source drift.
-          return digest === undefined
-            ? undefined
-            : JSON.stringify(["file", relative, details.mode & 0o7777, details.size, digest]);
+          if (digest === undefined) return undefined;
+          // hashStableFile proved these exact stats survived the read, so the
+          // digest is safe to serve for identical stats on a later pass.
+          seenFiles.add(absolute);
+          cache.store(absolute, details, digest);
+          return JSON.stringify(["file", relative, details.mode & 0o7777, details.size, digest]);
         });
       } else {
         throw new Error(`Source contains unsupported filesystem entry: ${relative}`);
       }
-    }
-  }
+    }));
+    await Promise.all(subdirectories.map((subdirectory) => walk(subdirectory)));
+  };
+
+  await walk(root);
   for (const hashed of await runFilePool(hashJobs)) {
     if (hashed !== undefined) entries.push(hashed);
   }
+  cache.retainOnly(seenFiles);
   entries.sort(compareOrdinal);
   return createHash("sha256").update(entries.join("\n")).digest("hex");
 }
+
+/** Walk parallelism for fingerprinting; hashing keeps its own bounded pool. */
+const FINGERPRINT_FS_CONCURRENCY = 16;
 
 export function isLockedFileError(error: unknown): boolean {
   if (!(error instanceof Error) || !("code" in error)) return false;

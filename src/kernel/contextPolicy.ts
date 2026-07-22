@@ -105,7 +105,7 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
       const entries: TranscriptEntry[] = [entry];
       // Only the actual adjacent human transcript entry can answer this call.
       // Runtime-authored `history` is a different role and can never bind here.
-      if (isControlObservation(transcript[index + 1], "user.ask")) {
+      if (isControlObservation(transcript[index + 1], "ask_user")) {
         entries.push(transcript[index + 1]!);
         index += 1;
       } else if (transcript[index + 1]?.role === "user") {
@@ -117,7 +117,7 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
     }
     if (decision?.kind === "execute") {
       const entries: TranscriptEntry[] = [entry];
-      if (isControlObservation(transcript[index + 1], "task.execute")) {
+      if (isControlObservation(transcript[index + 1], "execute_task")) {
         entries.push(transcript[index + 1]!);
         index += 1;
       }
@@ -126,7 +126,7 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
     }
     if (decision?.kind === "complete") {
       const entries: TranscriptEntry[] = [entry];
-      if (isControlObservation(transcript[index + 1], "task.complete")) {
+      if (isControlObservation(transcript[index + 1], "complete_task")) {
         entries.push(transcript[index + 1]!);
         index += 1;
       }

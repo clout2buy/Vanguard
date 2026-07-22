@@ -50,10 +50,10 @@ export interface ProcessToolOptions {
 }
 
 export class ProcessTool implements ToolPort {
-  readonly name = "process.run";
+  readonly name = "run_command";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Run one bounded allowlisted executable without a command shell and capture its exit state. Persistent development servers are rejected; use artifact.render for HTML evidence.",
+    description: "Run one bounded allowlisted executable without a command shell and capture its exit state. Persistent development servers are rejected; use render_artifact for HTML evidence.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,7 +153,7 @@ export class ProcessTool implements ToolPort {
         output: {
           error: "Persistent server commands are not valid bounded process evidence.",
           detail: persistentReason,
-          guidance: "Use artifact.render to execute and inspect an HTML/SVG deliverable, or run a bounded test command that exits on its own.",
+          guidance: "Use render_artifact to execute and inspect an HTML/SVG deliverable, or run a bounded test command that exits on its own.",
         },
       };
     }

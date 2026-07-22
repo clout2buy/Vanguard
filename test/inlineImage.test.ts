@@ -22,14 +22,14 @@ function renderExchangeRequest() {
         role: "decision" as const,
         content: {
           kind: "tools",
-          calls: [{ id: "call-render", name: "artifact.render", input: { path: "index.html" } }],
+          calls: [{ id: "call-render", name: "render_artifact", input: { path: "index.html" } }],
         } as unknown as JsonValue,
       },
       {
         role: "observation" as const,
         content: {
           callId: "call-render",
-          tool: "artifact.render",
+          tool: "render_artifact",
           ok: true,
           output: {
             path: ".vanguard/renders/index.html.1280x800.png",
@@ -69,7 +69,7 @@ test("text-only wires strip the base64 and say so instead of shipping it", () =>
   assert.ok(functionOutput !== undefined);
   assert.doesNotMatch(String(functionOutput.output), new RegExp(PIXELS, "u"));
   assert.match(String(functionOutput.output), /inline image omitted/u);
-  assert.match(String(functionOutput.output), /artifact\.inspect_image/u);
+  assert.match(String(functionOutput.output), /inspect_image/u);
 
   const chat = new OpenAIChatCompletionsCodec("deepseek-v4", undefined, "deepseek").encode(renderExchangeRequest()) as {
     messages: Array<Record<string, JsonValue>>;
@@ -89,14 +89,14 @@ test("outputs without a valid attachment pass through every wire untouched", () 
         role: "decision" as const,
         content: {
           kind: "tools",
-          calls: [{ id: "call-1", name: "workspace.read", input: { path: "a.ts" } }],
+          calls: [{ id: "call-1", name: "read_file", input: { path: "a.ts" } }],
         } as unknown as JsonValue,
       },
       {
         role: "observation" as const,
         content: {
           callId: "call-1",
-          tool: "workspace.read",
+          tool: "read_file",
           ok: true,
           // `image` here is model-visible data, not a valid attachment shape.
           output: { contents: "const x = 1;", image: { mediaType: "text/html", base64: "!!not-base64!!" } },

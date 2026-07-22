@@ -131,7 +131,7 @@ test("the model-independent artifact verifier gates every HTML completion", asyn
 
 // ── Code intelligence ──────────────────────────────────────────────────────
 
-test("code.intel answers definition and references from the project's own compiler", async () => {
+test("code_intel answers definition and references from the project's own compiler", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-intel-"));
   try {
     await writeFile(path.join(root, "tsconfig.json"), JSON.stringify({ compilerOptions: { strict: true }, include: ["src"] }));
@@ -167,14 +167,14 @@ test("code.intel answers definition and references from the project's own compil
   }
 });
 
-test("code.intel refuses honestly without a tsconfig", async () => {
+test("code_intel refuses honestly without a tsconfig", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-intel-none-"));
   try {
     await writeFile(path.join(root, "a.ts"), "export const x = 1;\n");
     const tool = new CodeIntelTool(new WorkspaceBoundary(root), async () => undefined);
     const result = await tool.execute({ path: "a.ts", line: 1, symbol: "x", query: "definition" }, context);
     assert.equal(result.ok, false);
-    assert.match(JSON.stringify(result.output), /workspace\.search/);
+    assert.match(JSON.stringify(result.output), /grep/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -221,7 +221,7 @@ function fakeCoordinator(records: Map<string, DelegateRecord>, script: {
   } as unknown as DelegationCoordinator;
 }
 
-test("delegate.race keeps the first completed child and cancels every loser", async () => {
+test("delegate_race keeps the first completed child and cancels every loser", async () => {
   const records = new Map<string, DelegateRecord>();
   const cancelled: string[] = [];
   let waits = 0;
@@ -251,7 +251,7 @@ test("delegate.race keeps the first completed child and cancels every loser", as
   assert.deepEqual(cancelled, ["child-1"], "the loser must actually be cancelled");
 });
 
-test("delegate.race reports total defeat honestly", async () => {
+test("delegate_race reports total defeat honestly", async () => {
   const records = new Map<string, DelegateRecord>();
   const cancelled: string[] = [];
   const coordinator = fakeCoordinator(records, {

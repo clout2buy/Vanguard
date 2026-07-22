@@ -312,7 +312,7 @@ export class PlanLedger implements PlanStatusPort {
    * Runtime-owned staleness repair. A proven milestone whose evidence went
    * stale (a later mutation/restore advanced the workspace generation) is
    * re-bound to a fresh, eligible journal event — the exact refresh the model
-   * could request via plan.update, derived without spending a model turn.
+   * could request via update_plan, derived without spending a model turn.
    * The write goes through the ordinary validated revision path, so the
    * strictly-newer-generation rule, monotonicity, and persistence integrity
    * all still hold; a refresh can never prove an unproven milestone, weaken a
@@ -403,7 +403,7 @@ export class PlanLedger implements PlanStatusPort {
       .join("; ");
     return `Path '${relativePath}' is outside every declared milestone scope (${owners}). `
       + "This mutation is plan drift. Work within the declared scope, or first revise the plan "
-      + "with plan.update, adding a milestone that owns this path, before mutating it.";
+      + "with update_plan, adding a milestone that owns this path, before mutating it.";
   }
 
   requiredCriteria(): readonly string[] {
@@ -1085,7 +1085,7 @@ function normalizeScopePath(value: string): string {
 /**
  * A scope entry matches a normalized workspace-relative path when it is the
  * path itself, a directory containing it, or a matching glob. The glob subset
- * mirrors workspace.glob: '**' spans directories, '*' and '?' stay within one
+ * mirrors glob: '**' spans directories, '*' and '?' stay within one
  * segment, '[...]' classes pass through, and a pattern without '/' matches
  * the basename. A malformed glob matches nothing rather than everything.
  */

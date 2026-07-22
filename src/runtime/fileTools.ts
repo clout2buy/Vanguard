@@ -31,7 +31,7 @@ interface ReadCursorPayload {
 }
 
 export class ReadFileTool implements ToolPort {
-  readonly name = "workspace.read";
+  readonly name = "read_file";
   readonly definition = toolDefinition(
     this.name,
     "Read one bounded UTF-8 byte range and return the full-file SHA-256. Continue sequentially with nextCursor.",
@@ -144,7 +144,7 @@ export class ReadFileTool implements ToolPort {
 }
 
 export class WriteFileTool implements ToolPort {
-  readonly name = "workspace.write";
+  readonly name = "write_file";
   readonly definition = toolDefinition(
     this.name,
     "Create a UTF-8 file, or replace a previously read version using expectedSha256.",
@@ -152,7 +152,7 @@ export class WriteFileTool implements ToolPort {
       path: { type: "string", description: "Workspace-relative file path." },
       contents: { type: "string", description: "Complete UTF-8 file contents." },
       contents_size: { type: "integer", minimum: 0, description: "Optional provider-supplied size metadata. Ignored; contents remains authoritative." },
-      expectedSha256: { type: ["string", "null"], description: "Hash returned by workspace.read, or null for a new file." },
+      expectedSha256: { type: ["string", "null"], description: "Hash returned by read_file, or null for a new file." },
       allowRepetition: { type: "boolean", description: "Acknowledge that heavily repeated identical lines are intentional; without it the degeneration guard rejects them." },
     },
     ["path", "contents"],
@@ -228,13 +228,13 @@ export class WriteFileTool implements ToolPort {
 }
 
 export class ReplaceTextTool implements ToolPort {
-  readonly name = "workspace.replace";
+  readonly name = "edit_file";
   readonly definition = toolDefinition(
     this.name,
     "Replace one unique exact text occurrence in a previously read file.",
     {
       path: { type: "string", description: "Workspace-relative file path." },
-      expectedSha256: { type: "string", description: "Hash returned by workspace.read." },
+      expectedSha256: { type: "string", description: "Hash returned by read_file." },
       before: { type: "string", description: "Exact unique text to replace." },
       after: { type: "string", description: "Replacement text." },
       allowRepetition: { type: "boolean", description: "Acknowledge that heavily repeated identical lines are intentional; without it the degeneration guard rejects them." },
@@ -305,13 +305,13 @@ export class ReplaceTextTool implements ToolPort {
 }
 
 export class DeleteFileTool implements ToolPort {
-  readonly name = "workspace.delete";
+  readonly name = "delete_file";
   readonly definition = toolDefinition(
     this.name,
     "Delete one previously read regular file within the mutation policy.",
     {
       path: { type: "string", description: "Workspace-relative file path." },
-      expectedSha256: { type: "string", description: "Hash returned by workspace.read." },
+      expectedSha256: { type: "string", description: "Hash returned by read_file." },
     },
     ["path"],
     "mutate",
@@ -351,7 +351,7 @@ export class DeleteFileTool implements ToolPort {
 }
 
 export class ListFilesTool implements ToolPort {
-  readonly name = "workspace.list";
+  readonly name = "list_dir";
   readonly definition = toolDefinition(this.name, "Recursively list regular files within a workspace directory.", {
     path: { type: "string", description: "Optional workspace-relative directory; defaults to the root." },
   }, [], "observe");
@@ -366,21 +366,29 @@ export class ListFilesTool implements ToolPort {
     const requested = optionalWorkspacePath(fields);
     const root = await this.workspace.existing(requested);
     const files: string[] = [];
-    const queue = [root];
-
-    while (queue.length > 0) {
-      const directory = queue.shift();
-      if (directory === undefined) break;
-      const entries = await readdir(directory, { withFileTypes: true });
-      for (const entry of entries) {
-        const absolute = path.join(directory, entry.name);
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) queue.push(absolute);
-        if (entry.isFile()) files.push(path.relative(this.workspace.root, absolute));
-        if (files.length + queue.length > this.maxEntries) {
-          return { ok: false, output: { error: "Workspace listing limit exceeded.", limit: this.maxEntries } };
+    // Level-parallel BFS: directories of one depth are listed concurrently,
+    // then consumed in discovery order so limits stay deterministic.
+    let level = [root];
+    while (level.length > 0) {
+      const listings = await Promise.all(level.map(async (directory) => ({
+        directory,
+        entries: await readdir(directory, { withFileTypes: true }),
+      })));
+      let remainingInLevel = listings.length;
+      const next: string[] = [];
+      for (const { directory, entries } of listings) {
+        remainingInLevel -= 1;
+        for (const entry of entries) {
+          const absolute = path.join(directory, entry.name);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) next.push(absolute);
+          if (entry.isFile()) files.push(path.relative(this.workspace.root, absolute));
+          if (files.length + remainingInLevel + next.length > this.maxEntries) {
+            return { ok: false, output: { error: "Workspace listing limit exceeded.", limit: this.maxEntries } };
+          }
         }
       }
+      level = next;
     }
 
     files.sort();
@@ -396,7 +404,7 @@ const REGEX_FILE_TIMEOUT_MS = 250;
 const REGEX_SEARCH_BUDGET_MS = 5_000;
 
 export class SearchTextTool implements ToolPort {
-  readonly name = "workspace.search";
+  readonly name = "grep";
   readonly definition = toolDefinition(
     this.name,
     "Search bounded UTF-8 workspace files for literal text (default) or a regular expression, and return source locations with optional context lines.",
@@ -471,33 +479,72 @@ export class SearchTextTool implements ToolPort {
     const requestedFile = rootMetadata.isFile()
       ? normalizeToolPath(path.relative(this.workspace.root, root))
       : undefined;
-    const queue = [requestedFile === undefined ? root : path.dirname(root)];
     const matches: SearchMatch[] = [];
     const deadline = Date.now() + REGEX_SEARCH_BUDGET_MS;
     let truncated = false;
 
-    while (queue.length > 0 && !truncated) {
-      const directory = queue.shift();
-      if (directory === undefined) break;
-      for (const entry of await readdir(directory, { withFileTypes: true })) {
-        const absolute = path.join(directory, entry.name);
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory() && requestedFile === undefined && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) {
-          queue.push(absolute);
-          continue;
+    // Phase 1 — level-parallel BFS collects candidate files in the same
+    // deterministic order the serial walk produced.
+    const candidates: Array<{ absolute: string; relative: string }> = [];
+    let level = [requestedFile === undefined ? root : path.dirname(root)];
+    while (level.length > 0) {
+      const listings = await Promise.all(level.map(async (directory) => ({
+        directory,
+        entries: await readdir(directory, { withFileTypes: true }),
+      })));
+      const next: string[] = [];
+      for (const { directory, entries } of listings) {
+        for (const entry of entries) {
+          const absolute = path.join(directory, entry.name);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory() && requestedFile === undefined && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) {
+            next.push(absolute);
+            continue;
+          }
+          if (entry.isDirectory()) continue;
+          if (!entry.isFile()) continue;
+          const relative = normalizeToolPath(path.relative(this.workspace.root, absolute));
+          if (requestedFile !== undefined && relative !== requestedFile) continue;
+          if (pathFilter !== undefined && !pathFilter(relative)) continue;
+          candidates.push({ absolute, relative });
         }
-        if (entry.isDirectory()) continue;
-        if (!entry.isFile()) continue;
-        const relative = normalizeToolPath(path.relative(this.workspace.root, absolute));
-        if (requestedFile !== undefined && relative !== requestedFile) continue;
-        if (pathFilter !== undefined && !pathFilter(relative)) continue;
-        const metadata = await stat(absolute);
-        if (metadata.size > this.maxFileBytes) continue;
-        const buffer = await readFile(absolute);
-        if (buffer.includes(0)) continue;
-        if (useRegex && Date.now() > deadline) {
-          return { ok: false, output: { error: "Regex search exceeded its time budget; narrow the pattern, path, or filePattern.", matches, truncated: true } };
-        }
+      }
+      level = next;
+    }
+
+    // Phase 2 — bounded read-ahead keeps several file loads in flight while
+    // matching consumes results strictly in candidate order, so match output
+    // and truncation are identical to a serial scan.
+    const READ_AHEAD = 8;
+    const skipped = Symbol("skipped");
+    type Loaded = { buffer: Buffer | typeof skipped } | { failure: unknown };
+    const pending = new Map<number, Promise<Loaded>>();
+    const load = async (candidate: { absolute: string }): Promise<Buffer | typeof skipped> => {
+      const metadata = await stat(candidate.absolute);
+      if (metadata.size > this.maxFileBytes) return skipped;
+      const buffer = await readFile(candidate.absolute);
+      return buffer.includes(0) ? skipped : buffer;
+    };
+    const ensureLoading = (index: number): void => {
+      if (index >= candidates.length || pending.has(index)) return;
+      pending.set(index, load(candidates[index]!).then(
+        (buffer) => ({ buffer }),
+        (failure: unknown) => ({ failure }),
+      ));
+    };
+
+    for (let index = 0; index < candidates.length && !truncated; index += 1) {
+      for (let ahead = index; ahead < index + READ_AHEAD; ahead += 1) ensureLoading(ahead);
+      const outcome = await pending.get(index)!;
+      pending.delete(index);
+      if ("failure" in outcome) throw outcome.failure;
+      if (outcome.buffer === skipped) continue;
+      const buffer = outcome.buffer;
+      const relative = candidates[index]!.relative;
+      if (useRegex && Date.now() > deadline) {
+        return { ok: false, output: { error: "Regex search exceeded its time budget; narrow the pattern, path, or filePattern.", matches, truncated: true } };
+      }
+      {
         const lines = buffer.toString("utf8").split(/\r?\n/u);
         let fileHits: ReadonlyArray<{ line: number; column: number }>;
         try {
@@ -528,7 +575,6 @@ export class SearchTextTool implements ToolPort {
             break;
           }
         }
-        if (truncated) break;
       }
     }
 
@@ -537,7 +583,7 @@ export class SearchTextTool implements ToolPort {
 }
 
 export class GlobTool implements ToolPort {
-  readonly name = "workspace.glob";
+  readonly name = "glob";
   readonly definition = toolDefinition(
     this.name,
     "List workspace files matching a glob pattern, e.g. 'src/**/*.ts' or '*.md'. A pattern without '/' matches file names anywhere.",
@@ -569,36 +615,45 @@ export class GlobTool implements ToolPort {
     const root = await this.workspace.existing(requested);
     const rootRelativePrefix = normalizeToolPath(path.relative(this.workspace.root, root));
     const files: string[] = [];
-    const queue = [root];
     let scanned = 0;
     let truncated = false;
 
-    while (queue.length > 0 && !truncated) {
-      const directory = queue.shift();
-      if (directory === undefined) break;
-      for (const entry of await readdir(directory, { withFileTypes: true })) {
-        const absolute = path.join(directory, entry.name);
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) queue.push(absolute);
-        if (!entry.isFile()) continue;
-        scanned += 1;
-        if (scanned > this.maxEntries * 20) {
-          truncated = true;
-          break;
-        }
-        const workspaceRelative = normalizeToolPath(path.relative(this.workspace.root, absolute));
-        // Patterns are evaluated relative to the searched directory so
-        // 'src/**/*.ts' behaves the same from the root and from src's parent.
-        const patternRelative = rootRelativePrefix === ""
-          ? workspaceRelative
-          : workspaceRelative.slice(rootRelativePrefix.length + 1);
-        if (!matches(patternRelative)) continue;
-        files.push(workspaceRelative);
-        if (files.length >= this.maxEntries) {
-          truncated = true;
-          break;
+    // Level-parallel BFS: directories of one depth are listed concurrently,
+    // then consumed in discovery order so scan limits stay deterministic.
+    let level = [root];
+    while (level.length > 0 && !truncated) {
+      const listings = await Promise.all(level.map(async (directory) => ({
+        directory,
+        entries: await readdir(directory, { withFileTypes: true }),
+      })));
+      const next: string[] = [];
+      for (const { directory, entries } of listings) {
+        if (truncated) break;
+        for (const entry of entries) {
+          const absolute = path.join(directory, entry.name);
+          if (entry.isSymbolicLink()) continue;
+          if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) next.push(absolute);
+          if (!entry.isFile()) continue;
+          scanned += 1;
+          if (scanned > this.maxEntries * 20) {
+            truncated = true;
+            break;
+          }
+          const workspaceRelative = normalizeToolPath(path.relative(this.workspace.root, absolute));
+          // Patterns are evaluated relative to the searched directory so
+          // 'src/**/*.ts' behaves the same from the root and from src's parent.
+          const patternRelative = rootRelativePrefix === ""
+            ? workspaceRelative
+            : workspaceRelative.slice(rootRelativePrefix.length + 1);
+          if (!matches(patternRelative)) continue;
+          files.push(workspaceRelative);
+          if (files.length >= this.maxEntries) {
+            truncated = true;
+            break;
+          }
         }
       }
+      level = next;
     }
 
     files.sort();
@@ -816,7 +871,7 @@ function optionalReadRange(fields: Record<string, JsonValue>): ReadByteRange | u
   if (value === null || Array.isArray(value) || typeof value !== "object") {
     throw new Error("Field 'range' must be an object.");
   }
-  rejectUnknownFields(value, ["startByte", "endByte"], "workspace.read range");
+  rejectUnknownFields(value, ["startByte", "endByte"], "read_file range");
   const startByte = optionalIntegerField(value, "startByte");
   const endByte = optionalIntegerField(value, "endByte");
   if (startByte === undefined || endByte === undefined) {

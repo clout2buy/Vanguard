@@ -146,7 +146,7 @@ Phase 5–6 in this historical execution record.
   completion-claim counts are the trend metrics to watch.
 - **Implemented:** expanded `TaskContract` (constraints, non-goals,
   assumptions, risk level, required verification, deliverables) rendered into
-  the durable task text; `PlanLedger`/`plan.update` (full-plan revisions with
+  the durable task text; `PlanLedger`/`update_plan` (full-plan revisions with
   journaled history, atomic `plan.json`, proven-requires-evidence,
   dependency validation, 24-milestone bound); kernel gates — mutation refused
   before an initial plan, completion enumerates unproven milestones as a
@@ -213,10 +213,10 @@ Phase 5–6 in this historical execution record.
   the accepted amendment.
 - **Implemented:** `buildRepositoryModel` (deterministic scan → languages
   with support tier, build systems, entry points, test topology, generated
-  directories, git state, instruction files) behind the `repository.map`
+  directories, git state, instruction files) behind the `repo_map`
   observe tool; `LANGUAGE_PROFILES` tier registry (deep: TS/JS, Python, Rust,
   Go; generic: Java/Kotlin/C#/C++/Ruby/PHP); `PostEditSyntaxChecker` +
-  `verify.syntax` tool — first-party parse CLIs (`node --check`,
+  `verify_syntax` tool — first-party parse CLIs (`node --check`,
   `py_compile`, `gofmt -e`) with a hard-allowlisted `SyntaxCommandRunner`,
   a structural delimiter-balance fallback for TypeScript/generic/missing
   toolchains that never false-passes a truncated edit, and an explicit
@@ -225,7 +225,7 @@ Phase 5–6 in this historical execution record.
   call-hierarchy across eight ecosystems is deliberately NOT built here; the
   syntax rung + repo model are the high-leverage, deterministic core. Deeper
   type/lint rungs run through the project's own toolchain via targeted
-  checks (the existing process/project.check tools). Certification will weight
+  checks (the existing process/check_project tools). Certification will weight
   ecosystems by the corpus and report deep vs generic separately.
 - **Adversarial proof:** ecosystem matrix (TS npm, Python, Rust, Go, Java,
   C#, mixed frontend/backend); generated dirs excluded from source; delimiter
@@ -240,7 +240,7 @@ Phase 5–6 in this historical execution record.
   unverifiable child claims, secret leakage, or implicit merges. Parent
   completion must remain impossible while child work is active.
 - **Implemented:** durable bounded `DelegationCoordinator`; parent-owned
-  `delegate.start/status/wait/cancel/merge` tools; non-blocking concurrent
+  `delegate_start/status/wait/cancel/merge` tools; non-blocking concurrent
   scheduling; genuine compiled `vanguard run` children with independent
   sessions, journals, plans, scorecards, verification, scope restrictions,
   step/depth/duration caps, and environment-only credential inheritance;
@@ -251,7 +251,7 @@ Phase 5–6 in this historical execution record.
 - **Durability:** every transition is atomically persisted. Parent restart
   marks queued/running records interrupted; graceful shutdown cancels active
   processes and marks queued work honestly. Children have no path to mutate
-  the parent until an exact reviewed hash is passed to `delegate.merge`.
+  the parent until an exact reviewed hash is passed to `delegate_merge`.
 - **Adversarial proof:** fake-runner concurrency, queueing, cancellation,
   aggregate/child/depth/scope budgets, restart interruption, queued+running
   shutdown, secret redaction, wrong-hash refusal, completion-gate enforcement,
@@ -546,7 +546,7 @@ Phase 5–6 in this historical execution record.
   result and no valid wrapper/aggregate was published. The retained Ward
   journal contained 1,640 events, 226 model decisions, 211 legacy context
   projections, 3 completion claims, 2 failed sealed required-command attempts,
-  and 1,110 `workspace.read` calls before the run stopped. It is not a 5/6
+  and 1,110 `read_file` calls before the run stopped. It is not a 5/6
   score and is never used as capability evidence. The failure drove the
   fresh-evidence projection and observation-stagnation repairs later validated
   at `fcf634d` and `751ed72`.

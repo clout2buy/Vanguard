@@ -194,9 +194,8 @@ export class StickyContextPolicy implements ContextPolicyPort {
     // budget. The final hard error below remains byte-based; tokens only ever
     // shed earlier, never allow more.
     const withinBudget = (entries: readonly TranscriptEntry[]): boolean => {
-      const serialized = JSON.stringify(entries);
-      return Buffer.byteLength(serialized) <= maxBytes
-        && estimateTokensFast(serialized) <= tokenCeilingForBytes(maxBytes);
+      if (serializedBytes(entries) > maxBytes) return false;
+      return estimateTokensFast(serializeEntries(entries)) <= tokenCeilingForBytes(maxBytes);
     };
     let result = assemble();
     // Shed optional preserved history oldest-first until the hard budget is
@@ -268,7 +267,7 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
     const decision = entry.role === "decision" ? normalizeDecision(entry.content) : undefined;
     if (decision?.kind === "ask_user") {
       const entries: TranscriptEntry[] = [entry];
-      if (isControlObservation(transcript[index + 1], "user.ask")) {
+      if (isControlObservation(transcript[index + 1], "ask_user")) {
         entries.push(transcript[index + 1]!);
         index += 1;
       } else if (transcript[index + 1]?.role === "user") {
@@ -280,7 +279,7 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
     }
     if (decision?.kind === "execute") {
       const entries: TranscriptEntry[] = [entry];
-      if (isControlObservation(transcript[index + 1], "task.execute")) {
+      if (isControlObservation(transcript[index + 1], "execute_task")) {
         entries.push(transcript[index + 1]!);
         index += 1;
       }
@@ -289,7 +288,7 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
     }
     if (decision?.kind === "complete") {
       const entries: TranscriptEntry[] = [entry];
-      if (isControlObservation(transcript[index + 1], "task.complete")) {
+      if (isControlObservation(transcript[index + 1], "complete_task")) {
         entries.push(transcript[index + 1]!);
         index += 1;
       }
@@ -323,7 +322,7 @@ function digestEntry(
   maxBytes: number,
 ): TranscriptEntry {
   const hash = createHash("sha256");
-  for (const index of omittedIndices) hash.update(JSON.stringify(chunks[index]!.entries)).update("\n");
+  for (const index of omittedIndices) hash.update(serializeEntries(chunks[index]!.entries)).update("\n");
   const omittedChunks = omittedIndices.map((index) => chunks[index]!);
   const entryCount = omittedChunks.reduce((total, chunk) => total + chunk.entries.length, 0);
   const toolExchanges = omittedChunks.filter((chunk) => isToolDecision(chunk.entries[0])).length;
@@ -352,8 +351,33 @@ function digestEntry(
   };
 }
 
+/**
+ * Transcript entries are immutable once constructed, so their serialized form
+ * is computed once and reused. Without this, every budget check re-stringified
+ * the whole transcript — O(history) work repeated several times per step.
+ */
+const serializedEntryCache = new WeakMap<TranscriptEntry, { readonly json: string; readonly bytes: number }>();
+
+function serializedEntry(entry: TranscriptEntry): { readonly json: string; readonly bytes: number } {
+  let cached = serializedEntryCache.get(entry);
+  if (cached === undefined) {
+    const json = JSON.stringify(entry);
+    cached = { json, bytes: Buffer.byteLength(json) };
+    serializedEntryCache.set(entry, cached);
+  }
+  return cached;
+}
+
+/** Byte-exact equivalent of Buffer.byteLength(JSON.stringify(entries)). */
 function serializedBytes(entries: readonly TranscriptEntry[]): number {
-  return Buffer.byteLength(JSON.stringify(entries));
+  let total = 2 + (entries.length > 0 ? entries.length - 1 : 0);
+  for (const entry of entries) total += serializedEntry(entry).bytes;
+  return total;
+}
+
+/** Byte-identical to JSON.stringify(entries), assembled from cached pieces. */
+function serializeEntries(entries: readonly TranscriptEntry[]): string {
+  return `[${entries.map((entry) => serializedEntry(entry).json).join(",")}]`;
 }
 
 /** Byte- and token-aware fit check used for both epochs and fresh selection. */
@@ -362,15 +386,24 @@ function fitsBudget(
   reservedTail: readonly TranscriptEntry[],
   maxBytes: number,
 ): boolean {
-  const serialized = JSON.stringify([...entries, ...reservedTail]);
-  return Buffer.byteLength(serialized) <= maxBytes
-    && estimateTokensFast(serialized) <= tokenCeilingForBytes(maxBytes);
+  const combined = [...entries, ...reservedTail];
+  if (serializedBytes(combined) > maxBytes) return false;
+  return estimateTokensFast(serializeEntries(combined)) <= tokenCeilingForBytes(maxBytes);
 }
 
 /** Identity of the transcript chunks an epoch's frozen prefix represents. */
 function hashChunks(chunks: readonly ContextChunk[]): string {
   const hash = createHash("sha256");
-  for (const chunk of chunks) hash.update(JSON.stringify(chunk.entries)).update("\n");
+  // Byte-identical to hashing JSON.stringify(chunk.entries) per chunk, but
+  // fed from the per-entry cache so unchanged history is never re-stringified.
+  for (const chunk of chunks) {
+    hash.update("[");
+    for (const [index, entry] of chunk.entries.entries()) {
+      if (index > 0) hash.update(",");
+      hash.update(serializedEntry(entry).json);
+    }
+    hash.update("]").update("\n");
+  }
   return hash.digest("hex");
 }
 

@@ -97,14 +97,14 @@ export class CreativeDirectionVerifier implements VerifierPort {
         role: "decision",
         content: {
           kind: "tools",
-          calls: [{ id: "judge-render", name: "artifact.render", input: { path: target } }],
+          calls: [{ id: "judge-render", name: "render_artifact", input: { path: target } }],
         } as unknown as JsonValue,
       },
       {
         role: "observation",
         content: {
           callId: "judge-render",
-          tool: "artifact.render",
+          tool: "render_artifact",
           ok: true,
           output: rendered.output,
         } as unknown as JsonValue,

@@ -31,7 +31,7 @@ const MAX_OBJECTIVE_LENGTH = 4_000;
 const SCOUT_CONTEXT_BYTES = 400_000;
 
 export class ScoutDelegateTool implements ToolPort {
-  readonly name = "delegate.scout";
+  readonly name = "delegate_scout";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Send a bounded read-only subagent to investigate the workspace and return a dense digest (findings, exact paths, line references). Use it for broad reconnaissance that would otherwise flood your context with raw file contents; ask one precise objective per scout.",
@@ -84,7 +84,7 @@ export class ScoutDelegateTool implements ToolPort {
     });
     const task = `You are a reconnaissance scout: a read-only subagent inside a larger engineering run.\n`
       + `Objective: ${objective.trim()}\n`
-      + "Investigate with the provided read-only tools, then call task.complete whose summary is the digest itself: "
+      + "Investigate with the provided read-only tools, then call complete_task whose summary is the digest itself: "
       + "concrete findings with exact workspace-relative paths and line references, direct answers to the objective, "
       + "and explicit 'not found' statements where the evidence is absent. Never speculate beyond what you observed. "
       + "You cannot modify anything; do not try.";

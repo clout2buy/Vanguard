@@ -117,7 +117,7 @@ export interface TreeSnapshot {
 const SNAPSHOT_FS_CONCURRENCY = 16;
 
 /** Run async filesystem operations with bounded parallelism. */
-function createFsLimiter(limit: number): <T>(operation: () => Promise<T>) => Promise<T> {
+export function createFsLimiter(limit: number): <T>(operation: () => Promise<T>) => Promise<T> {
   let active = 0;
   const waiters: (() => void)[] = [];
   return async <T>(operation: () => Promise<T>): Promise<T> => {

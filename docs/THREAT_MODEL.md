@@ -41,7 +41,7 @@ to run as your own account.
 
 ### `guarded` (evaluation and supervised high-assurance work)
 
-This profile is fail-closed: raw `process.run` is absent, Node process aliases
+This profile is fail-closed: raw `run_command` is absent, Node process aliases
 use Node's filesystem permission model where applicable, and sealed verifier
 feedback is summary-only. Explicit flags cannot quietly re-enable raw process,
 disable restriction, or reveal full verifier evidence. The private gauntlet

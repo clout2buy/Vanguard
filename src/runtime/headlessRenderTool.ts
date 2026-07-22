@@ -15,7 +15,7 @@ import { WorkspaceBoundary } from "./workspace.js";
  * directory, so producing evidence never opens a workspace mutation epoch.
  *
  * Without this rung Vanguard could prove an HTML page parses and never once
- * see it. The screenshot feeds `artifact.inspect_image` today (exposure,
+ * see it. The screenshot feeds `inspect_image` today (exposure,
  * occlusion, contrast, layout regions of the real render, not the source),
  * and is the substrate for direct image-to-model judgment once the provider
  * codecs carry image content.
@@ -47,7 +47,7 @@ const MAX_CAPTURED_OUTPUT_BYTES = 1_000_000;
  * Screenshots at or under this size ride inline in the tool output as base64,
  * so vision-capable providers receive the actual pixels. The cap keeps one
  * render from dominating the context byte budget; a larger capture degrades
- * to the on-disk file plus artifact.inspect_image.
+ * to the on-disk file plus inspect_image.
  */
 const MAX_INLINE_IMAGE_BYTES = 96_000;
 
@@ -158,10 +158,10 @@ export class HeadlessRenderRunner implements RenderProcessRunner {
 }
 
 export class HeadlessRenderTool implements ToolPort {
-  readonly name = "artifact.render";
+  readonly name = "render_artifact";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Execute a workspace HTML or SVG file in a headless system browser, reject visible failure/loading shells, and capture a PNG screenshot under .vanguard/renders/. On vision-capable providers a small enough screenshot is attached to this result as an image; otherwise analyze it with artifact.inspect_image. Fails honestly when no system browser exists or the page does not reach a settled DOM.",
+    description: "Execute a workspace HTML or SVG file in a headless system browser, reject visible failure/loading shells, and capture a PNG screenshot under .vanguard/renders/. On vision-capable providers a small enough screenshot is attached to this result as an image; otherwise analyze it with inspect_image. Fails honestly when no system browser exists or the page does not reach a settled DOM.",
     inputSchema: {
       type: "object",
       properties: {
@@ -231,7 +231,7 @@ export class HeadlessRenderTool implements ToolPort {
     }
     const extension = path.extname(relativePath).toLowerCase();
     if (!RENDERABLE_EXTENSIONS.has(extension)) {
-      return { ok: false, output: { error: "artifact.render accepts .html, .htm, and .svg files." } };
+      return { ok: false, output: { error: "render_artifact accepts .html, .htm, and .svg files." } };
     }
 
     const sourceFile = await this.workspace.existing(relativePath);
@@ -320,7 +320,7 @@ export class HeadlessRenderTool implements ToolPort {
             ? { image: { mediaType: "image/png", base64: screenshot.toString("base64") } }
             : {
               imageOmitted: inline
-                ? `screenshot is ${screenshot.byteLength} bytes, over the ${MAX_INLINE_IMAGE_BYTES}-byte inline budget; judge via artifact.inspect_image or render a smaller viewport`
+                ? `screenshot is ${screenshot.byteLength} bytes, over the ${MAX_INLINE_IMAGE_BYTES}-byte inline budget; judge via inspect_image or render a smaller viewport`
                 : "inline attachment was disabled for this call",
             }),
           note: "This PNG is the real rendered page. Judge the deliverable from it, never from the source text.",

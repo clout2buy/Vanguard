@@ -1,6 +1,6 @@
 # Finish the Ward Minecraft-style protection mod
 
-This is a multi-file, Gradle-shaped Java mod core. Finish it without changing the public API in the protected files. Work in phases, checkpoint after reconnaissance and after the storage layer, and run `project.check` after meaningful groups of edits. The public check compiles and exercises core behavior with Java 8; a separate sealed verifier covers adversarial integration cases, so do not use newer Java syntax or external dependencies.
+This is a multi-file, Gradle-shaped Java mod core. Finish it without changing the public API in the protected files. Work in phases, checkpoint after reconnaissance and after the storage layer, and run `check_project` after meaningful groups of edits. The public check compiles and exercises core behavior with Java 8; a separate sealed verifier covers adversarial integration cases, so do not use newer Java syntax or external dependencies.
 
 Implement the following behavior:
 

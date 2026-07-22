@@ -161,8 +161,8 @@ test("global and per-class retry budgets survive process-style resume", async ()
 test("a transient observe tool is retried, but only its final successful observation reaches the model", async () => {
   let attempts = 0;
   const tool: ToolPort = {
-    name: "workspace.read",
-    definition: { name: "workspace.read", description: "read", inputSchema: {}, effect: "observe" },
+    name: "read_file",
+    definition: { name: "read_file", description: "read", inputSchema: {}, effect: "observe" },
     async execute() {
       attempts += 1;
       if (attempts === 1) throw transient();
@@ -173,7 +173,7 @@ test("a transient observe tool is retried, but only its final successful observa
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "r", name: "workspace.read", input: { path: "a.ts" } }] },
+      { kind: "tools", calls: [{ id: "r", name: "read_file", input: { path: "a.ts" } }] },
       { kind: "complete", answer: "done" },
     ]),
     tools: [tool], verifiers: [passingVerifier], journal,
@@ -211,15 +211,15 @@ test("a provider port without its own adapter loop uses the same durable retry c
 test("a mutation is never automatically retried even when its exception is transient", async () => {
   let attempts = 0;
   const mutation: ToolPort = {
-    name: "workspace.write",
-    definition: { name: "workspace.write", description: "write", inputSchema: {}, effect: "mutate" },
+    name: "write_file",
+    definition: { name: "write_file", description: "write", inputSchema: {}, effect: "mutate" },
     async execute() { attempts += 1; throw transient(); },
   };
   const clock = new FakeClock();
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "w", name: "workspace.write", input: { path: "a" } }] },
+      { kind: "tools", calls: [{ id: "w", name: "write_file", input: { path: "a" } }] },
       { kind: "complete", answer: "reported" },
     ]),
     tools: [mutation], verifiers: [passingVerifier], journal,
@@ -297,7 +297,7 @@ test("one malformed model decision retries before dispatch and executes the reco
             role: "assistant",
             content: null,
             tool_calls: [{ id: "read-1", type: "function", function: {
-              name: "workspace_read",
+              name: "read_file",
               arguments: '{"path":"a.ts"}{"unexpected":true}',
             } }],
           } }],
@@ -310,7 +310,7 @@ test("one malformed model decision retries before dispatch and executes the reco
             role: "assistant",
             content: null,
             tool_calls: [{ id: "read-1", type: "function", function: {
-              name: "workspace_read",
+              name: "read_file",
               arguments: '{"path":"a.ts"}',
             } }],
           } }],
@@ -322,7 +322,7 @@ test("one malformed model decision retries before dispatch and executes the reco
           role: "assistant",
           content: null,
           tool_calls: [{ id: "complete-1", type: "function", function: {
-            name: "task_complete",
+            name: "complete_task",
             arguments: '{"summary":"read completed"}',
           } }],
         } }],
@@ -331,8 +331,8 @@ test("one malformed model decision retries before dispatch and executes the reco
     }) as typeof fetch,
   });
   const readTool: ToolPort = {
-    name: "workspace.read",
-    definition: { name: "workspace.read", description: "read", inputSchema: {}, effect: "observe" },
+    name: "read_file",
+    definition: { name: "read_file", description: "read", inputSchema: {}, effect: "observe" },
     async execute(input) {
       toolExecutions += 1;
       assert.deepEqual(input, { path: "a.ts" });
@@ -379,7 +379,7 @@ test("persistent malformed decisions exhaust the adapter bound without kernel mu
           role: "assistant",
           content: null,
           tool_calls: [{ id: "read-never", type: "function", function: {
-            name: "workspace_read",
+            name: "read_file",
             arguments: '{"path":"a.ts"} trailing',
           } }],
         } }],
@@ -388,8 +388,8 @@ test("persistent malformed decisions exhaust the adapter bound without kernel mu
     }) as typeof fetch,
   });
   const readTool: ToolPort = {
-    name: "workspace.read",
-    definition: { name: "workspace.read", description: "read", inputSchema: {}, effect: "observe" },
+    name: "read_file",
+    definition: { name: "read_file", description: "read", inputSchema: {}, effect: "observe" },
     async execute() {
       toolExecutions += 1;
       return { ok: true, output: "must not execute" };
@@ -424,7 +424,7 @@ test("truncated, duplicate-terminal, and post-terminal write payloads never disp
         index: 0,
         id: "write-never",
         type: "function",
-        function: { name: "workspace_write", arguments: '{"path":"owned.ts","contents":"pwned"}' },
+        function: { name: "write_file", arguments: '{"path":"owned.ts","contents":"pwned"}' },
       }] } }] }),
       JSON.stringify({ choices: [{ finish_reason: "length", delta: {} }] }),
     ],
@@ -437,7 +437,7 @@ test("truncated, duplicate-terminal, and post-terminal write payloads never disp
         output: [{
           type: "function_call",
           call_id: "write-never",
-          name: "workspace_write",
+          name: "write_file",
           arguments: '{"path":"owned.ts","contents":"pwned"}',
         }],
       } }),
@@ -451,7 +451,7 @@ test("truncated, duplicate-terminal, and post-terminal write payloads never disp
     codec: new AnthropicMessagesCodec("m"),
     events: [
       JSON.stringify({ type: "content_block_start", index: 0, content_block: {
-        type: "tool_use", id: "write-never", name: "workspace.write", input: {},
+        type: "tool_use", id: "write-never", name: "write_file", input: {},
       } }),
       JSON.stringify({ type: "content_block_delta", index: 0, delta: {
         type: "input_json_delta", partial_json: '{"path":"owned.ts","contents":"pwned"}',
@@ -475,8 +475,8 @@ test("truncated, duplicate-terminal, and post-terminal write payloads never disp
     // The sentinel is deliberately marked observe-only so no later mutation
     // policy can hide a provider-boundary failure by blocking dispatch first.
     const writeSentinel: ToolPort = {
-      name: "workspace.write",
-      definition: { name: "workspace.write", description: "sentinel", inputSchema: {}, effect: "observe" },
+      name: "write_file",
+      definition: { name: "write_file", description: "sentinel", inputSchema: {}, effect: "observe" },
       async execute() {
         writeExecutions += 1;
         return { ok: true, output: "must never execute" };
@@ -558,7 +558,7 @@ test("a disconnected streamed attempt resets provisional text and cannot duplica
         }), { status: 200, headers: { "content-type": "text/event-stream" } });
       }
       return new Response([
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"workspace.read","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}',
         'data: {"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
         "data: [DONE]",
       ].join("\n\n") + "\n\n", { status: 200, headers: { "content-type": "text/event-stream" } });
@@ -574,12 +574,12 @@ test("a disconnected streamed attempt resets provisional text and cannot duplica
 test("repeated deterministic failures emit replan guidance before the circuit breaker stops replay", async () => {
   let executions = 0;
   const failing: ToolPort = {
-    name: "workspace.read",
-    definition: { name: "workspace.read", description: "read", inputSchema: {}, effect: "observe" },
+    name: "read_file",
+    definition: { name: "read_file", description: "read", inputSchema: {}, effect: "observe" },
     async execute() { executions += 1; return { ok: false, output: "invalid path" }; },
   };
   const call: ModelDecision = {
-    kind: "tools", calls: [{ id: "same", name: "workspace.read", input: { path: "missing" } }],
+    kind: "tools", calls: [{ id: "same", name: "read_file", input: { path: "missing" } }],
   };
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({

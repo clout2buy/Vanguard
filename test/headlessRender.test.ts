@@ -21,7 +21,7 @@ function screenshotArgument(args: readonly string[]): string | undefined {
   return args.find((argument) => argument.startsWith("--screenshot="))?.slice("--screenshot=".length);
 }
 
-test("artifact.render invokes a headless browser and reports the screenshot honestly", async () => {
+test("render_artifact invokes a headless browser and reports the screenshot honestly", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-render-"));
   try {
     await writeFile(path.join(root, "page.html"), "<!doctype html><h1>hello</h1>");
@@ -67,7 +67,7 @@ test("artifact.render invokes a headless browser and reports the screenshot hone
   }
 });
 
-test("artifact.render never inlines a capture over the byte budget", async () => {
+test("render_artifact never inlines a capture over the byte budget", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-render-large-"));
   try {
     await writeFile(path.join(root, "page.html"), "<p>big</p>");
@@ -89,7 +89,7 @@ test("artifact.render never inlines a capture over the byte budget", async () =>
   }
 });
 
-test("artifact.render falls back to the legacy headless flag for older browsers", async () => {
+test("render_artifact falls back to the legacy headless flag for older browsers", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-render-legacy-"));
   try {
     await writeFile(path.join(root, "page.html"), "<p>ok</p>");
@@ -111,7 +111,7 @@ test("artifact.render falls back to the legacy headless flag for older browsers"
   }
 });
 
-test("artifact.render fails honestly with no browser, a bad extension, or no screenshot", async () => {
+test("render_artifact fails honestly with no browser, a bad extension, or no screenshot", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-render-fail-"));
   try {
     await writeFile(path.join(root, "page.html"), "<p>ok</p>");
@@ -137,7 +137,7 @@ test("artifact.render fails honestly with no browser, a bad extension, or no scr
   }
 });
 
-test("artifact.render rejects a stuck loading shell and a visible failure overlay", async () => {
+test("render_artifact rejects a stuck loading shell and a visible failure overlay", async () => {
   assert.match(
     inspectRenderedDom('<html><body><div role="status">Initializing WebGPU…</div></body></html>') ?? "",
     /active loading status/u,
@@ -169,7 +169,7 @@ test("artifact.render rejects a stuck loading shell and a visible failure overla
   }
 });
 
-test("artifact.render captures real pixels with a system browser", async (t) => {
+test("render_artifact captures real pixels with a system browser", async (t) => {
   const browser = await new SystemChromiumLocator().locate();
   if (browser === undefined) {
     t.skip("no system Chromium-family browser installed");

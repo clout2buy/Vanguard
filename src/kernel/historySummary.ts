@@ -108,11 +108,11 @@ function displayPathJson(value: string): string {
 }
 
 function toolCategory(tool: string): "observe" | "mutate" | "execute" | "review" | "state" | "unknown" {
-  if (/^(?:repository\.map|workspace\.(?:read|list|search))$/u.test(tool)) return "observe";
-  if (/^workspace\.(?:write|replace|delete)$/u.test(tool)) return "mutate";
-  if (/^(?:process\.run|project\.check|verify\.syntax)$/u.test(tool)) return "execute";
-  if (tool === "workspace.changes") return "review";
-  if (tool === "plan.update" || tool === "run.checkpoint") return "state";
+  if (/^(?:repo_map|read_file|list_dir|grep|glob)$/u.test(tool)) return "observe";
+  if (/^(?:write_file|edit_file|delete_file)$/u.test(tool)) return "mutate";
+  if (/^(?:run_command|check_project|verify_syntax)$/u.test(tool)) return "execute";
+  if (tool === "review_changes") return "review";
+  if (tool === "update_plan" || tool === "run.checkpoint") return "state";
   return "unknown";
 }
 

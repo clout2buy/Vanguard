@@ -122,7 +122,7 @@ test("logical history selects checkpoint-owned durable anchors instead of abando
     {
       sequence: 1,
       type: "tool.completed",
-      data: { tool: "plan.update", ok: true, output: { stateSha256: hash("a") } },
+      data: { tool: "update_plan", ok: true, output: { stateSha256: hash("a") } },
     },
     {
       sequence: 2,
@@ -137,7 +137,7 @@ test("logical history selects checkpoint-owned durable anchors instead of abando
     {
       sequence: 3,
       type: "tool.completed",
-      data: { tool: "plan.update", ok: true, output: { stateSha256: hash("b") } },
+      data: { tool: "update_plan", ok: true, output: { stateSha256: hash("b") } },
     },
     {
       sequence: 4,
@@ -151,6 +151,6 @@ test("logical history selects checkpoint-owned durable anchors instead of abando
     },
   ];
 
-  assert.equal(latestDurableStateAnchor(events, "plan.update")?.sha256, hash("b"));
-  assert.equal(latestDurableStateAnchor(logicalRunEvents(events), "plan.update")?.sha256, hash("a"));
+  assert.equal(latestDurableStateAnchor(events, "update_plan")?.sha256, hash("b"));
+  assert.equal(latestDurableStateAnchor(logicalRunEvents(events), "update_plan")?.sha256, hash("a"));
 });

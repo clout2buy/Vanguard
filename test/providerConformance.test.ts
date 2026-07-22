@@ -28,7 +28,7 @@ const request: ModelRequest = {
   mode: "execution",
   transcript: [{ role: "task", content: "repair the parser" }],
   tools: [{
-    name: "workspace.read",
+    name: "read_file",
     description: "read a file",
     effect: "observe",
     inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
@@ -144,15 +144,15 @@ test("capability negotiation is exact-profile configuration, never a model-name 
       role: "decision",
       content: {
         kind: "tools",
-        calls: [{ id: "a", name: "workspace.read", input: { path: "a.ts" } }],
+        calls: [{ id: "a", name: "read_file", input: { path: "a.ts" } }],
         continuation: {
           role: "assistant",
           content: null,
           reasoning_content: "PRIVATE_CAPABILITY_DISABLED",
-          tool_calls: [{ id: "a", type: "function", function: { name: "workspace_read", arguments: "{\"path\":\"a.ts\"}" } }],
+          tool_calls: [{ id: "a", type: "function", function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" } }],
         },
       },
-    }, { role: "observation", content: { callId: "a", tool: "workspace.read", ok: true } }],
+    }, { role: "observation", content: { callId: "a", tool: "read_file", ok: true } }],
   } as never);
   assert.doesNotMatch(JSON.stringify(withoutReplay), /PRIVATE_CAPABILITY_DISABLED/u);
 });
@@ -241,16 +241,16 @@ test("all public wire codecs preserve parallel calls and private continuation re
   responses.encode({ ...request, signal: undefined } as never);
   const responseDecision = responses.decode({ output: [
     { type: "reasoning", id: "r", encrypted_content: "OPENAI_PRIVATE" },
-    { type: "function_call", call_id: "a", name: "workspace_read", arguments: "{\"path\":\"a.ts\"}" },
-    { type: "function_call", call_id: "b", name: "workspace_read", arguments: "{\"path\":\"b.ts\"}" },
+    { type: "function_call", call_id: "a", name: "read_file", arguments: "{\"path\":\"a.ts\"}" },
+    { type: "function_call", call_id: "b", name: "read_file", arguments: "{\"path\":\"b.ts\"}" },
   ] });
   assert.deepEqual(responseDecision.kind === "tools" ? responseDecision.calls.map((call) => call.id) : [], ["a", "b"]);
 
   const anthropic = new AnthropicMessagesCodec("m");
   const anthropicDecision = anthropic.decode({ content: [
     { type: "thinking", thinking: "ANTHROPIC_PRIVATE", signature: "signature" },
-    { type: "tool_use", id: "a", name: "workspace.read", input: { path: "a.ts" } },
-    { type: "tool_use", id: "b", name: "workspace.read", input: { path: "b.ts" } },
+    { type: "tool_use", id: "a", name: "read_file", input: { path: "a.ts" } },
+    { type: "tool_use", id: "b", name: "read_file", input: { path: "b.ts" } },
   ], stop_reason: "tool_use" });
   assert.deepEqual(anthropicDecision.kind === "tools" ? anthropicDecision.calls.map((call) => call.id) : [], ["a", "b"]);
 
@@ -261,8 +261,8 @@ test("all public wire codecs preserve parallel calls and private continuation re
     content: null,
     reasoning_content: "CHAT_PRIVATE",
     tool_calls: [
-      { id: "a", type: "function", function: { name: "workspace_read", arguments: "{\"path\":\"a.ts\"}" } },
-      { id: "b", type: "function", function: { name: "workspace_read", arguments: "{\"path\":\"b.ts\"}" } },
+      { id: "a", type: "function", function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" } },
+      { id: "b", type: "function", function: { name: "read_file", arguments: "{\"path\":\"b.ts\"}" } },
     ],
   } }] });
   assert.deepEqual(chatDecision.kind === "tools" ? chatDecision.calls.map((call) => call.id) : [], ["a", "b"]);
@@ -272,8 +272,8 @@ test("all public wire codecs preserve parallel calls and private continuation re
     signal: undefined,
     transcript: [
       { role: "decision", content: decision as never },
-      { role: "observation", content: { callId: "a", tool: "workspace.read", ok: true } },
-      { role: "observation", content: { callId: "b", tool: "workspace.read", ok: true } },
+      { role: "observation", content: { callId: "a", tool: "read_file", ok: true } },
+      { role: "observation", content: { callId: "b", tool: "read_file", ok: true } },
     ],
   } as never);
   assert.match(JSON.stringify(responses.encode(followup(responseDecision))), /OPENAI_PRIVATE/u);
@@ -290,8 +290,8 @@ test("every wire emits a stable prompt cache key that survives transcript growth
     ...request,
     transcript: [
       ...request.transcript,
-      { role: "decision", content: { kind: "tools", calls: [{ id: "a", name: "workspace.read", input: { path: "a.ts" } }] } as never },
-      { role: "observation", content: { callId: "a", tool: "workspace.read", ok: true, output: { contents: "x".repeat(4_000) } } },
+      { role: "decision", content: { kind: "tools", calls: [{ id: "a", name: "read_file", input: { path: "a.ts" } }] } as never },
+      { role: "observation", content: { callId: "a", tool: "read_file", ok: true, output: { contents: "x".repeat(4_000) } } },
     ],
   };
   for (const codec of [new OpenAIResponsesCodec("m"), new OpenAIChatCompletionsCodec("m")]) {

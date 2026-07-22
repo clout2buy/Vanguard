@@ -72,17 +72,17 @@ test("one decision fans out observe calls in parallel, then mutates in order", a
         { id: "a", name: "read.a", input: {} },
         { id: "b", name: "read.b", input: {} },
         { id: "c", name: "read.c", input: {} },
-        { id: "w", name: "workspace.write", input: { path: "x" } },
+        { id: "w", name: "write_file", input: { path: "x" } },
       ] },
-      { kind: "tools", calls: [{ id: "t", name: "project.check", input: {} }] },
+      { kind: "tools", calls: [{ id: "t", name: "check_project", input: {} }] },
       { kind: "complete", answer: "done" },
     ]),
     tools: [
       observeTool("read.a", probe),
       observeTool("read.b", probe),
       observeTool("read.c", probe),
-      mutateTool("workspace.write", probe),
-      executeTool("project.check"),
+      mutateTool("write_file", probe),
+      executeTool("check_project"),
     ],
     verifiers: [passingVerifier],
     journal,
@@ -92,7 +92,7 @@ test("one decision fans out observe calls in parallel, then mutates in order", a
   // All three reads overlapped instead of paying three serial round trips…
   assert.equal(probe.max, 3);
   // …and the mutation still ran strictly after every read in its decision.
-  assert.deepEqual(probe.order, ["read.a", "read.b", "read.c", "workspace.write"]);
+  assert.deepEqual(probe.order, ["read.a", "read.b", "read.c", "write_file"]);
 });
 
 test("runtime syntax-checks every mutation without a model turn", async () => {
@@ -100,11 +100,11 @@ test("runtime syntax-checks every mutation without a model turn", async () => {
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new CapturingModel([
-      { kind: "tools", calls: [{ id: "w", name: "workspace.write", input: { path: "src/x.ts" } }] },
-      { kind: "tools", calls: [{ id: "t", name: "project.check", input: {} }] },
+      { kind: "tools", calls: [{ id: "w", name: "write_file", input: { path: "src/x.ts" } }] },
+      { kind: "tools", calls: [{ id: "t", name: "check_project", input: {} }] },
       { kind: "complete", answer: "done" },
     ]),
-    tools: [mutateTool("workspace.write"), executeTool("project.check")],
+    tools: [mutateTool("write_file"), executeTool("check_project")],
     verifiers: [passingVerifier],
     journal,
     postMutationSyntaxCheck: async (path) => {
@@ -117,7 +117,7 @@ test("runtime syntax-checks every mutation without a model turn", async () => {
   assert.deepEqual(checked, ["src/x.ts"]);
   const auto = journal.events.find((event) =>
     event.type === "tool.completed"
-    && (event.data as { tool?: string }).tool === "verify.syntax"
+    && (event.data as { tool?: string }).tool === "verify_syntax"
     && (event.data as { output?: { automatic?: boolean } }).output?.automatic === true);
   assert.notEqual(auto, undefined);
   // The automatic check lands before the model's next tool result.
@@ -130,11 +130,11 @@ test("a passing automatic syntax check satisfies the small-change execution gate
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new CapturingModel([
-      { kind: "tools", calls: [{ id: "w", name: "workspace.write", input: { path: "x" } }] },
+      { kind: "tools", calls: [{ id: "w", name: "write_file", input: { path: "x" } }] },
       // No model-called check at all: the runtime's parse is the evidence.
       { kind: "complete", answer: "done" },
     ]),
-    tools: [mutateTool("workspace.write")],
+    tools: [mutateTool("write_file")],
     verifiers: [passingVerifier],
     journal,
     postMutationSyntaxCheck: async () => ({ ok: true, output: { status: "passed" } }),
@@ -147,11 +147,11 @@ test("a failing automatic syntax check does not satisfy the gate, and never trip
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new CapturingModel([
-      { kind: "tools", calls: [{ id: "w", name: "workspace.write", input: { path: "x" } }] },
-      { kind: "tools", calls: [{ id: "t", name: "project.check", input: {} }] },
+      { kind: "tools", calls: [{ id: "w", name: "write_file", input: { path: "x" } }] },
+      { kind: "tools", calls: [{ id: "t", name: "check_project", input: {} }] },
       { kind: "complete", answer: "done" },
     ]),
-    tools: [mutateTool("workspace.write"), executeTool("project.check")],
+    tools: [mutateTool("write_file"), executeTool("check_project")],
     verifiers: [passingVerifier],
     journal,
     postMutationSyntaxCheck: async () => ({ ok: false, output: { status: "failed", detail: "unclosed brace" } }),
@@ -159,7 +159,7 @@ test("a failing automatic syntax check does not satisfy the gate, and never trip
   const outcome = await kernel.run("broken edit then repair");
   assert.equal(outcome.status, "completed");
   assert.ok(journal.events.some((event) => event.type === "tool.failed"
-    && (event.data as { tool?: string }).tool === "verify.syntax"));
+    && (event.data as { tool?: string }).tool === "verify_syntax"));
 });
 
 async function fingerprintCount(interval: number): Promise<number> {
@@ -169,13 +169,13 @@ async function fingerprintCount(interval: number): Promise<number> {
     model: new CapturingModel([
       ...Array.from({ length: 6 }, (_, index): ModelDecision => ({
         kind: "tools",
-        calls: [{ id: `r${index}`, name: "workspace.read", input: {} }],
+        calls: [{ id: `r${index}`, name: "read_file", input: {} }],
       })),
       { kind: "complete", answer: "done" },
     ]),
     tools: [{
-      name: "workspace.read",
-      definition: def("workspace.read", "observe"),
+      name: "read_file",
+      definition: def("read_file", "observe"),
       async execute() { return { ok: true, output: "x" }; },
     }],
     verifiers: [passingVerifier],

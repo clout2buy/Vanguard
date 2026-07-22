@@ -26,6 +26,7 @@ import type {
 } from "./contracts.js";
 import {
   CONTROL_TOOL_NAMES,
+  LEGACY_TOOL_NAMES,
   PLAN_TOOL_NAME,
   normalizeDecision,
   renderContract,
@@ -77,7 +78,7 @@ export interface RunOptions {
    * `independent` — the default: only a real executable check (a project check
    * or an authorized process run) clears the gate. Correct for a codebase.
    *
-   * `syntax` — a passing verify.syntax on the mutated file also clears it. For
+   * `syntax` — a passing verify_syntax on the mutated file also clears it. For
    * a deliverable with nothing to execute (a static page, a document), the
    * independent gate is unsatisfiable: there is no command whose success would
    * mean anything, so the agent invents throwaway harnesses to appease it and
@@ -91,7 +92,7 @@ export interface RunOptions {
   readonly maxModelRecoveryAttempts: number;
   /**
    * Whether a user is available to answer questions. When false the kernel
-   * does not offer `user.ask` and rejects ask_user decisions with feedback
+   * does not offer `ask_user` and rejects ask_user decisions with feedback
    * instead of pausing, so headless runs cannot dead-end.
    */
   readonly interactive: boolean;
@@ -147,7 +148,7 @@ export interface KernelDependencies {
    * Runtime-owned parse of a freshly mutated file. When present, every
    * successful mutation is syntax-checked automatically right after its batch
    * — no model turn, and the journaled observation satisfies the same gates a
-   * model-called verify.syntax would. The model only re-checks when it needs
+   * model-called verify_syntax would. The model only re-checks when it needs
    * a parse before its next decision.
    */
   readonly postMutationSyntaxCheck?: (relativePath: string) => Promise<{ ok: boolean; output: JsonValue }>;
@@ -286,7 +287,14 @@ export class AgentKernel {
 
   constructor(dependencies: KernelDependencies) {
     this.#model = dependencies.model;
-    this.#tools = new Map(dependencies.tools.map((tool) => [tool.name, tool]));
+    const tools = new Map(dependencies.tools.map((tool) => [tool.name, tool]));
+    // Decode-only aliases: journals written before the flat tool names replay
+    // against the tool they meant. Advertised definitions never include these.
+    for (const [legacy, current] of Object.entries(LEGACY_TOOL_NAMES)) {
+      const tool = tools.get(current);
+      if (tool !== undefined && !tools.has(legacy)) tools.set(legacy, tool);
+    }
+    this.#tools = tools;
     this.#verifiers = dependencies.verifiers;
     this.#journal = dependencies.journal;
     this.#contextPolicy = dependencies.contextPolicy ?? new StickyContextPolicy();
@@ -1018,7 +1026,7 @@ export class AgentKernel {
         if (stalePlanEvidence.length > 0 && this.#plan!.refreshStaleProofs !== undefined) {
           // Runtime-owned staleness repair: re-bind stale proofs to fresh
           // current-generation evidence instead of charging the model a
-          // plan.update turn for bookkeeping the journal already contains.
+          // update_plan turn for bookkeeping the journal already contains.
           const refresh = await this.#plan!.refreshStaleProofs();
           if (refresh.refreshed) {
             const output = {
@@ -1030,13 +1038,13 @@ export class AgentKernel {
             } as unknown as JsonValue;
             const stamped = {
               callId: `auto:${modelDecisionSequence}:plan.refresh`,
-              tool: "plan.update",
+              tool: "update_plan",
               ok: true,
               output,
               workspaceGeneration,
             };
             transcript.push({ role: "observation", content: stamped as unknown as JsonValue });
-            // Journaled in the plan.update tool shape so the durable-state
+            // Journaled in the update_plan tool shape so the durable-state
             // anchor chain survives resume exactly like a model-driven update.
             await this.#record("tool.completed", stamped as unknown as JsonValue);
           }
@@ -1052,15 +1060,15 @@ export class AgentKernel {
           const missing = [
             mutationNeedsExecutionEvidence
               ? (syntaxLaneOpen
-                ? "a successful executable check (a passing verify.syntax on the edited file also satisfies it)"
+                ? "a successful executable check (a passing verify_syntax on the edited file also satisfies it)"
                 : "a successful executable check")
               : undefined,
-            mutationNeedsReview ? "workspace.changes review" : undefined,
+            mutationNeedsReview ? "review_changes review" : undefined,
           ].filter((item) => item !== undefined).join(" and ");
           const parts = [
             missing.length === 0 ? undefined : `Complete ${missing} after the latest workspace mutation before completing.`,
             unprovenMilestones.length === 0 ? undefined
-              : `These plan milestones remain unproven: ${unprovenMilestones.join("; ")}. Prove each with evidence references via plan.update, or invalidate it with a reason, before completing.`,
+              : `These plan milestones remain unproven: ${unprovenMilestones.join("; ")}. Prove each with evidence references via update_plan, or invalidate it with a reason, before completing.`,
             stalePlanEvidence.length === 0 ? undefined
               : `These proven milestones have stale workspace evidence: ${stalePlanEvidence.join("; ")}. Run an authorized check/review in the current workspace generation — the runtime re-binds the proof automatically; no eligible fresh evidence exists yet.`,
             runtimeBlockers.length === 0 ? undefined
@@ -1240,9 +1248,14 @@ export class AgentKernel {
     return this.#fail("Step budget exhausted without verified completion.", this.#options.maxSteps);
   }
 
+  /** Tools under their canonical names only — legacy alias entries excluded. */
+  #canonicalTools(): ToolPort[] {
+    return [...this.#tools.entries()].filter(([name, tool]) => name === tool.name).map(([, tool]) => tool);
+  }
+
   #offeredTools(mode: KernelMode): ToolDefinition[] {
     if (mode === "conversation") {
-      const observers = [...this.#tools.values()]
+      const observers = this.#canonicalTools()
         .filter((tool) => tool.definition.effect === "observe")
         .map((tool) => tool.definition);
       return [
@@ -1252,7 +1265,7 @@ export class AgentKernel {
       ];
     }
     return [
-      ...[...this.#tools.values()].map((tool) => tool.definition),
+      ...this.#canonicalTools().map((tool) => tool.definition),
       ...(this.#options.interactive ? [ASK_CONTROL_DEFINITION] : []),
       COMPLETE_CONTROL_DEFINITION,
     ];
@@ -1359,7 +1372,7 @@ export class AgentKernel {
       if (context.mode === "conversation" && tool.definition.effect !== "observe") {
         return this.#terminalObservation(
           call,
-          `Tool '${call.name}' is not available before a task contract exists. Use task.execute to begin contracted work.`,
+          `Tool '${call.name}' is not available before a task contract exists. Use execute_task to begin contracted work.`,
           "policy",
           context.recovery,
           context.signal,
@@ -1378,7 +1391,7 @@ export class AgentKernel {
           || !isNarrowPlanFreeMutation(call))) {
         return this.#terminalObservation(
           call,
-          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow exact-text replacements, one per step. Materialize a non-empty engineering plan with plan.update before changing the workspace further.`,
+          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow exact-text replacements, one per step. Materialize a non-empty engineering plan with update_plan before changing the workspace further.`,
           "policy",
           context.recovery,
           context.signal,
@@ -1407,12 +1420,12 @@ export class AgentKernel {
       const source = tool.definition.effect === "execute" ? "process" : "tool";
       const idempotent = tool.definition.effect === "observe";
       // Pure observations memoize by generation + fingerprint. Independent-
-      // evidence tools (process.run, artifact.render, review) are excluded so
+      // evidence tools (run_command, render_artifact, review) are excluded so
       // a cached result can never impersonate a fresh execution or review that
       // a completion gate relies on.
       const cacheable = idempotent && tool.definition.evidenceAuthority === undefined;
       const cacheKey = cacheable
-        ? `${context.workspaceGeneration()} ${call.name} ${fingerprint}`
+        ? `${context.workspaceGeneration()}\u0000${call.name}\u0000${fingerprint}`
         : undefined;
       if (cacheKey !== undefined) {
         const hit = this.#observeCache.get(cacheKey);
@@ -1550,7 +1563,7 @@ export class AgentKernel {
           && context.completedMutations() > 0
           && context.completedMutations() <= SMALL_CHANGE_MUTATION_BUDGET);
       const smallChangeSyntaxEvidence = observation.ok && !workspaceChanged
-        && call.name === "verify.syntax"
+        && call.name === "verify_syntax"
         && context.mode === "execution"
         && syntaxSatisfiesGate
         && syntaxCheckPassed(observation.output);
@@ -1668,13 +1681,13 @@ export class AgentKernel {
     // Runtime-owned syntax rung: every file a mutation just touched is parsed
     // immediately, on the runtime's initiative — the model spends no turn on
     // it, and the journaled observation satisfies the same gates a
-    // model-called verify.syntax would (the small-change lane included).
+    // model-called verify_syntax would (the small-change lane included).
     if (this.#postMutationSyntaxCheck !== undefined && context.mode === "execution"
       && containmentPoisonReason === undefined) {
       const targets = new Set<string>();
       for (const [index, observation] of observations.entries()) {
         const call = calls[index]!;
-        if (!observation.ok || effectOf(call) !== "mutate" || call.name === "workspace.delete") continue;
+        if (!observation.ok || effectOf(call) !== "mutate" || call.name === "delete_file") continue;
         const target = mutationTargetPath(call.input);
         if (target !== undefined) targets.add(target);
       }
@@ -1703,7 +1716,7 @@ export class AgentKernel {
           const passed = result.ok && syntaxSatisfiesGate && syntaxCheckPassed(output);
           const stamped = {
             callId: `auto:${context.modelDecisionSequence}:${target}`,
-            tool: "verify.syntax",
+            tool: "verify_syntax",
             ok: result.ok,
             output,
             workspaceGeneration: context.workspaceGeneration(),
@@ -2389,7 +2402,7 @@ function hasTopLevelHistoricalElisionMarker(input: JsonValue): boolean {
 
 /**
  * The plan-free small-change lane: this many narrow exact-text replacements
- * may proceed without a durable plan, and a passing verify.syntax satisfies
+ * may proceed without a durable plan, and a passing verify_syntax satisfies
  * the pre-claim execution-evidence gate while inside it. Sealed completion
  * verification is unaffected.
  */
@@ -2408,7 +2421,7 @@ function mutationTargetPath(input: JsonValue): string | undefined {
 }
 
 function isNarrowPlanFreeMutation(call: ToolCall): boolean {
-  if (call.name !== "workspace.replace" || call.input === null || Array.isArray(call.input)
+  if (call.name !== "edit_file" || call.input === null || Array.isArray(call.input)
     || typeof call.input !== "object") return false;
   const before = call.input.before;
   const after = call.input.after;
@@ -2445,7 +2458,7 @@ function journalFailureSummary(observation: ToolObservation): string {
   if (typeof explicit === "string" && explicit.trim().length > 0) return boundedJournalText(explicit.trim());
   const exitCode = typeof output?.exitCode === "number" ? output.exitCode : undefined;
   if (exitCode !== undefined) {
-    // process.run-style failure: the reason lives on stderr, so keep its tail.
+    // run_command-style failure: the reason lives on stderr, so keep its tail.
     const stderr = typeof output?.stderr === "string" ? output.stderr.trim() : "";
     const tail = stderr.length === 0 ? "" : ` · ${stderr.slice(-200)}`;
     return boundedJournalText(`exit ${exitCode}${tail}`);

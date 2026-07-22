@@ -55,9 +55,9 @@ function executeTool(name: string): ToolPort {
 
 function syntaxTool(status: "passed" | "failed" | "inconclusive"): ToolPort {
   return {
-    name: "verify.syntax",
+    name: "verify_syntax",
     definition: {
-      name: "verify.syntax",
+      name: "verify_syntax",
       description: "Parse-only syntax check.",
       inputSchema: { type: "object" },
       effect: "observe",
@@ -84,7 +84,7 @@ function planDecision(id: string, status: string, evidence: readonly EvidenceCla
     kind: "tools",
     calls: [{
       id: `plan-${id}-${status}`,
-      name: "plan.update",
+      name: "update_plan",
       input: { summary: `moving ${id} to ${status}`, milestones: [milestone(id, status, evidence)] },
     }],
   };
@@ -92,18 +92,18 @@ function planDecision(id: string, status: string, evidence: readonly EvidenceCla
 
 const replaceInput = (suffix: string): JsonValue => ({ path: "src/a.ts", before: `old${suffix}`, after: `new${suffix}` });
 
-test("a passing verify.syntax satisfies the pre-claim gate inside the small-change lane", async () => {
+test("a passing verify_syntax satisfies the pre-claim gate inside the small-change lane", async () => {
   const plan = new PlanLedger();
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
+      { kind: "tools", calls: [{ id: "w1", name: "edit_file", input: replaceInput("1") }] },
       { kind: "complete", answer: "premature" },
-      { kind: "tools", calls: [{ id: "s1", name: "verify.syntax", input: { path: "src/a.ts" } }] },
+      { kind: "tools", calls: [{ id: "s1", name: "verify_syntax", input: { path: "src/a.ts" } }] },
       { kind: "complete", answer: "done" },
     ]),
     tools: [
-      mutateTool("workspace.replace"),
+      mutateTool("edit_file"),
       syntaxTool("passed"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
     ],
@@ -113,7 +113,7 @@ test("a passing verify.syntax satisfies the pre-claim gate inside the small-chan
   assert.equal(outcome.status === "completed" ? outcome.answer : outcome.status, "done");
   const events = JSON.stringify(journal.events);
   // The premature claim was blocked and the guidance advertised the lane.
-  assert.match(events, /passing verify\.syntax on the edited file also satisfies/u);
+  assert.match(events, /passing verify_syntax on the edited file also satisfies/u);
   assert.match(events, /smallChangeExecutionEvidence/u);
 });
 
@@ -122,34 +122,34 @@ test("the lane cannot bypass sealed completion verification", async () => {
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
-      { kind: "tools", calls: [{ id: "s1", name: "verify.syntax", input: { path: "src/a.ts" } }] },
+      { kind: "tools", calls: [{ id: "w1", name: "edit_file", input: replaceInput("1") }] },
+      { kind: "tools", calls: [{ id: "s1", name: "verify_syntax", input: { path: "src/a.ts" } }] },
       { kind: "complete", answer: "claim one" },
       { kind: "complete", answer: "claim two" },
       { kind: "complete", answer: "claim three" },
     ]),
-    tools: [mutateTool("workspace.replace"), syntaxTool("passed"), new PlanTool(plan, new JournalEvidenceResolver(journal))],
+    tools: [mutateTool("edit_file"), syntaxTool("passed"), new PlanTool(plan, new JournalEvidenceResolver(journal))],
     verifiers: [failingVerifier], journal, plan,
   });
   const outcome = await kernel.run("small fix with broken sealed check");
   assert.notEqual(outcome.status, "completed");
 });
 
-test("verify.syntax does not satisfy the gate once a plan exists", async () => {
+test("verify_syntax does not satisfy the gate once a plan exists", async () => {
   const plan = new PlanLedger();
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
       planDecision("m1", "active"),
-      { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
-      { kind: "tools", calls: [{ id: "s1", name: "verify.syntax", input: { path: "src/a.ts" } }] },
+      { kind: "tools", calls: [{ id: "w1", name: "edit_file", input: replaceInput("1") }] },
+      { kind: "tools", calls: [{ id: "s1", name: "verify_syntax", input: { path: "src/a.ts" } }] },
       { kind: "complete", answer: "premature" },
       { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
       planDecision("m1", "proven", [{ kind: "tool", callId: "t" }]),
       { kind: "complete", answer: "proven" },
     ]),
     tools: [
-      mutateTool("workspace.replace"),
+      mutateTool("edit_file"),
       syntaxTool("passed"),
       executeTool("test"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
@@ -168,14 +168,14 @@ test("an inconclusive syntax result does not satisfy the gate", async () => {
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
-      { kind: "tools", calls: [{ id: "s1", name: "verify.syntax", input: { path: "src/a.ts" } }] },
+      { kind: "tools", calls: [{ id: "w1", name: "edit_file", input: replaceInput("1") }] },
+      { kind: "tools", calls: [{ id: "s1", name: "verify_syntax", input: { path: "src/a.ts" } }] },
       { kind: "complete", answer: "premature" },
       { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
       { kind: "complete", answer: "done" },
     ]),
     tools: [
-      mutateTool("workspace.replace"),
+      mutateTool("edit_file"),
       syntaxTool("inconclusive"),
       executeTool("test"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
@@ -193,8 +193,8 @@ test("journaled lane evidence cannot be cited as plan-milestone execution proof"
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
-      { kind: "tools", calls: [{ id: "s1", name: "verify.syntax", input: { path: "src/a.ts" } }] },
+      { kind: "tools", calls: [{ id: "w1", name: "edit_file", input: replaceInput("1") }] },
+      { kind: "tools", calls: [{ id: "s1", name: "verify_syntax", input: { path: "src/a.ts" } }] },
       planDecision("m1", "active"),
       planDecision("m1", "proven", [{ kind: "tool", callId: "s1" }]),
       { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
@@ -202,7 +202,7 @@ test("journaled lane evidence cannot be cited as plan-milestone execution proof"
       { kind: "complete", answer: "done" },
     ]),
     tools: [
-      mutateTool("workspace.replace"),
+      mutateTool("edit_file"),
       syntaxTool("passed"),
       executeTool("test"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
@@ -211,7 +211,7 @@ test("journaled lane evidence cannot be cited as plan-milestone execution proof"
   });
   const outcome = await kernel.run("lane evidence must not prove milestones");
   assert.equal(outcome.status === "completed" ? outcome.answer : outcome.status, "done");
-  // The plan.update citing the syntax call as proof must have been rejected.
+  // The update_plan citing the syntax call as proof must have been rejected.
   const rejected = journal.events.some((event) => (event.type === "tool.failed")
     && JSON.stringify(event.data).includes("plan-m1-proven")
     && JSON.stringify(event.data).includes("does not resolve to one fresh runtime-authorized"));

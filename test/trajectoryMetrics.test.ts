@@ -5,9 +5,9 @@ import { analyzeTrajectory } from "../src/index.js";
 
 test("trajectory metrics distinguish clean completion from recovery and policy failures", () => {
   const events: RunEvent[] = [
-    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "workspace.read" } } },
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "read_file" } } },
     { sequence: 2, type: "tool.completed", data: { ok: true } },
-    { sequence: 3, type: "model.decided", data: { kind: "tool", call: { name: "process.run" } } },
+    { sequence: 3, type: "model.decided", data: { kind: "tool", call: { name: "run_command" } } },
     { sequence: 4, type: "tool.failed", data: { ok: false, output: { error: "Argument is blocked by process policy." } } },
     { sequence: 5, type: "model.decided", data: { kind: "complete" } },
     { sequence: 6, type: "verification.completed", data: { passed: false } },
@@ -34,7 +34,7 @@ test("trajectory metrics distinguish clean completion from recovery and policy f
     recoveryDelayMs: 0,
     failuresByCode: {},
     failuresByDisposition: {},
-    toolCallsByName: { "workspace.read": 1, "process.run": 1 },
+    toolCallsByName: { "read_file": 1, "run_command": 1 },
   });
 });
 
@@ -53,9 +53,9 @@ test("trajectory metrics distinguish request projection from durable compaction"
 
 test("trajectory metrics treat a non-zero local test exit as productive evidence", () => {
   const events: RunEvent[] = [
-    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "process.run" } } },
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "run_command" } } },
     { sequence: 2, type: "tool.failed", data: { ok: false, output: { exitCode: 1, stderr: "assertion" } } },
-    { sequence: 3, type: "model.decided", data: { kind: "tool", call: { name: "workspace.replace" } } },
+    { sequence: 3, type: "model.decided", data: { kind: "tool", call: { name: "edit_file" } } },
     { sequence: 4, type: "tool.completed", data: { ok: true } },
   ];
   const metrics = analyzeTrajectory(events);
@@ -67,7 +67,7 @@ test("trajectory metrics treat a non-zero local test exit as productive evidence
 
 test("trajectory metrics treat a failed trusted project check as productive evidence", () => {
   const events: RunEvent[] = [
-    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "project.check" } } },
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "check_project" } } },
     { sequence: 2, type: "tool.failed", data: { ok: false, output: { exitCode: 1, stderr: "assertion" } } },
   ];
   const metrics = analyzeTrajectory(events);
@@ -77,7 +77,7 @@ test("trajectory metrics treat a failed trusted project check as productive evid
 
 test("trajectory metrics classify malformed inline tests as harness friction", () => {
   const events: RunEvent[] = [
-    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "process.run" } } },
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "run_command" } } },
     { sequence: 2, type: "tool.failed", data: { ok: false, output: { exitCode: 1, stderr: "SyntaxError: Unexpected end at [eval1]" } } },
   ];
   const metrics = analyzeTrajectory(events);
@@ -88,7 +88,7 @@ test("trajectory metrics classify malformed inline tests as harness friction", (
 
 test("trajectory metrics classify invalid Node eval flags as harness friction", () => {
   const events: RunEvent[] = [
-    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "process.run" } } },
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "run_command" } } },
     { sequence: 2, type: "tool.failed", data: { ok: false, output: { exitCode: 1, stderr: "ERR_EVAL_ESM_CANNOT_PRINT" } } },
   ];
   const metrics = analyzeTrajectory(events);
@@ -98,7 +98,7 @@ test("trajectory metrics classify invalid Node eval flags as harness friction", 
 
 test("trajectory metrics count editable-root mutation denials as policy blocks", () => {
   const events: RunEvent[] = [
-    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "workspace.write" } } },
+    { sequence: 1, type: "model.decided", data: { kind: "tool", call: { name: "write_file" } } },
     {
       sequence: 2,
       type: "tool.failed",

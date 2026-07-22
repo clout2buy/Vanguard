@@ -2,7 +2,7 @@ import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } fro
 import { analyzePatch } from "../gauntlet/diffMetrics.js";
 
 export class ReviewChangesTool implements ToolPort {
-  readonly name = "workspace.changes";
+  readonly name = "review_changes";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Review final changed-file scope and aggregate code growth before completion.",

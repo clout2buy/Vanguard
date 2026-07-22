@@ -71,7 +71,7 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
       const serialized = asciiLowercase(JSON.stringify(event.data));
       const output = record(data?.output);
       const failedToolName = typeof data?.tool === "string" ? data.tool : pendingToolNames[0];
-      const isLocalTestFailure = (failedToolName === "process.run" || failedToolName === "project.check")
+      const isLocalTestFailure = (failedToolName === "run_command" || failedToolName === "check_project")
         && typeof output?.exitCode === "number";
       const isHarnessFailure = isLocalTestFailure && (
         serialized.includes("syntaxerror") && serialized.includes("[eval")

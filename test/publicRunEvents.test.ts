@@ -9,7 +9,7 @@ test("public event stream exposes chat and tool flow without private reasoning",
     type: "model.decided",
     data: {
       kind: "tool",
-      call: { id: "read-1", name: "workspace.read", input: { path: "src/main.ts" } },
+      call: { id: "read-1", name: "read_file", input: { path: "src/main.ts" } },
       continuation: { content: "I am inspecting the entry point.", reasoning_content: "PRIVATE_CHAIN_OF_THOUGHT" },
     },
   });
@@ -17,7 +17,7 @@ test("public event stream exposes chat and tool flow without private reasoning",
   assert.equal(decision[0]?.type, "agent.message");
   assert.equal(decision[0]?.message, "I am inspecting the entry point.");
   assert.equal(decision[1]?.type, "tool.started");
-  assert.equal(decision[1]?.tool, "workspace.read");
+  assert.equal(decision[1]?.tool, "read_file");
   assert.equal(decision[1]?.detail, "src/main.ts");
   assert.doesNotMatch(JSON.stringify(decision), /PRIVATE_CHAIN_OF_THOUGHT/);
 
@@ -36,7 +36,7 @@ test("public event stream exposes chat and tool flow without private reasoning",
     type: "model.decided",
     data: {
       kind: "tool",
-      call: { id: "run-1", name: "process.run", input: { command: "npm", args: ["test"] } },
+      call: { id: "run-1", name: "run_command", input: { command: "npm", args: ["test"] } },
     },
   });
   const processResult = presenter.present({
@@ -129,11 +129,11 @@ test("a Responses-wire tool decision still emits its narration as agent.message"
     type: "model.decided",
     data: {
       kind: "tool",
-      call: { id: "call-1", name: "workspace.read", input: { path: "server.js" } },
+      call: { id: "call-1", name: "read_file", input: { path: "server.js" } },
       continuation: [
         { type: "reasoning", summary: [], content: "PRIVATE_CHAIN_OF_THOUGHT" },
         { type: "message", role: "assistant", content: [{ type: "output_text", text: "Hardening the timeout path now." }] },
-        { type: "function_call", call_id: "call-1", name: "workspace_read", arguments: "{}" },
+        { type: "function_call", call_id: "call-1", name: "read_file", arguments: "{}" },
       ],
     },
   });

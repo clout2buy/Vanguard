@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { JournalPort, RunEvent } from "./contracts.js";
 
@@ -19,13 +19,26 @@ export interface JournalTip {
 export class FileJournal implements JournalPort {
   #lastHash: string;
   #writeChain: Promise<void> = Promise.resolve();
+  /**
+   * Events validated so far, in order, plus the exact byte length of the file
+   * they came from. This instance is the session's single sanctioned writer,
+   * so its own appends keep the cache exact; a byte-length mismatch means an
+   * out-of-band writer touched the file and forces a full re-validation.
+   * Without this cache every readValidated() re-parsed and re-hashed the whole
+   * chain, which made evidence resolution O(history²) over a session.
+   */
+  #events: RunEvent[];
+  #validBytes: number;
 
   private constructor(
     readonly file: string,
     readonly genesisHash: string,
-    lastHash: string,
+    envelopes: readonly JournalEnvelope[],
+    validBytes: number,
   ) {
-    this.#lastHash = lastHash;
+    this.#lastHash = envelopes.at(-1)?.hash ?? genesisHash;
+    this.#events = envelopes.map((envelope) => envelope.event);
+    this.#validBytes = validBytes;
   }
 
   static async open(file: string, options: { readonly genesisHash?: string } = {}): Promise<FileJournal> {
@@ -38,8 +51,8 @@ export class FileJournal implements JournalPort {
     } catch (error) {
       if (!isExisting(error)) throw error;
     }
-    const envelopes = await readValidatedJournal(absolute, genesisHash);
-    return new FileJournal(absolute, genesisHash, envelopes.at(-1)?.hash ?? genesisHash);
+    const { envelopes, byteLength } = await readValidatedJournal(absolute, genesisHash);
+    return new FileJournal(absolute, genesisHash, envelopes, byteLength);
   }
 
   async append(event: RunEvent): Promise<void> {
@@ -47,8 +60,11 @@ export class FileJournal implements JournalPort {
       const previousHash = this.#lastHash;
       const hash = envelopeHash(previousHash, event);
       const envelope: JournalEnvelope = { previousHash, hash, event };
-      await appendFile(this.file, `${JSON.stringify(envelope)}\n`, "utf8");
+      const line = `${JSON.stringify(envelope)}\n`;
+      await appendFile(this.file, line, "utf8");
       this.#lastHash = hash;
+      this.#events.push(event);
+      this.#validBytes += Buffer.byteLength(line, "utf8");
     });
     this.#writeChain = operation.catch(() => undefined);
     return operation;
@@ -56,21 +72,31 @@ export class FileJournal implements JournalPort {
 
   async readValidated(): Promise<readonly RunEvent[]> {
     await this.#writeChain;
-    const envelopes = await readValidatedJournal(this.file, this.genesisHash);
-    this.#lastHash = envelopes.at(-1)?.hash ?? this.genesisHash;
-    return envelopes.map((envelope) => envelope.event);
+    await this.#refresh();
+    return [...this.#events];
   }
 
   async tip(): Promise<JournalTip> {
     await this.#writeChain;
-    const envelopes = await readValidatedJournal(this.file, this.genesisHash);
-    const last = envelopes.at(-1);
-    this.#lastHash = last?.hash ?? this.genesisHash;
-    return { hash: last?.hash ?? this.genesisHash, sequence: last?.event.sequence ?? 0 };
+    await this.#refresh();
+    return { hash: this.#lastHash, sequence: this.#events.at(-1)?.sequence ?? 0 };
+  }
+
+  /** Re-validates from disk only when the file no longer matches our own writes. */
+  async #refresh(): Promise<void> {
+    const size = (await stat(this.file)).size;
+    if (size === this.#validBytes) return;
+    const { envelopes, byteLength } = await readValidatedJournal(this.file, this.genesisHash);
+    this.#events = envelopes.map((envelope) => envelope.event);
+    this.#lastHash = envelopes.at(-1)?.hash ?? this.genesisHash;
+    this.#validBytes = byteLength;
   }
 }
 
-async function readValidatedJournal(file: string, genesisHash: string): Promise<JournalEnvelope[]> {
+async function readValidatedJournal(
+  file: string,
+  genesisHash: string,
+): Promise<{ envelopes: JournalEnvelope[]; byteLength: number }> {
   const contents = await readFile(file, "utf8");
   const lines = contents.split("\n").filter((line) => line.length > 0);
   const envelopes: JournalEnvelope[] = [];
@@ -84,7 +110,7 @@ async function readValidatedJournal(file: string, genesisHash: string): Promise<
     envelopes.push(parsed);
     previousHash = parsed.hash;
   }
-  return envelopes;
+  return { envelopes, byteLength: Buffer.byteLength(contents, "utf8") };
 }
 
 function envelopeHash(previousHash: string, event: RunEvent): string {

@@ -83,7 +83,7 @@ function planDecision(
     kind: "tools",
     calls: [{
       id: `plan-${id}-${status}`,
-      name: "plan.update",
+      name: "update_plan",
       input: { summary: `moving ${id} to ${status}`, milestones: [milestone(id, status, evidence, covers)] },
     }],
   };
@@ -101,18 +101,18 @@ test("the plan-free lane allows three narrow replacements; the fourth is refused
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new CapturingModel([
-      { kind: "tools", calls: [{ id: "w1", name: "workspace.replace", input: replaceInput("1") }] },
-      { kind: "tools", calls: [{ id: "w2", name: "workspace.replace", input: replaceInput("2") }] },
-      { kind: "tools", calls: [{ id: "w3", name: "workspace.replace", input: replaceInput("3") }] },
-      { kind: "tools", calls: [{ id: "w4", name: "workspace.replace", input: replaceInput("4") }] },
+      { kind: "tools", calls: [{ id: "w1", name: "edit_file", input: replaceInput("1") }] },
+      { kind: "tools", calls: [{ id: "w2", name: "edit_file", input: replaceInput("2") }] },
+      { kind: "tools", calls: [{ id: "w3", name: "edit_file", input: replaceInput("3") }] },
+      { kind: "tools", calls: [{ id: "w4", name: "edit_file", input: replaceInput("4") }] },
       planDecision("m1", "active"),
-      { kind: "tools", calls: [{ id: "w5", name: "workspace.replace", input: replaceInput("5") }] },
+      { kind: "tools", calls: [{ id: "w5", name: "edit_file", input: replaceInput("5") }] },
       { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
       planDecision("m1", "proven", [toolEvidence("t")]),
       { kind: "complete", answer: "done" },
     ]),
     tools: [
-      mutateTool("workspace.replace", () => { mutations += 1; }),
+      mutateTool("edit_file", () => { mutations += 1; }),
       executeTool("test"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
     ],
@@ -130,14 +130,14 @@ test("write/delete and multi-mutation batches cannot exploit the plan-free excep
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new CapturingModel([
-      { kind: "tools", calls: [{ id: "write", name: "workspace.write", input: { path: "x", contents: "x" } }] },
+      { kind: "tools", calls: [{ id: "write", name: "write_file", input: { path: "x", contents: "x" } }] },
       { kind: "tools", calls: [
-        { id: "r1", name: "workspace.replace", input: replaceInput("1") },
-        { id: "r2", name: "workspace.replace", input: replaceInput("2") },
+        { id: "r1", name: "edit_file", input: replaceInput("1") },
+        { id: "r2", name: "edit_file", input: replaceInput("2") },
       ] },
       { kind: "complete", answer: "no changes" },
     ]),
-    tools: [mutateTool("workspace.write", () => { mutations += 1; }), mutateTool("workspace.replace", () => { mutations += 1; }), new PlanTool(plan)],
+    tools: [mutateTool("write_file", () => { mutations += 1; }), mutateTool("edit_file", () => { mutations += 1; }), new PlanTool(plan)],
     verifiers: [passingVerifier], journal, plan,
   });
   const outcome = await kernel.run("guard mutations");
@@ -172,12 +172,12 @@ test("completion auto-refreshes stale proof from fresh evidence without a model 
       planDecision("m1", "active"),
       { kind: "tools", calls: [{ id: "check-0", name: "test", input: {} }] },
       planDecision("m1", "proven", [toolEvidence("check-0")]),
-      { kind: "tools", calls: [{ id: "write", name: "workspace.write", input: {} }] },
+      { kind: "tools", calls: [{ id: "write", name: "write_file", input: {} }] },
       { kind: "tools", calls: [{ id: "check-1", name: "test", input: {} }] },
       { kind: "complete", answer: "fresh plan proof" },
     ]),
     tools: [
-      mutateTool("workspace.write"),
+      mutateTool("write_file"),
       executeTool("test"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
     ],
@@ -201,13 +201,13 @@ test("completion still blocks stale proof when no fresh evidence exists", async 
       planDecision("m1", "active"),
       { kind: "tools", calls: [{ id: "check-0", name: "test", input: {} }] },
       planDecision("m1", "proven", [toolEvidence("check-0")]),
-      { kind: "tools", calls: [{ id: "write", name: "workspace.write", input: {} }] },
+      { kind: "tools", calls: [{ id: "write", name: "write_file", input: {} }] },
       { kind: "complete", answer: "old plan proof" },
       { kind: "tools", calls: [{ id: "check-1", name: "test", input: {} }] },
       { kind: "complete", answer: "fresh plan proof" },
     ]),
     tools: [
-      mutateTool("workspace.write"),
+      mutateTool("write_file"),
       executeTool("test"),
       new PlanTool(plan, new JournalEvidenceResolver(journal)),
     ],
@@ -229,14 +229,14 @@ test("callId-only evidence is canonicalized from one successful journal event", 
   await journal.append({
     sequence: 7,
     type: "tool.completed",
-    data: { callId: "check-call", tool: "project.check", ok: true, output: { exitCode: 0 }, evidenceAuthority: "independent-execution", workspaceGeneration: 0 },
+    data: { callId: "check-call", tool: "check_project", ok: true, output: { exitCode: 0 }, evidenceAuthority: "independent-execution", workspaceGeneration: 0 },
   });
   const tool = new PlanTool(plan, new JournalEvidenceResolver(journal));
   const untrustedMetadata = {
     kind: "tool",
     callId: "check-call",
     sequence: 1,
-    tool: "project_check",
+    tool: "check_project",
     exactText: "tests passed",
     sha256: "0".repeat(64),
   } as unknown as EvidenceClaim;
@@ -251,7 +251,7 @@ test("callId-only evidence is canonicalized from one successful journal event", 
     callId: evidence.callId,
     tool: evidence.tool,
     sequence: evidence.sequence,
-  }, { kind: "tool", callId: "check-call", tool: "project.check", sequence: 7 });
+  }, { kind: "tool", callId: "check-call", tool: "check_project", sequence: 7 });
   assert.match(evidence.sha256, /^[a-f0-9]{64}$/u);
   assert.notEqual(evidence.sha256, "0".repeat(64));
   assert.equal(evidence.exactText, undefined);
@@ -263,7 +263,7 @@ test("invented strings and failed or unknown legacy call ids cannot prove work",
   const journal = new MemoryJournal();
   await journal.append({ sequence: 1, type: "tool.failed", data: { callId: "bad", tool: "test", ok: false, error: "failed" } });
   await journal.append({ sequence: 2, type: "tool.completed", data: { callId: "duplicate", tool: "test", ok: true, output: "passed", evidenceAuthority: "independent-execution", workspaceGeneration: 0 } });
-  await journal.append({ sequence: 3, type: "tool.completed", data: { callId: "duplicate", tool: "project.check", ok: true, output: "passed", evidenceAuthority: "independent-execution", workspaceGeneration: 0 } });
+  await journal.append({ sequence: 3, type: "tool.completed", data: { callId: "duplicate", tool: "check_project", ok: true, output: "passed", evidenceAuthority: "independent-execution", workspaceGeneration: 0 } });
   const tool = new PlanTool(plan, new JournalEvidenceResolver(journal));
   const context = { task: "t", step: 1, signal: new AbortController().signal };
   await assert.rejects(() => tool.execute({
@@ -287,7 +287,7 @@ test("invented strings and failed or unknown legacy call ids cannot prove work",
     milestones: [milestone("m1", "proven", [toolEvidence("duplicate")])],
   }, context);
   assert.equal(plan.state()!.milestones[0]!.evidence[0]!.sequence, 3);
-  assert.equal(plan.state()!.milestones[0]!.evidence[0]!.tool, "project.check");
+  assert.equal(plan.state()!.milestones[0]!.evidence[0]!.tool, "check_project");
 });
 
 test("runtime evidence ids disambiguate repeated provider call ids without rewriting them", async () => {
@@ -300,7 +300,7 @@ test("runtime evidence ids disambiguate repeated provider call ids without rewri
   await journal.append({
     sequence: 2,
     type: "tool.completed",
-    data: { evidenceId: "evidence:12:1", callId: "provider-repeat", tool: "project.check", ok: true, output: "second", evidenceAuthority: "independent-execution", workspaceGeneration: 0 },
+    data: { evidenceId: "evidence:12:1", callId: "provider-repeat", tool: "check_project", ok: true, output: "second", evidenceAuthority: "independent-execution", workspaceGeneration: 0 },
   });
   const resolver = new JournalEvidenceResolver(journal);
 
@@ -331,22 +331,22 @@ test("observe, state, mutation, plan, and unmarked execute results cannot prove 
   const kernel = new AgentKernel({
     model: new CapturingModel([
       { kind: "tools", calls: [
-        { id: "read", name: "workspace.read", input: {} },
+        { id: "read", name: "read_file", input: {} },
         { id: "checkpoint", name: "run.checkpoint", input: {} },
-        { id: "plan", name: "plan.update", input: {} },
-        { id: "write", name: "workspace.write", input: {} },
+        { id: "plan", name: "update_plan", input: {} },
+        { id: "write", name: "write_file", input: {} },
         { id: "raw", name: "custom.execute", input: {} },
       ] },
-      { kind: "tools", calls: [{ id: "trusted", name: "project.check", input: {} }] },
+      { kind: "tools", calls: [{ id: "trusted", name: "check_project", input: {} }] },
       { kind: "complete", answer: "recorded ineligible observations" },
     ]),
     tools: [
-      tool("workspace.read", "observe"),
+      tool("read_file", "observe"),
       tool("run.checkpoint", "state"),
-      tool("plan.update", "state"),
-      tool("workspace.write", "mutate"),
+      tool("update_plan", "state"),
+      tool("write_file", "mutate"),
       tool("custom.execute", "execute"),
-      executeTool("project.check"),
+      executeTool("check_project"),
     ],
     verifiers: [passingVerifier],
     journal,
@@ -354,14 +354,14 @@ test("observe, state, mutation, plan, and unmarked execute results cannot prove 
   assert.equal((await kernel.run("authority boundaries")).status, "completed");
   const resolver = new JournalEvidenceResolver(journal);
   const observations = journal.events.filter((event) => event.type === "tool.completed"
-    && (event.data as { tool?: string }).tool !== "project.check");
+    && (event.data as { tool?: string }).tool !== "check_project");
   assert.equal(observations.length, 5);
   for (const event of observations) {
     const data = event.data as { evidenceId?: string; evidenceAuthority?: string; workspaceGeneration?: number };
     assert.equal(data.evidenceAuthority, undefined);
     assert.equal(await resolver.resolve(runtimeEvidence(data.evidenceId!)), undefined);
   }
-  const mutation = observations.find((event) => (event.data as { tool?: string }).tool === "workspace.write")!;
+  const mutation = observations.find((event) => (event.data as { tool?: string }).tool === "write_file")!;
   assert.equal((mutation.data as { workspaceMutation?: boolean; workspaceGeneration?: number }).workspaceMutation, true);
   assert.equal((mutation.data as { workspaceGeneration?: number }).workspaceGeneration, 1);
 });
@@ -417,7 +417,7 @@ test("later mutations and restore/fork epochs invalidate otherwise authentic pro
   await journal.append({
     sequence: 1,
     type: "tool.completed",
-    data: { evidenceId: "evidence:1:1", callId: "check-0", tool: "project.check", ok: true,
+    data: { evidenceId: "evidence:1:1", callId: "check-0", tool: "check_project", ok: true,
       evidenceAuthority: "independent-execution", workspaceGeneration: 0, output: "passed" },
   });
   const resolver = new JournalEvidenceResolver(journal);
@@ -426,7 +426,7 @@ test("later mutations and restore/fork epochs invalidate otherwise authentic pro
   await journal.append({
     sequence: 2,
     type: "tool.completed",
-    data: { evidenceId: "evidence:2:1", callId: "write", tool: "workspace.write", ok: true,
+    data: { evidenceId: "evidence:2:1", callId: "write", tool: "write_file", ok: true,
       workspaceMutation: true, workspaceGeneration: 1, output: "changed" },
   });
   assert.equal(await resolver.resolve(runtimeEvidence("evidence:1:1")), undefined);
@@ -434,7 +434,7 @@ test("later mutations and restore/fork epochs invalidate otherwise authentic pro
   await journal.append({
     sequence: 3,
     type: "tool.completed",
-    data: { evidenceId: "evidence:3:1", callId: "check-1", tool: "project.check", ok: true,
+    data: { evidenceId: "evidence:3:1", callId: "check-1", tool: "check_project", ok: true,
       evidenceAuthority: "independent-execution", workspaceGeneration: 1, output: "passed" },
   });
   assert.equal((await resolver.resolve(runtimeEvidence("evidence:3:1")))?.workspaceGeneration, 1);
@@ -457,7 +457,7 @@ test("later mutations and restore/fork epochs invalidate otherwise authentic pro
   await journal.append({
     sequence: 6,
     type: "tool.completed",
-    data: { evidenceId: "evidence:6:1", callId: "check-2", tool: "project.check", ok: true,
+    data: { evidenceId: "evidence:6:1", callId: "check-2", tool: "check_project", ok: true,
       evidenceAuthority: "independent-execution", workspaceGeneration: 2, output: "passed" },
   });
   await journal.append({ sequence: 7, type: "session.forked", data: { role: "parent" } });
@@ -543,7 +543,7 @@ test("invalid plan evidence reports the exact fresh proof handles available", as
     data: {
       evidenceId: "evidence:1:1",
       callId: "check-1",
-      tool: "artifact.render",
+      tool: "render_artifact",
       ok: true,
       output: { path: ".vanguard/renders/page.png" },
       evidenceAuthority: "independent-execution",
@@ -557,7 +557,7 @@ test("invalid plan evidence reports the exact fresh proof handles available", as
       summary: "proof recovery",
       milestones: [milestone("m1", "proven", [runtimeEvidence("invented")])],
     }, { task: "t", step: 1, signal: new AbortController().signal }),
-    /Fresh eligible tool proof: evidence:1:1 \(artifact\.render, independent-execution\)/u,
+    /Fresh eligible tool proof: evidence:1:1 \(render_artifact, independent-execution\)/u,
   );
 });
 
@@ -617,7 +617,7 @@ test("authentic persisted proof survives restore as stale and can be refreshed w
     await journal.append({
       sequence: 1,
       type: "tool.completed",
-      data: { evidenceId: "evidence:1:1", callId: "check-0", tool: "project.check", ok: true,
+      data: { evidenceId: "evidence:1:1", callId: "check-0", tool: "check_project", ok: true,
         evidenceAuthority: "independent-execution", workspaceGeneration: 0, output: "passed" },
     });
     const resolver = new JournalEvidenceResolver(journal);
@@ -652,7 +652,7 @@ test("authentic persisted proof survives restore as stale and can be refreshed w
     await journal.append({
       sequence: 4,
       type: "tool.completed",
-      data: { evidenceId: "evidence:4:1", callId: "check-1", tool: "project.check", ok: true,
+      data: { evidenceId: "evidence:4:1", callId: "check-1", tool: "check_project", ok: true,
         evidenceAuthority: "independent-execution", workspaceGeneration: 1, output: "passed again" },
     });
     await new PlanTool(reopened, resolver).execute({
@@ -805,7 +805,7 @@ test("plan invalidation cannot erase initial or required work through an unrelat
   await journal.append({
     sequence: 1,
     type: "tool.completed",
-    data: { evidenceId: "evidence:1:1", callId: "unrelated-proof", tool: "project.check", ok: true,
+    data: { evidenceId: "evidence:1:1", callId: "unrelated-proof", tool: "check_project", ok: true,
       evidenceAuthority: "independent-execution", workspaceGeneration: 0, output: "passed unrelated work" },
   });
   const plan = new PlanLedger(undefined, undefined, ["success-1"]);
@@ -903,7 +903,7 @@ test("an explicitly approved later invalidation stays blocked until its supersed
   await journal.append({
     sequence: 2,
     type: "tool.completed",
-    data: { evidenceId: "evidence:2:1", callId: "replacement-proof", tool: "project.check", ok: true,
+    data: { evidenceId: "evidence:2:1", callId: "replacement-proof", tool: "check_project", ok: true,
       evidenceAuthority: "independent-execution", workspaceGeneration: 0, output: "replacement passes" },
   });
   await tool.execute({
@@ -958,8 +958,8 @@ test("an interrupted planned execution resumes with exact plan state and bound e
     const firstPlan = await PlanLedger.open(file);
     const firstJournal = new MemoryJournal();
     const first = new AgentKernel({
-      model: new CapturingModel([planDecision("m1", "active"), { kind: "tools", calls: [{ id: "w", name: "workspace.replace", input: replaceInput("1") }] }]),
-      tools: [mutateTool("workspace.replace"), new PlanTool(firstPlan, new JournalEvidenceResolver(firstJournal))],
+      model: new CapturingModel([planDecision("m1", "active"), { kind: "tools", calls: [{ id: "w", name: "edit_file", input: replaceInput("1") }] }]),
+      tools: [mutateTool("edit_file"), new PlanTool(firstPlan, new JournalEvidenceResolver(firstJournal))],
       verifiers: [passingVerifier], journal: firstJournal, plan: firstPlan,
     });
     assert.equal((await first.run("long planned work")).status, "failed");

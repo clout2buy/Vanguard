@@ -18,8 +18,8 @@ test("sticky context accepts the smallest representable empty JSON transcript bu
 
 function toolChunk(index: number, ok = true): TranscriptEntry[] {
   return [
-    { role: "decision", content: { kind: "tools", calls: [{ id: `c${index}`, name: "workspace.read", input: { path: `src/${index}.ts` } }] } },
-    { role: "observation", content: { callId: `c${index}`, tool: "workspace.read", ok, output: { contents: "x".repeat(400) } } },
+    { role: "decision", content: { kind: "tools", calls: [{ id: `c${index}`, name: "read_file", input: { path: `src/${index}.ts` } }] } },
+    { role: "observation", content: { callId: `c${index}`, tool: "read_file", ok, output: { contents: "x".repeat(400) } } },
   ];
 }
 
@@ -119,8 +119,8 @@ test("thousands of huge events can never overflow the selected byte budget", () 
   const toolHeavy: TranscriptEntry[] = [{ role: "task", content: "t" }];
   for (let index = 0; index < 2_000; index += 1) {
     toolHeavy.push(
-      { role: "decision", content: { kind: "tools", calls: [{ id: `h${index}`, name: "workspace.read", input: { path: `f${index}`, noise: "i".repeat(5_000) } }] } },
-      { role: "observation", content: { callId: `h${index}`, tool: "workspace.read", ok: true, output: { contents: "o".repeat(20_000) } } },
+      { role: "decision", content: { kind: "tools", calls: [{ id: `h${index}`, name: "read_file", input: { path: `f${index}`, noise: "i".repeat(5_000) } }] } },
+      { role: "observation", content: { callId: `h${index}`, tool: "read_file", ok: true, output: { contents: "o".repeat(20_000) } } },
     );
   }
   // The huge exchanges are historical. A final small exchange is the fresh
@@ -138,20 +138,20 @@ test("sticky compaction turns an oversized tool exchange into inert forensic tex
       role: "decision",
       content: {
         kind: "tools",
-        calls: [{ id: "old-plan", name: "plan.update", input: { summary: "x".repeat(40_000) } }],
+        calls: [{ id: "old-plan", name: "update_plan", input: { summary: "x".repeat(40_000) } }],
         continuation: {
           role: "assistant",
           tool_calls: [{
             id: "old-plan",
             type: "function",
-            function: { name: "plan_update", arguments: "should-never-replay" },
+            function: { name: "update_plan", arguments: "should-never-replay" },
           }],
         },
       },
     },
     {
       role: "observation",
-      content: { callId: "old-plan", tool: "plan.update", ok: false, error: "missing summary" },
+      content: { callId: "old-plan", tool: "update_plan", ok: false, error: "missing summary" },
     },
     ...toolChunk(1),
   ], 5_000);
@@ -165,7 +165,7 @@ test("sticky compaction turns an oversized tool exchange into inert forensic tex
   assert.match(String(summary?.content), /failures=1/);
   assert.match(String(summary?.content), /bytes=\d+/);
   assert.match(String(summary?.content), /sha256=[a-f0-9]{64}/);
-  assert.match(String(summary?.content), /tool=plan\.update; category=state; status=failed/);
+  assert.match(String(summary?.content), /tool=update_plan; category=state; status=failed/);
   assert.doesNotMatch(String(summary?.content), /old-plan|missing summary|preview/);
   assert.equal(selected.some((entry) => entry.role === "decision"
     && JSON.stringify(entry.content).includes("old-plan")), false,
@@ -182,17 +182,17 @@ test("the latest Ward-scale tool batch stays byte-exact above the historical com
       content: {
         kind: "tools",
         calls: [
-          { id: "ward-read", name: "workspace.read", input: { path: "src/world/ward.ts" } },
-          { id: "ward-search", name: "workspace.search", input: { query: "registerWard", path: "src" } },
-          { id: "ward-list", name: "workspace.list", input: { path: "test/fixtures/ward" } },
+          { id: "ward-read", name: "read_file", input: { path: "src/world/ward.ts" } },
+          { id: "ward-search", name: "grep", input: { query: "registerWard", path: "src" } },
+          { id: "ward-list", name: "list_dir", input: { path: "test/fixtures/ward" } },
         ],
         continuation: {
           role: "assistant",
           reasoning_content: `opaque-provider-state:${"r".repeat(3_000)}`,
           tool_calls: [
-            { id: "ward-read", type: "function", function: { name: "workspace_read", arguments: "{\"path\":\"src/world/ward.ts\"}" } },
-            { id: "ward-search", type: "function", function: { name: "workspace_search", arguments: "{\"query\":\"registerWard\",\"path\":\"src\"}" } },
-            { id: "ward-list", type: "function", function: { name: "workspace_list", arguments: "{\"path\":\"test/fixtures/ward\"}" } },
+            { id: "ward-read", type: "function", function: { name: "read_file", arguments: "{\"path\":\"src/world/ward.ts\"}" } },
+            { id: "ward-search", type: "function", function: { name: "grep", arguments: "{\"query\":\"registerWard\",\"path\":\"src\"}" } },
+            { id: "ward-list", type: "function", function: { name: "list_dir", arguments: "{\"path\":\"test/fixtures/ward\"}" } },
           ],
         },
       },
@@ -201,7 +201,7 @@ test("the latest Ward-scale tool batch stays byte-exact above the historical com
       role: "observation",
       content: {
         callId: "ward-read",
-        tool: "workspace.read",
+        tool: "read_file",
         ok: true,
         output: { contents: `LATEST_WARD_SOURCE:${"s".repeat(6_000)}` },
       },
@@ -210,7 +210,7 @@ test("the latest Ward-scale tool batch stays byte-exact above the historical com
       role: "observation",
       content: {
         callId: "ward-search",
-        tool: "workspace.search",
+        tool: "grep",
         ok: true,
         output: { matches: [`LATEST_WARD_MATCH:${"m".repeat(4_000)}`] },
       },
@@ -219,7 +219,7 @@ test("the latest Ward-scale tool batch stays byte-exact above the historical com
       role: "observation",
       content: {
         callId: "ward-list",
-        tool: "workspace.list",
+        tool: "list_dir",
         ok: true,
         output: { files: [`LATEST_WARD_FIXTURE:${"f".repeat(2_000)}`] },
       },
@@ -263,14 +263,14 @@ test("a truly over-budget fresh tool batch fails explicitly instead of being sum
       role: "decision",
       content: {
         kind: "tools",
-        calls: [{ id: "fresh-read", name: "workspace.read", input: { path: "src/huge.ts" } }],
+        calls: [{ id: "fresh-read", name: "read_file", input: { path: "src/huge.ts" } }],
       },
     },
     {
       role: "observation",
       content: {
         callId: "fresh-read",
-        tool: "workspace.read",
+        tool: "read_file",
         ok: true,
         output: { contents: `FRESH_UNSUMMARIZABLE_EVIDENCE:${"x".repeat(20_000)}` },
       },
@@ -306,7 +306,7 @@ test("sticky context anchors a missing task inside its hard byte budget", () => 
   );
 });
 
-test("sticky boundaries never split user.ask from its human answer", () => {
+test("sticky boundaries never split ask_user from its human answer", () => {
   const policy = new StickyContextPolicy();
   const ask: TranscriptEntry = {
     role: "decision",
@@ -316,7 +316,7 @@ test("sticky boundaries never split user.ask from its human answer", () => {
       continuation: {
         role: "assistant",
         reasoning_content: "x".repeat(8_000),
-        tool_calls: [{ id: "permission", type: "function", function: { name: "user_ask", arguments: "{}" } }],
+        tool_calls: [{ id: "permission", type: "function", function: { name: "ask_user", arguments: "{}" } }],
       },
     },
   };
@@ -344,7 +344,7 @@ test("sticky boundaries never split completion from its verification results", (
       continuation: {
         role: "assistant",
         reasoning_content: "x".repeat(8_000),
-        tool_calls: [{ id: "finish", type: "function", function: { name: "task_complete", arguments: "{}" } }],
+        tool_calls: [{ id: "finish", type: "function", function: { name: "complete_task", arguments: "{}" } }],
       },
     },
   };
@@ -419,9 +419,9 @@ test("trusted runtime notes never replace the latest human correction", () => {
 test("sticky compaction keeps control decisions with adjacent runtime feedback", () => {
   const policy = new StickyContextPolicy();
   for (const [kind, tool] of [
-    ["ask_user", "user.ask"],
-    ["execute", "task.execute"],
-    ["complete", "task.complete"],
+    ["ask_user", "ask_user"],
+    ["execute", "execute_task"],
+    ["complete", "complete_task"],
   ] as const) {
     const selected = policy.select("repair", [
       { role: "task", content: "repair" },
@@ -515,8 +515,8 @@ test("context overflow digests every other source before touching the working-st
     async decide() { return { kind: "respond", message: "compressed digest" }; },
   });
   const freshTool: TranscriptEntry[] = [
-    { role: "decision", content: { kind: "tools", calls: [{ id: "c1", name: "workspace.read", input: {} }] } },
-    { role: "observation", content: { callId: "c1", tool: "workspace.read", ok: true, output: { contents: "y".repeat(24_000) } } },
+    { role: "decision", content: { kind: "tools", calls: [{ id: "c1", name: "read_file", input: {} }] } },
+    { role: "observation", content: { callId: "c1", tool: "read_file", ok: true, output: { contents: "y".repeat(24_000) } } },
   ];
   const workingState = { checkpoint: "z".repeat(26_000) } as JsonValue;
   const projection = await delegate.project({

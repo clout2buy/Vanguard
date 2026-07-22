@@ -144,13 +144,13 @@ async function visualRung(locator: BrowserLocator): Promise<DoctorResult> {
   }
   if (browser === undefined) {
     return {
-      name: "visual rung (artifact.render)",
+      name: "visual rung (render_artifact)",
       status: "degraded",
       detail: "no system Chromium-family browser found; HTML deliverables cannot be rendered or screenshotted",
       remedy: "install Edge/Chrome/Chromium or set VANGUARD_BROWSER to a browser executable",
     };
   }
-  return { name: "visual rung (artifact.render)", status: "ok", detail: browser };
+  return { name: "visual rung (render_artifact)", status: "ok", detail: browser };
 }
 
 async function typescriptRung(workspaceRoot: string, loader: TypeScriptLoader): Promise<DoctorResult> {

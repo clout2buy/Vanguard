@@ -72,7 +72,7 @@ test("file tools write atomically, read, and enumerate workspace files", async (
   }
 });
 
-test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", async () => {
+test("read_file returns bounded UTF-8 pages with a stable full-file hash", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-pages-"));
   try {
     const contents = "alpha αβγ\n".repeat(50_000);
@@ -121,7 +121,7 @@ test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", 
   }
 });
 
-test("workspace.read supports exact byte ranges and rejects unsafe ambiguous or unknown input", async () => {
+test("read_file supports exact byte ranges and rejects unsafe ambiguous or unknown input", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-range-"));
   try {
     await writeFile(path.join(root, "value.txt"), "0123456789");
@@ -150,7 +150,7 @@ test("workspace.read supports exact byte ranges and rejects unsafe ambiguous or 
 
     await assert.rejects(
       reader.execute({ path: "value.txt", unexpected: true }, context),
-      /workspace\.read received unknown field: unexpected/u,
+      /read_file received unknown field: unexpected/u,
     );
     await assert.rejects(
       reader.execute({ path: "value.txt", range: { startByte: 0, endByte: 1, extra: 1 } }, context),
@@ -185,7 +185,7 @@ test("workspace.read supports exact byte ranges and rejects unsafe ambiguous or 
   }
 });
 
-test("workspace.read cursors reject cross-file use and file drift", async () => {
+test("read_file cursors reject cross-file use and file drift", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-cursor-"));
   try {
     await writeFile(path.join(root, "one.txt"), "abcdefghij");
@@ -363,7 +363,7 @@ test("process tool refuses persistent server commands before they occupy a turn"
       const result = await tool.execute(input, context);
       assert.equal(result.ok, false);
       assert.match(JSON.stringify(result.output), /Persistent server commands/u);
-      assert.match(JSON.stringify(result.output), /artifact\.render/u);
+      assert.match(JSON.stringify(result.output), /render_artifact/u);
     }
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -375,7 +375,7 @@ test("fixed command tool exposes a trusted check without model-controlled argume
   try {
     const processTool = new ProcessTool(new WorkspaceBoundary(root), { allowedCommands: [process.execPath] });
     const tool = new FixedCommandTool(
-      "project.check",
+      "check_project",
       "run fixed check",
       processTool,
       { command: process.execPath, args: ["-e", "process.stdout.write('fixed')"] },

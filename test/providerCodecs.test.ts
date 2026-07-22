@@ -15,7 +15,7 @@ const request: SerializableModelRequest = {
   workingState: null,
   remainingSteps: 10,
   tools: [{
-    name: "workspace.read",
+    name: "read_file",
     description: "read",
     inputSchema: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
   }],
@@ -23,7 +23,7 @@ const request: SerializableModelRequest = {
     { role: "task", content: "repair" },
     {
       role: "decision",
-      content: { kind: "tool", call: { id: "call-1", name: "workspace.read", input: { path: "a.ts" } } },
+      content: { kind: "tool", call: { id: "call-1", name: "read_file", input: { path: "a.ts" } } },
     },
     { role: "observation", content: { ok: true, output: { contents: "code" } } },
   ],
@@ -34,13 +34,13 @@ test("OpenAI codec formats function history and decodes parallel-capable calls",
   const encoded = JSON.stringify(codec.encode(request));
   assert.match(encoded, /function_call_output/);
   assert.match(encoded, /parallel_tool_calls\":true/);
-  assert.match(encoded, /workspace_read/);
+  assert.match(encoded, /read_file/);
   assert.deepEqual(codec.decode({
-    output: [{ type: "function_call", call_id: "call-2", name: "workspace_read", arguments: "{\"path\":\"b.ts\"}" }],
+    output: [{ type: "function_call", call_id: "call-2", name: "read_file", arguments: "{\"path\":\"b.ts\"}" }],
   }), {
     kind: "tools",
-    calls: [{ id: "call-2", name: "workspace.read", input: { path: "b.ts" } }],
-    continuation: [{ type: "function_call", call_id: "call-2", name: "workspace_read", arguments: "{\"path\":\"b.ts\"}" }],
+    calls: [{ id: "call-2", name: "read_file", input: { path: "b.ts" } }],
+    continuation: [{ type: "function_call", call_id: "call-2", name: "read_file", arguments: "{\"path\":\"b.ts\"}" }],
   });
 });
 
@@ -63,7 +63,7 @@ test("chat codec treats bare assistant text as a reply, not a completion claim",
   assert.equal(decision.kind, "respond");
 });
 
-test("completion is claimed only through the task.complete control tool", () => {
+test("completion is claimed only through the complete_task control tool", () => {
   const codec = new OpenAIChatCompletionsCodec("deepseek-v4-pro");
   const decision = codec.decode({
     choices: [{
@@ -74,7 +74,7 @@ test("completion is claimed only through the task.complete control tool", () => 
         tool_calls: [{
           id: "finish",
           type: "function",
-          function: { name: "task_complete", arguments: JSON.stringify({ summary: "All tests pass." }) },
+          function: { name: "complete_task", arguments: JSON.stringify({ summary: "All tests pass." }) },
         }],
       },
     }],
@@ -83,7 +83,7 @@ test("completion is claimed only through the task.complete control tool", () => 
   assert.equal(decision.kind === "complete" ? decision.answer : "", "All tests pass.");
 });
 
-test("user.ask and task.execute decode into typed decisions", () => {
+test("ask_user and execute_task decode into typed decisions", () => {
   const codec = new OpenAIChatCompletionsCodec("deepseek-v4-pro");
   const ask = codec.decode({
     choices: [{
@@ -92,7 +92,7 @@ test("user.ask and task.execute decode into typed decisions", () => {
         role: "assistant", content: null,
         tool_calls: [{
           id: "q1", type: "function",
-          function: { name: "user_ask", arguments: JSON.stringify({ question: "JSON or YAML?" }) },
+          function: { name: "ask_user", arguments: JSON.stringify({ question: "JSON or YAML?" }) },
         }],
       },
     }],
@@ -108,7 +108,7 @@ test("user.ask and task.execute decode into typed decisions", () => {
         tool_calls: [{
           id: "go", type: "function",
           function: {
-            name: "task_execute",
+            name: "execute_task",
             arguments: JSON.stringify({ objective: "Fix the JSON parser", successCriteria: ["tests pass"] }),
           },
         }],
@@ -122,7 +122,7 @@ test("user.ask and task.execute decode into typed decisions", () => {
   });
 });
 
-test("an answered user.ask replays as a paired tool result", () => {
+test("an answered ask_user replays as a paired tool result", () => {
   const codec = new OpenAIChatCompletionsCodec("deepseek-v4-pro");
   const askDecision = codec.decode({
     choices: [{
@@ -131,7 +131,7 @@ test("an answered user.ask replays as a paired tool result", () => {
         role: "assistant", content: null,
         tool_calls: [{
           id: "q1", type: "function",
-          function: { name: "user_ask", arguments: JSON.stringify({ question: "JSON or YAML?" }) },
+          function: { name: "ask_user", arguments: JSON.stringify({ question: "JSON or YAML?" }) },
         }],
       },
     }],
@@ -160,7 +160,7 @@ test("conversation mode uses the conversational system prompt", () => {
   assert.match(conversation, /conversation mode/);
   assert.match(conversation, /not authorization to scaffold/);
   const execution = JSON.stringify(codec.encode(request));
-  assert.match(execution, /task\.complete/);
+  assert.match(execution, /complete_task/);
 });
 
 test("OpenAI codec carries opaque reasoning items into the next request", () => {
@@ -169,7 +169,7 @@ test("OpenAI codec carries opaque reasoning items into the next request", () => 
   const decision = codec.decode({
     output: [
       { type: "reasoning", id: "reason-1", encrypted_content: "opaque" },
-      { type: "function_call", call_id: "call-2", name: "workspace_read", arguments: "{\"path\":\"b.ts\"}" },
+      { type: "function_call", call_id: "call-2", name: "read_file", arguments: "{\"path\":\"b.ts\"}" },
     ],
   });
   const followup = codec.encode({
@@ -247,11 +247,11 @@ test("DeepSeek-compatible chat codec preserves reasoning content and parallel to
         tool_calls: [{
           id: "deep-call",
           type: "function",
-          function: { name: "workspace_read", arguments: "{\"path\":\"a.ts\"}" },
+          function: { name: "read_file", arguments: "{\"path\":\"a.ts\"}" },
         }, {
           id: "second-parallel-call",
           type: "function",
-          function: { name: "workspace_read", arguments: "{\"path\":\"b.ts\"}" },
+          function: { name: "read_file", arguments: "{\"path\":\"b.ts\"}" },
         }],
       },
     }],
@@ -267,8 +267,8 @@ test("DeepSeek-compatible chat codec preserves reasoning content and parallel to
     transcript: [
       { role: "task", content: "repair" },
       { role: "decision", content: decision as never },
-      { role: "observation", content: { callId: "deep-call", tool: "workspace.read", ok: true, output: "contents" } },
-      { role: "observation", content: { callId: "second-parallel-call", tool: "workspace.read", ok: true, output: "more" } },
+      { role: "observation", content: { callId: "deep-call", tool: "read_file", ok: true, output: "contents" } },
+      { role: "observation", content: { callId: "second-parallel-call", tool: "read_file", ok: true, output: "more" } },
     ],
   });
   const serialized = JSON.stringify(followup);
@@ -285,9 +285,9 @@ test("chat completions stream accumulator rebuilds parallel calls and streams on
   accumulator.feed('{"choices":[{"delta":{"role":"assistant","reasoning_content":"PRIVATE_REASONING"}}]}');
   accumulator.feed('{"choices":[{"delta":{"content":"Check"}}]}');
   accumulator.feed('{"choices":[{"delta":{"content":"ing the parser."}}]}');
-  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"workspace_read","arguments":"{\\"pa"}}]}}]}');
+  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","type":"function","function":{"name":"read_file","arguments":"{\\"pa"}}]}}]}');
   accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\\":\\"a.ts\\"}"}}]}}]}');
-  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"workspace_read","arguments":"{\\"path\\":\\"b.ts\\"}"}}]}}]}');
+  accumulator.feed('{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"b","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"b.ts\\"}"}}]}}]}');
   accumulator.feed('{"choices":[{"finish_reason":"tool_calls","delta":{}}]}');
   accumulator.terminal?.("[DONE]");
   assert.equal(deltas.join(""), "Checking the parser.");
@@ -315,7 +315,7 @@ test("chat completions stream accumulator rejects complete-looking text and tool
   );
 
   const toolWithoutDone = codec.createStreamAccumulator();
-  toolWithoutDone.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"workspace_read","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}');
+  toolWithoutDone.feed('{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}');
   toolWithoutDone.feed('{"choices":[{"finish_reason":"tool_calls","delta":{}}]}');
   assert.throws(
     () => toolWithoutDone.finish(),
@@ -342,7 +342,7 @@ test("anthropic stream accumulator rebuilds tool input and keeps thinking privat
   accumulator.feed('{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Reading "}}');
   accumulator.feed('{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"the file."}}');
   accumulator.feed('{"type":"content_block_stop","index":1}');
-  accumulator.feed('{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"workspace.read","input":{}}}');
+  accumulator.feed('{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"t1","name":"read_file","input":{}}}');
   accumulator.feed('{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}');
   accumulator.feed('{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"\\"a.ts\\"}"}}');
   accumulator.feed('{"type":"content_block_stop","index":2}');
@@ -369,7 +369,7 @@ test("anthropic stream accumulator rejects complete-looking text and tool JSON w
   assert.throws(() => text.finish(), /terminal message_stop event/u);
 
   const tool = codec.createStreamAccumulator();
-  tool.feed('{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"workspace.read","input":{}}}');
+  tool.feed('{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read_file","input":{}}}');
   tool.feed('{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"a.ts\\"}"}}');
   tool.feed('{"type":"content_block_stop","index":0}');
   tool.feed('{"type":"message_delta","delta":{"stop_reason":"tool_use"}}');
@@ -383,7 +383,7 @@ test("anthropic stream accumulator rejects complete-looking text and tool JSON w
 test("anthropic stream accumulator requires an exact content-block lifecycle before tool dispatch", () => {
   const codec = new AnthropicMessagesCodec("test-model");
   const missingStop = codec.createStreamAccumulator!();
-  missingStop.feed('{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"workspace.write","input":{}}}');
+  missingStop.feed('{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"write_file","input":{}}}');
   missingStop.feed('{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"owned.txt\\",\\"contents\\":\\"bad\\"}"}}');
   missingStop.feed('{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}}');
   missingStop.feed('{"type":"message_stop"}');
@@ -405,7 +405,7 @@ test("anthropic stream accumulator requires an exact content-block lifecycle bef
   );
 
   const deltaAfterTerminal = codec.createStreamAccumulator!();
-  deltaAfterTerminal.feed('{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"workspace.write","input":{}}}');
+  deltaAfterTerminal.feed('{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"write_file","input":{}}}');
   deltaAfterTerminal.feed('{"type":"message_delta","delta":{"stop_reason":"tool_use"}}');
   assert.throws(
     () => deltaAfterTerminal.feed('{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"late.txt\\"}"}}'),
@@ -490,7 +490,7 @@ test("DeepSeek compaction discards old executable continuations but retains rece
       role: "decision" as const,
       content: {
         kind: "tool",
-        call: { id: `call-${index}`, name: "workspace.read", input: { path: `src/${index}.ts` } },
+        call: { id: `call-${index}`, name: "read_file", input: { path: `src/${index}.ts` } },
         continuation: {
           role: "assistant",
           content: "",
@@ -498,7 +498,7 @@ test("DeepSeek compaction discards old executable continuations but retains rece
           tool_calls: [{
             id: `call-${index}`,
             type: "function",
-            function: { name: "workspace_read", arguments: JSON.stringify({ path: `src/${index}.ts` }) },
+            function: { name: "read_file", arguments: JSON.stringify({ path: `src/${index}.ts` }) },
           }],
         },
       },
@@ -527,7 +527,7 @@ test("compacted history is inert and causally paired in OpenAI, Anthropic, and D
         kind: "tools",
         calls: [{
           id: `history-${index}`,
-          name: index === 1 ? "plan.update" : "workspace.read",
+          name: index === 1 ? "update_plan" : "read_file",
           input: index === 1
             ? { summary: "historical plan", details: "x".repeat(8_000) }
             : { path: `src/${index}.ts` },
@@ -540,7 +540,7 @@ test("compacted history is inert and causally paired in OpenAI, Anthropic, and D
               id: "history-1",
               type: "function",
               function: {
-                name: "plan_update",
+                name: "update_plan",
                 arguments: JSON.stringify({ summary: "historical plan", details: "x".repeat(8_000) }),
               },
             }],
@@ -552,7 +552,7 @@ test("compacted history is inert and causally paired in OpenAI, Anthropic, and D
       role: "observation",
       content: {
         callId: `history-${index}`,
-        tool: index === 1 ? "plan.update" : "workspace.read",
+        tool: index === 1 ? "update_plan" : "read_file",
         ok: true,
         output: { contents: `result-${index}` },
       },
@@ -567,7 +567,7 @@ test("compacted history is inert and causally paired in OpenAI, Anthropic, and D
   assert.match(String(summary?.content), /failures=0/);
   assert.match(String(summary?.content), /bytes=\d+/);
   assert.match(String(summary?.content), /sha256=[a-f0-9]{64}/);
-  assert.match(String(summary?.content), /tool=plan\.update; category=state; status=ok/);
+  assert.match(String(summary?.content), /tool=update_plan; category=state; status=ok/);
   assert.doesNotMatch(String(summary?.content), /history-1|historical plan|preview/);
 
   const openAI = new OpenAIResponsesCodec("test").encode({ ...request, transcript: selected }) as {
@@ -624,7 +624,7 @@ test("compacted history is inert and causally paired in OpenAI, Anthropic, and D
   assert.doesNotMatch(JSON.stringify({ openAI, anthropic, deepSeek }), /vanguardElided/);
 });
 
-test("runtime history never satisfies a pending user.ask across provider wires", () => {
+test("runtime history never satisfies a pending ask_user across provider wires", () => {
   const history = "[Vanguard inert historical tool exchange]\ncalls=1; observations=1; failures=0; missing=0; bytes=12; sha256="
     + "a".repeat(64);
   const base = {
@@ -642,7 +642,7 @@ test("runtime history never satisfies a pending user.ask across provider wires",
         content: {
           kind: "ask_user",
           question: "May I proceed?",
-          continuation: [{ type: "function_call", call_id: "permission", name: "user_ask", arguments: "{}" }],
+          continuation: [{ type: "function_call", call_id: "permission", name: "ask_user", arguments: "{}" }],
         },
       },
       { role: "history", content: history },
@@ -662,7 +662,7 @@ test("runtime history never satisfies a pending user.ask across provider wires",
         content: {
           kind: "ask_user",
           question: "May I proceed?",
-          continuation: [{ type: "tool_use", id: "permission", name: "user.ask", input: {} }],
+          continuation: [{ type: "tool_use", id: "permission", name: "ask_user", input: {} }],
         },
       },
       { role: "history", content: history },
@@ -696,7 +696,7 @@ test("runtime history never satisfies a pending user.ask across provider wires",
             tool_calls: [{
               id: "permission",
               type: "function",
-              function: { name: "user_ask", arguments: "{}" },
+              function: { name: "ask_user", arguments: "{}" },
             }],
           },
         },
@@ -718,25 +718,25 @@ test("synthetic control feedback is paired to the real provider id across all wi
     {
       wire: "responses" as const,
       codec: new OpenAIResponsesCodec("test"),
-      ask: [{ type: "function_call", call_id: "real-ask", name: "user_ask", arguments: "{}" }],
-      execute: [{ type: "function_call", call_id: "real-execute", name: "task_execute", arguments: "{}" }],
+      ask: [{ type: "function_call", call_id: "real-ask", name: "ask_user", arguments: "{}" }],
+      execute: [{ type: "function_call", call_id: "real-execute", name: "execute_task", arguments: "{}" }],
     },
     {
       wire: "anthropic" as const,
       codec: new AnthropicMessagesCodec("test"),
-      ask: [{ type: "tool_use", id: "real-ask", name: "user.ask", input: {} }],
-      execute: [{ type: "tool_use", id: "real-execute", name: "task.execute", input: {} }],
+      ask: [{ type: "tool_use", id: "real-ask", name: "ask_user", input: {} }],
+      execute: [{ type: "tool_use", id: "real-execute", name: "execute_task", input: {} }],
     },
     {
       wire: "chat" as const,
       codec: new OpenAIChatCompletionsCodec("deepseek-v4-pro"),
       ask: {
         role: "assistant", content: null,
-        tool_calls: [{ id: "real-ask", type: "function", function: { name: "user_ask", arguments: "{}" } }],
+        tool_calls: [{ id: "real-ask", type: "function", function: { name: "ask_user", arguments: "{}" } }],
       },
       execute: {
         role: "assistant", content: null,
-        tool_calls: [{ id: "real-execute", type: "function", function: { name: "task_execute", arguments: "{}" } }],
+        tool_calls: [{ id: "real-execute", type: "function", function: { name: "execute_task", arguments: "{}" } }],
       },
     },
   ];
@@ -748,7 +748,7 @@ test("synthetic control feedback is paired to the real provider id across all wi
       { role: "decision", content: { kind: "ask_user", question: "Need input", continuation: item.ask } },
       {
         role: "observation",
-        content: { callId: "ask-user", tool: "user.ask", ok: false, error: "No user is available." },
+        content: { callId: "ask-user", tool: "ask_user", ok: false, error: "No user is available." },
       },
     ], 2_000);
     const askWire = item.codec.encode({
@@ -774,7 +774,7 @@ test("synthetic control feedback is paired to the real provider id across all wi
         },
         {
           role: "observation",
-          content: { callId: "task-execute", tool: "task.execute", ok: false, error: "Already contracted." },
+          content: { callId: "task-execute", tool: "execute_task", ok: false, error: "Already contracted." },
         },
       ], 2_000);
     const executeWire = item.codec.encode({
@@ -789,24 +789,24 @@ test("synthetic control feedback is paired to the real provider id across all wi
   }
 });
 
-test("an orphaned task.execute at transcript EOF is never fabricated as accepted across provider wires", () => {
+test("an orphaned execute_task at transcript EOF is never fabricated as accepted across provider wires", () => {
   const cases = [
     {
       wire: "responses" as const,
       codec: new OpenAIResponsesCodec("test"),
-      continuation: [{ type: "function_call", call_id: "crashed-execute", name: "task_execute", arguments: "{}" }],
+      continuation: [{ type: "function_call", call_id: "crashed-execute", name: "execute_task", arguments: "{}" }],
     },
     {
       wire: "anthropic" as const,
       codec: new AnthropicMessagesCodec("test"),
-      continuation: [{ type: "tool_use", id: "crashed-execute", name: "task.execute", input: {} }],
+      continuation: [{ type: "tool_use", id: "crashed-execute", name: "execute_task", input: {} }],
     },
     {
       wire: "chat" as const,
       codec: new OpenAIChatCompletionsCodec("deepseek-v4-pro"),
       continuation: {
         role: "assistant", content: null,
-        tool_calls: [{ id: "crashed-execute", type: "function", function: { name: "task_execute", arguments: "{}" } }],
+        tool_calls: [{ id: "crashed-execute", type: "function", function: { name: "execute_task", arguments: "{}" } }],
       },
     },
   ];
@@ -839,7 +839,7 @@ test("Chat Completions terminal reasons must independently authorize their paylo
     tool_calls: [{
       id: "write-never",
       type: "function",
-      function: { name: "workspace_write", arguments: '{"path":"owned.ts","contents":"pwned"}' },
+      function: { name: "write_file", arguments: '{"path":"owned.ts","contents":"pwned"}' },
     }],
   };
 
@@ -868,7 +868,7 @@ test("Chat Completions terminal reasons must independently authorize their paylo
 
 test("Anthropic stop reasons must independently authorize text or tool payloads", () => {
   const codec = new AnthropicMessagesCodec("test-model");
-  const tool = { type: "tool_use", id: "write-never", name: "workspace.write", input: { path: "owned.ts" } };
+  const tool = { type: "tool_use", id: "write-never", name: "write_file", input: { path: "owned.ts" } };
   const text = { type: "text", text: "Looks complete." };
 
   assert.throws(() => codec.decode({ stop_reason: "max_tokens", content: [tool] }), /max_tokens/u);
@@ -886,7 +886,7 @@ test("OpenAI Responses rejects explicit non-completed status even with executabl
   const executable = [{
     type: "function_call",
     call_id: "write-never",
-    name: "workspace_write",
+    name: "write_file",
     arguments: '{"path":"owned.ts","contents":"pwned"}',
   }];
   for (const status of ["in_progress", "incomplete", "failed", "cancelled"] as const) {

@@ -21,9 +21,9 @@ class ScriptedModel implements ModelPort {
 
 let observed = 0;
 const readTool: ToolPort = {
-  name: "workspace.read",
+  name: "read_file",
   definition: {
-    name: "workspace.read",
+    name: "read_file",
     description: "read",
     inputSchema: { type: "object" },
     effect: "observe",
@@ -34,9 +34,9 @@ const readTool: ToolPort = {
   },
 };
 const mutateTool: ToolPort = {
-  name: "workspace.write",
+  name: "write_file",
   definition: {
-    name: "workspace.write",
+    name: "write_file",
     description: "write",
     inputSchema: { type: "object" },
     effect: "mutate",
@@ -49,7 +49,7 @@ const mutateTool: ToolPort = {
 test("a scout investigates read-only and returns the digest with its cost", async () => {
   observed = 0;
   const model = new ScriptedModel([
-    { kind: "tools", calls: [{ id: "s1", name: "workspace.read", input: { path: "src/retry.ts" } }] },
+    { kind: "tools", calls: [{ id: "s1", name: "read_file", input: { path: "src/retry.ts" } }] },
     { kind: "complete", answer: "retry.ts:1 sets retries = 3; no other configuration site exists." },
   ]);
   const scout = new ScoutDelegateTool(model, [readTool, mutateTool]);
@@ -68,8 +68,8 @@ test("a scout is structurally incapable of mutation and dies on its budget hones
   // The mutating tool is filtered before the kernel ever sees it: a scout
   // that decides to write gets an unknown-tool failure, not a side effect.
   const rogue = new ScriptedModel([
-    { kind: "tools", calls: [{ id: "m1", name: "workspace.write", input: { path: "x", contents: "y" } }] },
-    { kind: "tools", calls: [{ id: "m2", name: "workspace.write", input: { path: "x", contents: "y" } }] },
+    { kind: "tools", calls: [{ id: "m1", name: "write_file", input: { path: "x", contents: "y" } }] },
+    { kind: "tools", calls: [{ id: "m2", name: "write_file", input: { path: "x", contents: "y" } }] },
     { kind: "complete", answer: "I wrote the file." },
   ]);
   const rogueScout = new ScoutDelegateTool(rogue, [readTool, mutateTool]);
@@ -81,7 +81,7 @@ test("a scout is structurally incapable of mutation and dies on its budget hones
   // A scout that never completes runs out of budget and reports that.
   const stuck = new ScriptedModel(Array.from({ length: 8 }, (_, index): ModelDecision => ({
     kind: "tools",
-    calls: [{ id: `r${index}`, name: "workspace.read", input: { path: `file-${index}.ts` } }],
+    calls: [{ id: `r${index}`, name: "read_file", input: { path: `file-${index}.ts` } }],
   })));
   const stuckScout = new ScoutDelegateTool(stuck, [readTool]);
   const stuckResult = await stuckScout.execute({ objective: "wander forever", maxSteps: 4 }, context);

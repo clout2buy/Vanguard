@@ -68,7 +68,7 @@ Vanguard automatically detects npm tests, Python pytest projects, Rust Cargo pro
 
 The final scorecard prints `workspaceRoot`, `journalFile`, and `scorecardFile`. Inspect and test the disposable `workspaceRoot`; Vanguard does not overwrite the original repository in this preview.
 
-Models without native image input can inspect generated BMP and PNG artifacts through Vanguard's `artifact.inspect_image` tool. The tool decodes pixels inside the workspace and returns compact exposure, color, regional detail/occlusion, HUD-contrast, luminance-map, and optional image-comparison evidence. It does not pretend to provide semantic vision; sealed visual graders and, when configured later, a vision-capable reviewer remain necessary for subjective composition and product-quality judgments.
+Models without native image input can inspect generated BMP and PNG artifacts through Vanguard's `inspect_image` tool. The tool decodes pixels inside the workspace and returns compact exposure, color, regional detail/occlusion, HUD-contrast, luminance-map, and optional image-comparison evidence. It does not pretend to provide semantic vision; sealed visual graders and, when configured later, a vision-capable reviewer remain necessary for subjective composition and product-quality judgments.
 
 Optional containment parameters include `-Protect`, `-EditableRoot`, and `-AllowCommand`, each accepting an array. For example:
 
@@ -92,7 +92,7 @@ npm run vanguard -- run `
   --verify-arg test
 ```
 
-When verification can be auto-detected, the same fixed command is automatically exposed to the model as `project.check`; the model cannot alter its argument vector. Repeat `--allow-command NAME` for any additional executable the model needs. Commands run without a command shell, but unrestricted subprocesses are not an OS sandbox; use repositories and credentials appropriate for a preview environment.
+When verification can be auto-detected, the same fixed command is automatically exposed to the model as `check_project`; the model cannot alter its argument vector. Repeat `--allow-command NAME` for any additional executable the model needs. Commands run without a command shell, but unrestricted subprocesses are not an OS sandbox; use repositories and credentials appropriate for a preview environment.
 
 If an invocation is interrupted, continue the same disposable session without replaying completed tool actions:
 

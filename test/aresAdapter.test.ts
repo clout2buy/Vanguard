@@ -200,7 +200,7 @@ test("a failure after any tool boundary blocks silent legacy replay", async () =
     const created = await adapter.create(input(true));
     await adapter.send(created.sessionId, "mutating task");
     const upstream = vanguard.onlySessionId();
-    vanguard.emit(upstream, publicEvent("tool.started", { tool: "workspace.write", detail: "secret/file.ts" }));
+    vanguard.emit(upstream, publicEvent("tool.started", { tool: "write_file", detail: "secret/file.ts" }));
     vanguard.emit(upstream, publicEvent("run.failed", { detail: "crash" }));
     await until(async () => (await adapter.status(created.sessionId)).requiresManualRecovery);
     const status = await adapter.status(created.sessionId);
@@ -365,7 +365,7 @@ test("completed or previously mutating Vanguard sessions never silently continue
   try {
     const created = await adapter.create(input(true));
     await adapter.send(created.sessionId, "first turn");
-    vanguard.emit(vanguard.onlySessionId(), publicEvent("tool.started", { tool: "workspace.write" }));
+    vanguard.emit(vanguard.onlySessionId(), publicEvent("tool.started", { tool: "write_file" }));
     vanguard.emit(vanguard.onlySessionId(), publicEvent("run.completed"));
     await until(async () => (await adapter.status(created.sessionId)).state === "completed");
     await assert.rejects(() => adapter.send(created.sessionId, "follow-up"), /new session/i);
@@ -389,7 +389,7 @@ test("mutation history is lifetime-scoped and survives a later advance", async (
     const created = await adapter.create(input(true));
     await adapter.send(created.sessionId, "first turn");
     const upstream = vanguard.onlySessionId();
-    vanguard.emit(upstream, publicEvent("tool.started", { tool: "workspace.write" }));
+    vanguard.emit(upstream, publicEvent("tool.started", { tool: "write_file" }));
     await until(async () => (await adapter.events(created.sessionId)).events.some((event) => event.kind === "tool.started"));
     vanguard.setState(upstream, "failed");
     assert.equal((await adapter.status(created.sessionId)).state, "failed");
@@ -441,7 +441,7 @@ test("an unknown advance throw is treated as uncertain execution, never safe fal
 test("existing Vanguard resume never crosses to legacy when rollout is unavailable", async () => {
   const vanguard = new FakeVanguard();
   const original = await vanguard.create(config, "op_10000000000000000000000000000002");
-  vanguard.emit(original.sessionId, publicEvent("tool.started", { tool: "workspace.write" }), false);
+  vanguard.emit(original.sessionId, publicEvent("tool.started", { tool: "write_file" }), false);
   const legacy = new FakeLegacy();
   const adapter = new AresVanguardAdapter({ vanguard, legacy });
   try {

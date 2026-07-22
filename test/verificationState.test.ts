@@ -161,9 +161,9 @@ test("kernel reserves a failed sealed claim beside proven milestones across requ
     unproven: () => [],
   };
   const planTool: ToolPort = {
-    name: "plan.update",
+    name: "update_plan",
     definition: {
-      name: "plan.update",
+      name: "update_plan",
       description: "test plan tool",
       inputSchema: { type: "object" },
       effect: "state",

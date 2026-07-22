@@ -42,20 +42,20 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
         output?: { sha256?: string };
       } | undefined;
       const decision = decisions === 0
-        ? { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } }
+        ? { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } }
         : decisions === 1
           ? {
               kind: "tool",
               call: {
                 id: "edit",
-                name: "workspace.replace",
+                name: "edit_file",
                 input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
               },
             }
           : decisions === 2
-            ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
+            ? { kind: "tool", call: { id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } } }
             : decisions === 3
-              ? { kind: "tool", call: { id: "review", name: "workspace.changes", input: {} } }
+              ? { kind: "tool", call: { id: "review", name: "review_changes", input: {} } }
               : { kind: "complete", answer: "Fixed and tested." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
@@ -112,7 +112,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     assert.match(await readFile(path.join(source, "answer.mjs"), "utf8"), /41/);
     assert.equal(JSON.parse(await readFile(scorecard.scorecardFile, "utf8")).outcome.status, "completed");
     assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"session.ready"/);
-    assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"tool.started".*"workspace.read"/);
+    assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"tool.started".*"read_file"/);
     assert.match(stderr, /@@VANGUARD_EVENT@@.*"type":"verification.completed"/);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -147,20 +147,20 @@ test("compiled CLI advance flows from conversation to contracted execution", asy
               },
             }
         : decisions === 2
-          ? { kind: "tools", calls: [{ id: "read", name: "workspace.read", input: { path: "answer.mjs" } }] }
+          ? { kind: "tools", calls: [{ id: "read", name: "read_file", input: { path: "answer.mjs" } }] }
           : decisions === 3
             ? {
                 kind: "tools",
                 calls: [{
                   id: "edit",
-                  name: "workspace.replace",
+                  name: "edit_file",
                   input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
                 }],
               }
             : decisions === 4
-              ? { kind: "tools", calls: [{ id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } }] }
+              ? { kind: "tools", calls: [{ id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } }] }
               : decisions === 5
-                ? { kind: "tools", calls: [{ id: "review", name: "workspace.changes", input: {} }] }
+                ? { kind: "tools", calls: [{ id: "review", name: "review_changes", input: {} }] }
                 : { kind: "complete", answer: "Fixed and tested." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
@@ -320,20 +320,20 @@ test("compiled CLI advance recovers a contracted session whose workspace copy ne
         output?: { sha256?: string };
       } | undefined;
       const decision = decisions === 1
-        ? { kind: "tools", calls: [{ id: "read", name: "workspace.read", input: { path: "answer.mjs" } }] }
+        ? { kind: "tools", calls: [{ id: "read", name: "read_file", input: { path: "answer.mjs" } }] }
         : decisions === 2
           ? {
               kind: "tools",
               calls: [{
                 id: "edit",
-                name: "workspace.replace",
+                name: "edit_file",
                 input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
               }],
             }
           : decisions === 3
-            ? { kind: "tools", calls: [{ id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } }] }
+            ? { kind: "tools", calls: [{ id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } }] }
             : decisions === 4
-              ? { kind: "tools", calls: [{ id: "review", name: "workspace.changes", input: {} }] }
+              ? { kind: "tools", calls: [{ id: "review", name: "review_changes", input: {} }] }
               : { kind: "complete", answer: "Recovered, fixed, and tested." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
@@ -416,20 +416,20 @@ test("compiled CLI resumes a failed session from its durable journal", async () 
         output?: { sha256?: string };
       } | undefined;
       const decision = decisions === 0
-        ? { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } }
+        ? { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } }
         : decisions === 1
           ? {
               kind: "tool",
               call: {
                 id: "edit",
-                name: "workspace.replace",
+                name: "edit_file",
                 input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "40", after: "42" },
               },
             }
           : decisions === 2
-            ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
+            ? { kind: "tool", call: { id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } } }
             : decisions === 3
-              ? { kind: "tool", call: { id: "review", name: "workspace.changes", input: {} } }
+              ? { kind: "tool", call: { id: "review", name: "review_changes", input: {} } }
               : { kind: "complete", answer: "Resumed, fixed, and tested." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));

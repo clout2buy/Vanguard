@@ -28,8 +28,8 @@ export function scoreExecutionQuality(
   trajectory: QualityTrajectory,
   patch: PatchMetrics,
 ): ExecutionQuality {
-  const writes = (trajectory.toolCallsByName["workspace.write"] ?? 0)
-    + (trajectory.toolCallsByName["workspace.replace"] ?? 0);
+  const writes = (trajectory.toolCallsByName["write_file"] ?? 0)
+    + (trajectory.toolCallsByName["edit_file"] ?? 0);
   const changedFiles = patch.changedFiles.length;
   const penalties = {
     toolFriction: Math.min(0.32, trajectory.toolFrictionFailures * 0.08),
@@ -44,7 +44,7 @@ export function scoreExecutionQuality(
   }
   if (patch.beforeLines === 0 && patch.afterLines > 300) reviewFlags.push("large-new-code-surface");
   if (changedFiles > 0 && writes > changedFiles * 4) reviewFlags.push("high-edit-churn");
-  if ((trajectory.toolCallsByName["process.run"] ?? 0) > 12) reviewFlags.push("high-test-fragmentation");
+  if ((trajectory.toolCallsByName["run_command"] ?? 0) > 12) reviewFlags.push("high-test-fragmentation");
   return {
     score: verified ? round(Math.max(0, 1 - totalPenalty)) : 0,
     cleanFirstPass: verified

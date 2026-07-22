@@ -89,7 +89,7 @@ interface ScanOptions {
 
 /**
  * Builds a persistent repository model from a filesystem scan. Pure and
- * deterministic; the agent reads it through the repository.map tool for
+ * deterministic; the agent reads it through the repo_map tool for
  * expert context without spending a model turn per directory.
  */
 export async function buildRepositoryModel(root: string, options: ScanOptions = {}): Promise<RepositoryModel> {
@@ -198,7 +198,7 @@ export async function readRepositoryInstructions(root: string, files: readonly s
 }
 
 export class RepositoryMapTool implements ToolPort {
-  readonly name = "repository.map";
+  readonly name = "repo_map";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Return a structured map of the repository or one workspace-relative directory: languages and their support tier, build systems, entry points, test topology, generated directories, and git presence. Use this first on an unfamiliar project instead of listing directories by hand.",

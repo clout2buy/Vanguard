@@ -23,7 +23,7 @@ test("doctor reports a fully equipped environment as ready with every rung ok", 
   const byName = new Map(report.results.map((result) => [result.name, result]));
   assert.equal(byName.get("provider credentials")?.status, "ok");
   assert.match(byName.get("provider credentials")?.detail ?? "", /ANTHROPIC_API_KEY/);
-  assert.equal(byName.get("visual rung (artifact.render)")?.status, "ok");
+  assert.equal(byName.get("visual rung (render_artifact)")?.status, "ok");
   assert.equal(byName.get("TypeScript syntax rung")?.status, "ok");
   assert.match(byName.get("TypeScript syntax rung")?.detail ?? "", /5\.8\.0/);
   assert.equal(byName.get("Python syntax rung")?.status, "ok");
@@ -44,8 +44,8 @@ test("doctor treats absent credentials as run-blocking and absent rungs as degra
   assert.equal(byName.get("provider credentials")?.status, "missing");
   assert.match(byName.get("provider credentials")?.remedy ?? "", /vanguard login/);
   // Degraded evidence rungs never block a run by themselves.
-  assert.equal(byName.get("visual rung (artifact.render)")?.status, "degraded");
-  assert.match(byName.get("visual rung (artifact.render)")?.remedy ?? "", /VANGUARD_BROWSER/);
+  assert.equal(byName.get("visual rung (render_artifact)")?.status, "degraded");
+  assert.match(byName.get("visual rung (render_artifact)")?.remedy ?? "", /VANGUARD_BROWSER/);
   assert.equal(byName.get("TypeScript syntax rung")?.status, "degraded");
   assert.equal(byName.get("Python syntax rung")?.status, "degraded");
   assert.equal(byName.get("Go syntax rung")?.status, "degraded");

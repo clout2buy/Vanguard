@@ -53,7 +53,7 @@ test("a greeting gets a model response with no tools, no verifier, and no contra
   ]);
   const kernel = new AgentKernel({
     model,
-    tools: [observeTool("workspace.read"), mutateTool("workspace.write", () => { mutations += 1; })],
+    tools: [observeTool("read_file"), mutateTool("write_file", () => { mutations += 1; })],
     verifiers: [neverVerifier],
     journal,
     options: { interactive: true },
@@ -71,14 +71,14 @@ test("conversation mode offers only observation and control tools to the model",
   const model = new CapturingModel([{ kind: "respond", message: "This repository is a CLI." }]);
   const kernel = new AgentKernel({
     model,
-    tools: [observeTool("workspace.read"), observeTool("workspace.list"), mutateTool("workspace.write")],
+    tools: [observeTool("read_file"), observeTool("list_dir"), mutateTool("write_file")],
     verifiers: [neverVerifier],
     journal: new MemoryJournal(),
     options: { interactive: true },
   });
   await kernel.advance({ userMessage: "what does this repo do?" });
   const offered = model.requests[0]?.tools.map((tool) => tool.name).sort();
-  assert.deepEqual(offered, ["task.execute", "user.ask", "workspace.list", "workspace.read"]);
+  assert.deepEqual(offered, ["ask_user", "execute_task", "list_dir", "read_file"]);
 });
 
 test("the kernel refuses a context policy that drops the latest human message", async () => {
@@ -107,12 +107,12 @@ test("the kernel refuses a context policy that drops the latest human message", 
 
 test("the kernel refuses any custom context policy that drops fresh tool evidence", async () => {
   const model = new CapturingModel([
-    { kind: "tools", calls: [{ id: "read", name: "workspace.read", input: { path: "README.md" } }] },
+    { kind: "tools", calls: [{ id: "read", name: "read_file", input: { path: "README.md" } }] },
     { kind: "respond", message: "must not run without the read result" },
   ]);
   const kernel = new AgentKernel({
     model,
-    tools: [observeTool("workspace.read")],
+    tools: [observeTool("read_file")],
     verifiers: [],
     journal: new MemoryJournal(),
     contextPolicy: {
@@ -138,13 +138,13 @@ test("conversation may inspect read-only tools but a mutation call is refused", 
       {
         kind: "tools",
         calls: [
-          { id: "r", name: "workspace.read", input: { path: "README.md" } },
-          { id: "w", name: "workspace.write", input: { path: "x", contents: "y" } },
+          { id: "r", name: "read_file", input: { path: "README.md" } },
+          { id: "w", name: "write_file", input: { path: "x", contents: "y" } },
         ],
       },
       { kind: "respond", message: "It is a parser. I could not and did not modify anything." },
     ]),
-    tools: [observeTool("workspace.read", () => { reads += 1; }), mutateTool("workspace.write", () => { mutations += 1; })],
+    tools: [observeTool("read_file", () => { reads += 1; }), mutateTool("write_file", () => { mutations += 1; })],
     verifiers: [neverVerifier],
     journal,
     options: { interactive: true },
@@ -170,7 +170,7 @@ test("an actionable request produces a journaled contract and execution continue
   ]);
   const conversation = new AgentKernel({
     model: contractModel,
-    tools: [observeTool("workspace.read")],
+    tools: [observeTool("read_file")],
     verifiers: [neverVerifier],
     journal,
     taskAddendum: "Vanguard runtime mutation policy: all workspace paths are editable.",
@@ -186,7 +186,7 @@ test("an actionable request produces a journaled contract and execution continue
   const executionModel = new CapturingModel([{ kind: "complete", answer: "built and verified" }]);
   const execution = new AgentKernel({
     model: executionModel,
-    tools: [mutateTool("workspace.write")],
+    tools: [mutateTool("write_file")],
     verifiers: [{
       name: "tests",
       async verify() { return { verifier: "tests", passed: true, evidence: "ok" }; },
@@ -202,7 +202,7 @@ test("an actionable request produces a journaled contract and execution continue
     && JSON.stringify(entry.content).includes("task manager")), true);
 });
 
-test("resume durably finishes an interrupted task.execute transaction without another model decision", async () => {
+test("resume durably finishes an interrupted execute_task transaction without another model decision", async () => {
   const journal = new MemoryJournal();
   const contract = {
     objective: "Repair the parser without changing its public API",
@@ -266,7 +266,7 @@ test("an execute decision made after run.started can never replace the contracte
       type: "tool.failed" as const,
       data: {
         callId: "task-execute",
-        tool: "task.execute",
+        tool: "execute_task",
         ok: false,
         error: "Execution is already contracted.",
       },
@@ -362,14 +362,14 @@ test("a batch that reuses a call id is refused and repeated abuse fails the run"
   const duplicate: ModelDecision = {
     kind: "tools",
     calls: [
-      { id: "same", name: "workspace.read", input: { path: "a.ts" } },
-      { id: "same", name: "workspace.read", input: { path: "b.ts" } },
+      { id: "same", name: "read_file", input: { path: "a.ts" } },
+      { id: "same", name: "read_file", input: { path: "b.ts" } },
     ],
   };
   let reads = 0;
   const kernel = new AgentKernel({
     model: new CapturingModel([duplicate, duplicate]),
-    tools: [observeTool("workspace.read", () => { reads += 1; })],
+    tools: [observeTool("read_file", () => { reads += 1; })],
     verifiers: [neverVerifier],
     journal,
     options: { maxRepeatedAction: 2 },
@@ -476,11 +476,11 @@ test("an execution question with a live channel is answered in-process without p
 test("a conversation turn that never yields to the user fails its step budget honestly", async () => {
   const decisions: ModelDecision[] = Array.from({ length: 20 }, (_value, index) => ({
     kind: "tools" as const,
-    calls: [{ id: `read-${index}`, name: "workspace.read", input: { path: `file-${index}` } }],
+    calls: [{ id: `read-${index}`, name: "read_file", input: { path: `file-${index}` } }],
   }));
   const kernel = new AgentKernel({
     model: new CapturingModel(decisions),
-    tools: [observeTool("workspace.read")],
+    tools: [observeTool("read_file")],
     verifiers: [neverVerifier],
     journal: new MemoryJournal(),
     options: { interactive: true, maxConversationTurnSteps: 4 },

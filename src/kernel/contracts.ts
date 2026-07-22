@@ -46,13 +46,50 @@ export type KernelMode = "conversation" | "execution";
  * names into typed decisions and the kernel never dispatches them.
  */
 export const CONTROL_TOOL_NAMES = {
-  ask: "user.ask",
-  execute: "task.execute",
-  complete: "task.complete",
+  ask: "ask_user",
+  execute: "execute_task",
+  complete: "complete_task",
 } as const;
 
 /** The runtime-owned plan tool; its presence activates the plan gates. */
-export const PLAN_TOOL_NAME = "plan.update";
+export const PLAN_TOOL_NAME = "update_plan";
+
+/**
+ * Pre-rename spellings of the built-in tools, kept so journals written before
+ * the flat snake_case names replay against the tools they meant. Decode-only:
+ * nothing ever advertises or emits these names.
+ */
+export const LEGACY_TOOL_NAMES: Readonly<Record<string, string>> = {
+  "workspace.read": "read_file",
+  "workspace.write": "write_file",
+  "workspace.replace": "edit_file",
+  "workspace.delete": "delete_file",
+  "workspace.list": "list_dir",
+  "workspace.search": "grep",
+  "workspace.glob": "glob",
+  "workspace.changes": "review_changes",
+  "process.run": "run_command",
+  "project.check": "check_project",
+  "artifact.render": "render_artifact",
+  "artifact.inspect_image": "inspect_image",
+  "code.intel": "code_intel",
+  "repository.map": "repo_map",
+  "verify.syntax": "verify_syntax",
+  "memory.note": "memory_note",
+  "delegate.agent": "delegate_agent",
+  "delegate.swarm": "delegate_swarm",
+  "delegate.race": "delegate_race",
+  "delegate.scout": "delegate_scout",
+  "delegate.start": "delegate_start",
+  "delegate.status": "delegate_status",
+  "delegate.wait": "delegate_wait",
+  "delegate.cancel": "delegate_cancel",
+  "delegate.merge": "delegate_merge",
+  "user.ask": CONTROL_TOOL_NAMES.ask,
+  "task.execute": CONTROL_TOOL_NAMES.execute,
+  "task.complete": CONTROL_TOOL_NAMES.complete,
+  "plan.update": PLAN_TOOL_NAME,
+};
 
 /** The kernel's read-only view of the runtime-owned plan. */
 /** Result of a runtime-owned stale-proof refresh on the plan ledger. */
@@ -77,7 +114,7 @@ export interface PlanStatusPort {
    * Runtime-owned staleness repair: re-bind proven-but-stale milestones to
    * fresh current-generation execution/review evidence derived from the
    * journal, persisting through the same validated revision path a
-   * model-driven plan.update would take. Never proves an unproven milestone.
+   * model-driven update_plan would take. Never proves an unproven milestone.
    */
   refreshStaleProofs?(): Promise<PlanProofRefresh>;
   /**
@@ -208,7 +245,7 @@ export function renderContract(contract: TaskContract): string {
 export interface TranscriptEntry {
   /**
    * `history` is runtime-authored, inert context. It must never be interpreted
-   * as a human instruction or as the answer to a pending `user.ask` call.
+   * as a human instruction or as the answer to a pending `ask_user` call.
    * `runtime` is fixed runtime guidance, distinct from actual human input so
    * context selection can preserve the latest human correction precisely. It
    * must never contain raw model- or workspace-authored prose.
@@ -298,7 +335,7 @@ export interface ToolObservation {
   /** True only on a successful mutation that advanced workspaceGeneration. */
   readonly workspaceMutation?: true;
   /**
-   * Runtime-computed: a passing verify.syntax that satisfied the post-change
+   * Runtime-computed: a passing verify_syntax that satisfied the post-change
    * execution-evidence gate inside the bounded plan-free small-change lane.
    * This is deliberately distinct from evidenceAuthority so it can never be
    * cited as plan-milestone execution proof.

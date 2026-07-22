@@ -1,19 +1,22 @@
 // Per-provider tool-name compatibility, in one place.
 //
-// Vanguard names tools with dots (`workspace.read`, `project.check`). No current
-// provider accepts that: OpenAI and Anthropic both require ^[a-zA-Z0-9_-]+$ and
-// answer a dotted name with a 400 that names the offending field and nothing
-// else. So every wire codec has to translate names out on encode and back on
-// decode, and any codec that forgets is broken for every tool call it makes.
+// Vanguard's built-in tools use flat snake_case names (`read_file`,
+// `check_project`) that every provider accepts verbatim, but extension tools
+// keep dotted `namespace.tool` names (custom tools, MCP servers) — and no
+// current provider accepts those: OpenAI and Anthropic both require
+// ^[a-zA-Z0-9_-]+$ and answer a dotted name with a 400 that names the
+// offending field and nothing else. So every wire codec still has to translate
+// names out on encode and back on decode, and any codec that forgets is broken
+// for every extension tool call it makes.
 //
-// That is exactly how it broke: the Anthropic codec shipped without the mapping
-// its OpenAI siblings had, and mocked conformance tests never noticed because
-// the mock accepted whatever it was handed. Centralizing the rule here means a
-// provider declares its constraint once and gets the translation for free —
-// there is no per-call-site step left to forget.
+// That is exactly how it broke once: the Anthropic codec shipped without the
+// mapping its OpenAI siblings had, and mocked conformance tests never noticed
+// because the mock accepted whatever it was handed. Centralizing the rule here
+// means a provider declares its constraint once and gets the translation for
+// free — there is no per-call-site step left to forget.
 
 import type { ToolDefinition } from "../kernel/contracts.js";
-import { CONTROL_TOOL_NAMES } from "../kernel/contracts.js";
+import { CONTROL_TOOL_NAMES, LEGACY_TOOL_NAMES } from "../kernel/contracts.js";
 
 /** One provider's documented tool-name constraint. */
 export interface ToolNamingRules {
@@ -39,9 +42,11 @@ export function sanitizeToolName(internalName: string): string {
  * Control tools decode independently of encode state: a provider may return
  * their sanitized spelling before this codec has encoded anything.
  */
-const CONTROL_VENDOR_NAMES: Readonly<Record<string, string>> = Object.fromEntries(
-  Object.values(CONTROL_TOOL_NAMES).map((name) => [sanitizeToolName(name), name]),
-);
+const CONTROL_VENDOR_NAMES: Readonly<Record<string, string>> = Object.fromEntries([
+  ...Object.values(CONTROL_TOOL_NAMES).map((name) => [sanitizeToolName(name), name]),
+  // Pre-rename spellings a resumed conversation may still carry.
+  ...Object.entries(LEGACY_TOOL_NAMES).map(([legacy, current]) => [sanitizeToolName(legacy), current]),
+]);
 
 /**
  * Translates tool names between Vanguard's internal spelling and one provider's.

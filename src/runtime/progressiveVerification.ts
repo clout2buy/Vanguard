@@ -351,7 +351,7 @@ export function delimiterBalance(source: string): { ok: boolean; detail: string 
  * the kernel's completion policy still requires the sealed verifier.
  */
 export class SyntaxCheckTool implements ToolPort {
-  readonly name = "verify.syntax";
+  readonly name = "verify_syntax";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Cheaply check whether a file you just wrote is structurally valid (parse/delimiter check) before running an expensive build. Reports the language support tier. Passing here does not replace the sealed verifier.",

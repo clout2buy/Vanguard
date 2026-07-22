@@ -652,7 +652,7 @@ function deriveTrajectory(events) {
       const serialized = asciiLowercase(JSON.stringify(event.data));
       const output = isObject(data.output) ? data.output : {};
       const failedToolName = typeof data.tool === "string" ? data.tool : pendingToolNames[0];
-      const localTest = (failedToolName === "process.run" || failedToolName === "project.check")
+      const localTest = (failedToolName === "run_command" || failedToolName === "check_project")
         && typeof output.exitCode === "number";
       const harness = localTest && (
         serialized.includes("syntaxerror") && serialized.includes("[eval")

@@ -14,7 +14,7 @@ import { WorkspaceBoundary } from "./workspace.js";
  * "who calls this?" becomes one exact answer instead of a dozen text
  * searches whose hits still need reading. Repos without a resolvable
  * `typescript` module or tsconfig degrade to an honest refusal that points
- * the model back at workspace.search.
+ * the model back at grep.
  */
 
 const MAX_PROJECT_FILES = 4_000;
@@ -37,10 +37,10 @@ interface TsForIntel {
 }
 
 export class CodeIntelTool implements ToolPort {
-  readonly name = "code.intel";
+  readonly name = "code_intel";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Symbol-aware navigation via the project's own TypeScript compiler: exact definition sites, every reference (callers included), or hover type info for a named symbol. Far more precise than workspace.search for 'who calls this' and 'where is this defined' questions in TypeScript/JavaScript projects.",
+    description: "Symbol-aware navigation via the project's own TypeScript compiler: exact definition sites, every reference (callers included), or hover type info for a named symbol. Far more precise than grep for 'who calls this' and 'where is this defined' questions in TypeScript/JavaScript projects.",
     inputSchema: {
       type: "object",
       properties: {
@@ -79,7 +79,7 @@ export class CodeIntelTool implements ToolPort {
     if (runtime === null) {
       return {
         ok: false,
-        output: { error: "Code intelligence needs a resolvable `typescript` module and a tsconfig in this workspace; use workspace.search instead." },
+        output: { error: "Code intelligence needs a resolvable `typescript` module and a tsconfig in this workspace; use grep instead." },
       };
     }
     const absolute = await this.workspace.existing(relativePath);

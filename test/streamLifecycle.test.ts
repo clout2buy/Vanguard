@@ -151,7 +151,7 @@ test("clean EOF cannot finalize complete-looking Chat Completions text or tool c
     '{"choices":[{"delta":{"content":"Looks complete."}}]}',
     '{"choices":[{"finish_reason":"stop","delta":{}}]}',
   ], [
-    '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"workspace_read","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}',
+    '{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.ts\\"}"}}]}}]}',
     '{"choices":[{"finish_reason":"tool_calls","delta":{}}]}',
   ]];
 
@@ -178,7 +178,7 @@ test("clean EOF cannot finalize complete-looking Anthropic text or tool calls", 
     '{"type":"content_block_stop","index":0}',
     '{"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
   ], [
-    '{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"workspace.read","input":{}}}',
+    '{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-1","name":"read_file","input":{}}}',
     '{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"a.ts\\"}"}}',
     '{"type":"content_block_stop","index":0}',
     '{"type":"message_delta","delta":{"stop_reason":"tool_use"}}',
@@ -290,7 +290,7 @@ test("malformed Anthropic streamed tool input retries exactly to the adapter bou
         JSON.stringify({
           type: "content_block_start",
           index: 0,
-          content_block: { type: "tool_use", id: "bad-tool", name: "workspace.read", input: {} },
+          content_block: { type: "tool_use", id: "bad-tool", name: "read_file", input: {} },
         }),
         JSON.stringify({
           type: "content_block_delta",

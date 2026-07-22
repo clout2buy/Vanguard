@@ -47,19 +47,19 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
         transcript: WireEntry[];
         tools: Array<{ name: string }>;
       };
-      receivedToolSchemas ||= payload.tools.some((tool) => tool.name === "workspace.replace");
+      receivedToolSchemas ||= payload.tools.some((tool) => tool.name === "edit_file");
       const decisions = payload.transcript.filter((entry) => entry.role === "decision").length;
       observedDecisionCounts.push(decisions);
       let decision: unknown;
       if (decisions === 0) {
-        decision = { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } };
+        decision = { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } };
       } else if (decisions === 1) {
         const observation = lastObservation(payload.transcript) as { output?: { sha256?: string } } | undefined;
         decision = {
           kind: "tool",
           call: {
             id: "patch",
-            name: "workspace.replace",
+            name: "edit_file",
             input: {
               path: "answer.mjs",
               expectedSha256: observation?.output?.sha256,
@@ -71,7 +71,7 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
       } else if (decisions === 2) {
         decision = {
           kind: "tool",
-          call: { id: "test", name: "process.run", input: { command: process.execPath, args: ["test.mjs"] } },
+          call: { id: "test", name: "run_command", input: { command: process.execPath, args: ["test.mjs"] } },
         };
       } else {
         decision = { kind: "complete", answer: "Corrected answer.mjs and verified test.mjs." };

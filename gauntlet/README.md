@@ -57,7 +57,7 @@ Provider transport, authentication, and protocol/adapter failures are classified
 
 Schema v5 adds pre-mutation scope enforcement and distinguishes productive local test failures from malformed test-harness failures. Case graders accept semantically useful error wording rather than requiring one arbitrary phrase.
 
-Schema v6 requires `workspace.changes` review after the final mutation and exposes large patch expansion before completion. Plugin-lifecycle v3 adds prototype-safe status-key behavior.
+Schema v6 requires `review_changes` review after the final mutation and exposes large patch expansion before completion. Plugin-lifecycle v3 adds prototype-safe status-key behavior.
 
 Schema v7 adds durable context-compaction counts, the long-horizon Ward mod track, fixed trusted project checks across every case, provider/capability outcome separation, and per-case raw-process exposure. Semantically equivalent useful errors are accepted; wording-only grader failures invalidate the benchmark result and require a corrected rerun.
 

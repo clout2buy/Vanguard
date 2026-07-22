@@ -65,7 +65,7 @@ All operations use the request envelope above.
 cancel a two-hour coding run. Public events are pushed after the response:
 
 ```json
-{"type":"event","protocolVersion":1,"sessionId":"vanguard-session-...","cursor":12,"event":{"type":"tool.completed","agentId":"main","title":"workspace.read","status":"passed"}}
+{"type":"event","protocolVersion":1,"sessionId":"vanguard-session-...","cursor":12,"event":{"type":"tool.completed","agentId":"main","title":"read_file","status":"passed"}}
 ```
 
 Cursor order is exact per session. Replay is bounded by both count (4,096
@@ -148,7 +148,7 @@ close alone cannot prove that on all operating systems. The separate
 `sessions.executionTreeFenced` capability is advertised only when a trusted
 custom `VanguardRunnerPort` explicitly attests exact whole-tree closure through
 an OS/container primitive. The built-in `CliVanguardRunner` intentionally does
-not advertise it. Internally, `process.run` refuses pre-aborted launches and
+not advertise it. Internally, `run_command` refuses pre-aborted launches and
 waits for direct-child `close` after bounded TERM/KILL escalation; failure to
 observe close permanently poisons the journaled run as
 containment-uncertain—no later call in the batch, model turn, verifier, or

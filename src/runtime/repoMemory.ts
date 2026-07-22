@@ -109,7 +109,7 @@ export class RepoMemoryStore {
       .slice(0, INJECTED_ENTRIES);
     if (entries.length === 0) return "";
     const lines = entries.map((entry) => `- [${entry.id}] (${entry.kind}) ${entry.fact}`);
-    return "\n\nDurable repository memory (recorded in prior sessions; verify before relying on it, and use memory.note to confirm, refute, or add):\n"
+    return "\n\nDurable repository memory (recorded in prior sessions; verify before relying on it, and use memory_note to confirm, refute, or add):\n"
       + lines.join("\n");
   }
 
@@ -155,7 +155,7 @@ function isMemoryEntry(value: unknown): value is MemoryEntry {
 }
 
 export class RepoMemoryTool implements ToolPort {
-  readonly name = "memory.note";
+  readonly name = "memory_note";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Record, confirm, refute, or forget a durable fact about THIS repository (working commands, conventions, gotchas). Facts persist across sessions; the strongest few are injected into future runs, weak ones are forgotten automatically. Record only what future sessions cannot cheaply re-derive.",

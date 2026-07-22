@@ -111,20 +111,20 @@ lines.on('line', line => {
       const decision = decisions === 0
         ? { kind: "tool", call: { id: "mcp", name: "mcp_fixture.echo", input: { text: "hello" } } }
         : decisions === 1
-          ? { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } }
+          ? { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } }
           : decisions === 2
             ? {
                 kind: "tool",
                 call: {
                   id: "edit",
-                  name: "workspace.replace",
+                  name: "edit_file",
                   input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
                 },
               }
             : decisions === 3
-              ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
+              ? { kind: "tool", call: { id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } } }
               : decisions === 4
-                ? { kind: "tool", call: { id: "review", name: "workspace.changes", input: {} } }
+                ? { kind: "tool", call: { id: "review", name: "review_changes", input: {} } }
                 : { kind: "complete", answer: "Fixed with MCP assistance." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));
@@ -184,20 +184,20 @@ test("workspace skills are advertised to contracted runs", async () => {
         output?: { sha256?: string };
       } | undefined;
       const decision = decisions === 0
-        ? { kind: "tool", call: { id: "read", name: "workspace.read", input: { path: "answer.mjs" } } }
+        ? { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } }
         : decisions === 1
           ? {
               kind: "tool",
               call: {
                 id: "edit",
-                name: "workspace.replace",
+                name: "edit_file",
                 input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
               },
             }
           : decisions === 2
-            ? { kind: "tool", call: { id: "test", name: "process.run", input: { command: "node", args: ["test.mjs"] } } }
+            ? { kind: "tool", call: { id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } } }
             : decisions === 3
-              ? { kind: "tool", call: { id: "review", name: "workspace.changes", input: {} } }
+              ? { kind: "tool", call: { id: "review", name: "review_changes", input: {} } }
               : { kind: "complete", answer: "Applied the demo skill." };
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(decision));

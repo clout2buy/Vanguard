@@ -29,7 +29,7 @@ test("conversation replies settle back to ready instead of spinning forever", ()
 });
 
 test("tool lifecycle tracks concurrent calls and clears the last completed tool", () => {
-  const base = { agentId: "main", title: "workspace.read" } as const;
+  const base = { agentId: "main", title: "read_file" } as const;
   const oneRemaining = inspectTuiLifecycleForTest([
     { ...base, type: "tool.started", status: "pending" },
     { ...base, type: "tool.started", status: "pending" },
@@ -130,7 +130,7 @@ test("the footer carries the live status contract: phase, budget, model", () => 
 
 test("a pending tool owns the status row with its own elapsed clock", () => {
   const [status] = renderFooterForTest("tooling", 100).map(plain);
-  assert.match(status!, /project\.check/);
+  assert.match(status!, /check_project/);
   assert.match(status!, /trusted project verification/);
   assert.match(status!, /00:1[0-9]/, "the tool's own runtime shows, so long calls read as work, not a freeze");
 });
@@ -145,14 +145,14 @@ test("footer rows never exceed the terminal width, even at the minimum size", ()
 
 test("the transcript prints tool cards, chat, and verifier results", () => {
   const events: PublicRunEvent[] = [
-    { type: "tool.started", agentId: "main", title: "workspace.read", status: "pending", detail: "src/main.ts", turn: 6 },
-    { type: "tool.completed", agentId: "main", title: "workspace.read", status: "passed", detail: "src/main.ts" },
+    { type: "tool.started", agentId: "main", title: "read_file", status: "pending", detail: "src/main.ts", turn: 6 },
+    { type: "tool.completed", agentId: "main", title: "read_file", status: "passed", detail: "src/main.ts" },
     { type: "agent.message", agentId: "main", title: "Agent", status: "info", message: "The implementation is ready for a full trusted build.", turn: 7 },
     { type: "verification.completed", agentId: "main", title: "workspace integrity", status: "passed" },
     { type: "run.completed", agentId: "main", title: "Run completed", status: "passed" },
   ];
   const rendered = plain(renderTranscriptForTest(events, 96));
-  assert.match(rendered, /✓ workspace\.read src\/main\.ts/);
+  assert.match(rendered, /✓ read_file src\/main\.ts/);
   assert.match(rendered, /◆ Vanguard {2}The implementation is ready/);
   assert.match(rendered, /◈ workspace integrity — passed/);
   assert.match(rendered, /◈ VERIFIED ◈ 1 tools · 0 files/);
@@ -160,18 +160,18 @@ test("the transcript prints tool cards, chat, and verifier results", () => {
 
 test("a failed tool card carries its reason into the transcript", () => {
   const rendered = plain(renderTranscriptForTest([
-    { type: "tool.started", agentId: "main", title: "process.run", status: "pending", detail: "npm run build" },
-    { type: "tool.failed", agentId: "main", title: "process.run", status: "failed", detail: "exit 1 · src/main.js:42: Unexpected token" },
+    { type: "tool.started", agentId: "main", title: "run_command", status: "pending", detail: "npm run build" },
+    { type: "tool.failed", agentId: "main", title: "run_command", status: "failed", detail: "exit 1 · src/main.js:42: Unexpected token" },
   ], 96));
-  assert.match(rendered, /× process\.run/);
+  assert.match(rendered, /× run_command/);
   assert.match(rendered, /exit 1 · src\/main\.js:42: Unexpected token/, "the actual compiler error must be visible, not just 'exit 1'");
 });
 
 test("delegate work is attributed, not anonymous", () => {
   const rendered = plain(renderTranscriptForTest([
-    { type: "tool.completed", agentId: "scout-1", title: "workspace.search", status: "passed", detail: "texture loader" },
+    { type: "tool.completed", agentId: "scout-1", title: "grep", status: "passed", detail: "texture loader" },
   ], 96));
-  assert.match(rendered, /✓ scout-1 workspace\.search/);
+  assert.match(rendered, /✓ scout-1 grep/);
 });
 
 test("an identical agent message prints exactly once", () => {

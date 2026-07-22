@@ -76,7 +76,7 @@ sessions onto that loop's route claims. See
 ## Environment health
 
 Run `vanguard doctor` (or ship it in your agent's setup flow) to check
-provider credentials, the headless browser behind `artifact.render`, and the
+provider credentials, the headless browser behind `render_artifact`, and the
 per-language syntax rungs before a session ever starts. Degraded rungs reduce
 evidence quality, not correctness; missing credentials block runs.
 

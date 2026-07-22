@@ -148,15 +148,15 @@ test("a repeated deterministic failure requires replanning before another action
 test("execution containment uncertainty permanently poisons the run and survives resume", async () => {
   let unsafeFollowupCalls = 0;
   const uncertainExecution: ToolPort = {
-    name: "process.run",
-    definition: { ...toolDefinition("process.run"), effect: "execute" },
+    name: "run_command",
+    definition: { ...toolDefinition("run_command"), effect: "execute" },
     async execute() {
       return { ok: false, output: { error: "close not proven", containmentUncertain: true } };
     },
   };
   const unsafeFollowup: ToolPort = {
-    name: "workspace.write",
-    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    name: "write_file",
+    definition: { ...toolDefinition("write_file"), effect: "mutate" },
     async execute() {
       unsafeFollowupCalls += 1;
       return { ok: true, output: "mutated" };
@@ -167,8 +167,8 @@ test("execution containment uncertainty permanently poisons the run and survives
     model: new ScriptedModel([{
       kind: "tools",
       calls: [
-        { id: "uncertain", name: "process.run", input: {} },
-        { id: "must-not-run", name: "workspace.write", input: { path: "unsafe" } },
+        { id: "uncertain", name: "run_command", input: {} },
+        { id: "must-not-run", name: "write_file", input: { path: "unsafe" } },
       ],
     }]),
     tools: [uncertainExecution, unsafeFollowup],
@@ -264,8 +264,8 @@ test("executes a successful tool action and completes", async () => {
 test("rejects a top-level historical elision marker before tool dispatch", async () => {
   let executions = 0;
   const tool: ToolPort = {
-    name: "plan.update",
-    definition: toolDefinition("plan.update"),
+    name: "update_plan",
+    definition: toolDefinition("update_plan"),
     async execute() {
       executions += 1;
       return { ok: true, output: "must not execute" };
@@ -278,7 +278,7 @@ test("rejects a top-level historical elision marker before tool dispatch", async
         kind: "tools",
         calls: [{
           id: "copied-history",
-          name: "plan.update",
+          name: "update_plan",
           input: {
             vanguardElided: true,
             bytes: 42,
@@ -684,8 +684,8 @@ test("kernel injects runtime-owned checkpoint state independently of transcript 
 test("successful observation stagnation detects reordered and reshaped batches before step exhaustion", async () => {
   let reads = 0;
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute(input) {
       reads += 1;
       const target = (input as { path: string }).path;
@@ -694,7 +694,7 @@ test("successful observation stagnation detects reordered and reshaped batches b
   };
   const batch = (...paths: string[]): ModelDecision => ({
     kind: "tools",
-    calls: paths.map((path, index) => ({ id: `${path}-${index}`, name: "workspace.read", input: { path } })),
+    calls: paths.map((path, index) => ({ id: `${path}-${index}`, name: "read_file", input: { path } })),
   });
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
@@ -731,13 +731,13 @@ test("successful observation stagnation detects reordered and reshaped batches b
 
 test("distinct large-repository reconnaissance never consumes the observation stagnation budget", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute(input) { return { ok: true, output: input }; },
   };
   const decisions: ModelDecision[] = Array.from({ length: 24 }, (_, index) => ({
     kind: "tools",
-    calls: [{ id: `read-${index}`, name: "workspace.read", input: { path: `src/module-${index}.ts` } }],
+    calls: [{ id: `read-${index}`, name: "read_file", input: { path: `src/module-${index}.ts` } }],
   }));
   decisions.push({ kind: "complete", answer: "survey complete" });
   const journal = new MemoryJournal();
@@ -760,13 +760,13 @@ test("distinct large-repository reconnaissance never consumes the observation st
 
 test("observation stagnation survives resume, compaction, and runtime re-grounding notes", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute() { return { ok: true, output: "unchanged" }; },
   };
   const repeated: ModelDecision = {
     kind: "tools",
-    calls: [{ id: "same", name: "workspace.read", input: { path: "src/index.ts" } }],
+    calls: [{ id: "same", name: "read_file", input: { path: "src/index.ts" } }],
   };
   const firstJournal = new MemoryJournal();
   const first = new AgentKernel({
@@ -817,13 +817,13 @@ test("observation stagnation survives resume, compaction, and runtime re-groundi
 
 test("resume repairs an interrupted soft observation-stagnation transition before provider use", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute() { return { ok: true, output: "unchanged" }; },
   };
   const repeated = (id: string): ModelDecision => ({
     kind: "tools",
-    calls: [{ id, name: "workspace.read", input: { path: "src/index.ts" } }],
+    calls: [{ id, name: "read_file", input: { path: "src/index.ts" } }],
   });
   const originalJournal = new MemoryJournal();
   const original = new AgentKernel({
@@ -881,13 +881,13 @@ test("resume repairs an interrupted soft observation-stagnation transition befor
 
 test("resume cannot escape a hard observation-stagnation bound through a completion claim", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute() { return { ok: true, output: "unchanged" }; },
   };
   const repeated = (id: string): ModelDecision => ({
     kind: "tools",
-    calls: [{ id, name: "workspace.read", input: { path: "src/index.ts" } }],
+    calls: [{ id, name: "read_file", input: { path: "src/index.ts" } }],
   });
   const originalJournal = new MemoryJournal();
   const original = new AgentKernel({
@@ -926,8 +926,8 @@ test("resume cannot escape a hard observation-stagnation bound through a complet
 
 test("only one failed-verifier recovery epoch refreshes repeated observation evidence", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute() { return { ok: true, output: "same source" }; },
   };
   let verifierAttempts = 0;
@@ -940,7 +940,7 @@ test("only one failed-verifier recovery epoch refreshes repeated observation evi
   };
   const repeated = (id: string): ModelDecision => ({
     kind: "tools",
-    calls: [{ id, name: "workspace.read", input: { path: "src/index.ts" } }],
+    calls: [{ id, name: "read_file", input: { path: "src/index.ts" } }],
   });
   const kernel = new AgentKernel({
     model: new ScriptedModel([
@@ -967,13 +967,13 @@ test("only one failed-verifier recovery epoch refreshes repeated observation evi
 
 test("a new user message resets durable observation stagnation state", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute() { return { ok: true, output: "unchanged" }; },
   };
   const repeated = (id: string): ModelDecision => ({
     kind: "tools",
-    calls: [{ id, name: "workspace.read", input: { path: "README.md" } }],
+    calls: [{ id, name: "read_file", input: { path: "README.md" } }],
   });
   const firstJournal = new MemoryJournal();
   const options = {
@@ -1011,23 +1011,23 @@ test("a new user message resets durable observation stagnation state", async () 
 
 test("successful non-observe progress opens a fresh observation epoch", async () => {
   const read: ToolPort = {
-    name: "workspace.read",
-    definition: { ...toolDefinition("workspace.read"), effect: "observe" },
+    name: "read_file",
+    definition: { ...toolDefinition("read_file"), effect: "observe" },
     async execute() { return { ok: true, output: "unchanged" }; },
   };
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "independent check passed" }; },
   };
   const repeated = (id: string): ModelDecision => ({
     kind: "tools",
-    calls: [{ id, name: "workspace.read", input: { path: "README.md" } }],
+    calls: [{ id, name: "read_file", input: { path: "README.md" } }],
   });
   const kernel = new AgentKernel({
     model: new ScriptedModel([
       repeated("one"), repeated("two"),
-      { kind: "tools", calls: [{ id: "check", name: "project.check", input: {} }] },
+      { kind: "tools", calls: [{ id: "check", name: "check_project", input: {} }] },
       repeated("three"), repeated("four"),
       { kind: "complete", answer: "done" },
     ]),
@@ -1114,12 +1114,12 @@ test("kernel closes an orphaned tool call with interruption evidence on resume",
     },
   ];
   const model = new CapturingModel([
-    { kind: "tools", calls: [{ id: "check", name: "project.check", input: {} }] },
+    { kind: "tools", calls: [{ id: "check", name: "check_project", input: {} }] },
     { kind: "complete", answer: "recovered" },
   ]);
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "checked uncertain state" }; },
   };
   const kernel = new AgentKernel({
@@ -1138,31 +1138,31 @@ test("an execute tool that changes reviewable files cannot satisfy its own post-
   let checks = 0;
   let reviews = 0;
   const mutatingProcess: ToolPort = {
-    name: "process.run",
-    definition: { ...toolDefinition("process.run"), effect: "execute" },
+    name: "run_command",
+    definition: { ...toolDefinition("run_command"), effect: "execute" },
     async execute() {
       fingerprint = "after";
       return { ok: true, output: { exitCode: 0 } };
     },
   };
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { checks += 1; return { ok: true, output: { exitCode: 0 } }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes",
-    definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes",
+    definition: trustedReviewDefinition("review_changes"),
     async execute() { reviews += 1; return { ok: true, output: { changedFiles: ["changed.txt"] } }; },
   };
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
-      { kind: "tools", calls: [{ id: "process", name: "process.run", input: {} }] },
+      { kind: "tools", calls: [{ id: "process", name: "run_command", input: {} }] },
       { kind: "complete", answer: "premature" },
       { kind: "tools", calls: [
-        { id: "check", name: "project.check", input: {} },
-        { id: "review", name: "workspace.changes", input: {} },
+        { id: "check", name: "check_project", input: {} },
+        { id: "review", name: "review_changes", input: {} },
       ] },
       { kind: "complete", answer: "fresh" },
     ]),
@@ -1186,18 +1186,18 @@ test("an interrupted mutate call opens a fresh workspace epoch and re-arms check
   let checks = 0;
   let reviews = 0;
   const write: ToolPort = {
-    name: "workspace.write",
-    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    name: "write_file",
+    definition: { ...toolDefinition("write_file"), effect: "mutate" },
     async execute() { writes += 1; return { ok: true, output: "must not replay" }; },
   };
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { checks += 1; return { ok: true, output: "passed" }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes",
-    definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes",
+    definition: trustedReviewDefinition("review_changes"),
     async execute() { reviews += 1; return { ok: true, output: "reviewed" }; },
   };
   const prior = [
@@ -1205,7 +1205,7 @@ test("an interrupted mutate call opens a fresh workspace epoch and re-arms check
     {
       sequence: 2,
       type: "model.decided" as const,
-      data: { kind: "tools", calls: [{ id: "orphan-write", name: "workspace.write", input: { path: "a.ts" } }] },
+      data: { kind: "tools", calls: [{ id: "orphan-write", name: "write_file", input: { path: "a.ts" } }] },
     },
   ];
   const journal = new MemoryJournal();
@@ -1213,8 +1213,8 @@ test("an interrupted mutate call opens a fresh workspace epoch and re-arms check
     model: new ScriptedModel([
       { kind: "complete", answer: "premature" },
       { kind: "tools", calls: [
-        { id: "check", name: "project.check", input: {} },
-        { id: "review", name: "workspace.changes", input: {} },
+        { id: "check", name: "check_project", input: {} },
+        { id: "review", name: "review_changes", input: {} },
       ] },
       { kind: "complete", answer: "recovered" },
     ]),
@@ -1237,13 +1237,13 @@ test("a sealed verifier that changes reviewable files cannot complete the run", 
   let fingerprint = "before";
   let verifierCalls = 0;
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "passed" }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes",
-    definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes",
+    definition: trustedReviewDefinition("review_changes"),
     async execute() { return { ok: true, output: "reviewed" }; },
   };
   const journal = new MemoryJournal();
@@ -1251,8 +1251,8 @@ test("a sealed verifier that changes reviewable files cannot complete the run", 
     model: new ScriptedModel([
       { kind: "complete", answer: "verifier-mutated" },
       { kind: "tools", calls: [
-        { id: "check", name: "project.check", input: {} },
-        { id: "review", name: "workspace.changes", input: {} },
+        { id: "check", name: "check_project", input: {} },
+        { id: "review", name: "review_changes", input: {} },
       ] },
       { kind: "complete", answer: "stable" },
     ]),
@@ -1278,19 +1278,19 @@ test("a sealed verifier that changes reviewable files cannot complete the run", 
 
 test("replay cannot clear a changed batch's gates from suppressed execute and review observations", async () => {
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "fresh check" }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes",
-    definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes",
+    definition: trustedReviewDefinition("review_changes"),
     async execute() { return { ok: true, output: "fresh review" }; },
   };
   const calls = [
-    { id: "process", name: "process.run", input: {} },
-    { id: "old-check", name: "project.check", input: {} },
-    { id: "old-review", name: "workspace.changes", input: {} },
+    { id: "process", name: "run_command", input: {} },
+    { id: "old-check", name: "check_project", input: {} },
+    { id: "old-review", name: "review_changes", input: {} },
   ];
   const prior = [
     { sequence: 1, type: "run.started" as const, data: { task: "resume changed batch" } },
@@ -1298,17 +1298,17 @@ test("replay cannot clear a changed batch's gates from suppressed execute and re
     { sequence: 3, type: "model.decided" as const, data: { kind: "tools", calls } },
     { sequence: 4, type: "workspace.changed" as const, data: { cause: "tool-batch", workspaceGeneration: 1 } },
     { sequence: 5, type: "workspace.observed" as const, data: { fingerprint: "after", workspaceGeneration: 1 } },
-    { sequence: 6, type: "tool.completed" as const, data: { callId: "process", tool: "process.run", ok: true, workspaceGeneration: 1 } },
-    { sequence: 7, type: "tool.completed" as const, data: { callId: "old-check", tool: "project.check", ok: true, workspaceGeneration: 1 } },
-    { sequence: 8, type: "tool.completed" as const, data: { callId: "old-review", tool: "workspace.changes", ok: true, workspaceGeneration: 1 } },
+    { sequence: 6, type: "tool.completed" as const, data: { callId: "process", tool: "run_command", ok: true, workspaceGeneration: 1 } },
+    { sequence: 7, type: "tool.completed" as const, data: { callId: "old-check", tool: "check_project", ok: true, workspaceGeneration: 1 } },
+    { sequence: 8, type: "tool.completed" as const, data: { callId: "old-review", tool: "review_changes", ok: true, workspaceGeneration: 1 } },
   ];
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new ScriptedModel([
       { kind: "complete", answer: "stale replay must fail" },
       { kind: "tools", calls: [
-        { id: "fresh-check", name: "project.check", input: {} },
-        { id: "fresh-review", name: "workspace.changes", input: {} },
+        { id: "fresh-check", name: "check_project", input: {} },
+        { id: "fresh-review", name: "review_changes", input: {} },
       ] },
       { kind: "complete", answer: "fresh evidence" },
     ]),
@@ -1334,11 +1334,11 @@ test("an observe-labelled tool is still monitored for workspace mutations", asyn
     },
   };
   const check: ToolPort = {
-    name: "project.check", definition: trustedExecutionDefinition("project.check"),
+    name: "check_project", definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "checked" }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes", definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes", definition: trustedReviewDefinition("review_changes"),
     async execute() { return { ok: true, output: "reviewed" }; },
   };
   const journal = new MemoryJournal();
@@ -1347,8 +1347,8 @@ test("an observe-labelled tool is still monitored for workspace mutations", asyn
       { kind: "tools", calls: [{ id: "observe", name: "extension.inspect", input: {} }] },
       { kind: "complete", answer: "premature" },
       { kind: "tools", calls: [
-        { id: "check", name: "project.check", input: {} },
-        { id: "review", name: "workspace.changes", input: {} },
+        { id: "check", name: "check_project", input: {} },
+        { id: "review", name: "review_changes", input: {} },
       ] },
       { kind: "complete", answer: "safe" },
     ]),
@@ -1376,19 +1376,19 @@ test("workspace drift during inference invalidates previously current evidence",
       if (decision === 2) return {
         kind: "tools",
         calls: [
-          { id: "check", name: "project.check", input: {} },
-          { id: "review", name: "workspace.changes", input: {} },
+          { id: "check", name: "check_project", input: {} },
+          { id: "review", name: "review_changes", input: {} },
         ],
       };
       return { kind: "complete", answer: "current" };
     },
   };
   const check: ToolPort = {
-    name: "project.check", definition: trustedExecutionDefinition("project.check"),
+    name: "check_project", definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "checked" }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes", definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes", definition: trustedReviewDefinition("review_changes"),
     async execute() { return { ok: true, output: "reviewed" }; },
   };
   const journal = new MemoryJournal();
@@ -1414,11 +1414,11 @@ test("an interrupted sealed verifier opens an uncertain epoch and closes its tra
     { sequence: 4, type: "verification.started" as const, data: { id: "verification:3", fingerprint: "before", workspaceGeneration: 0 } },
   ];
   const check: ToolPort = {
-    name: "project.check", definition: trustedExecutionDefinition("project.check"),
+    name: "check_project", definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: true, output: "checked" }; },
   };
   const review: ToolPort = {
-    name: "workspace.changes", definition: trustedReviewDefinition("workspace.changes"),
+    name: "review_changes", definition: trustedReviewDefinition("review_changes"),
     async execute() { return { ok: true, output: "reviewed" }; },
   };
   const journal = new MemoryJournal();
@@ -1426,8 +1426,8 @@ test("an interrupted sealed verifier opens an uncertain epoch and closes its tra
     model: new ScriptedModel([
       { kind: "complete", answer: "still stale" },
       { kind: "tools", calls: [
-        { id: "check", name: "project.check", input: {} },
-        { id: "review", name: "workspace.changes", input: {} },
+        { id: "check", name: "check_project", input: {} },
+        { id: "review", name: "review_changes", input: {} },
       ] },
       { kind: "complete", answer: "recovered" },
     ]),
@@ -1484,19 +1484,19 @@ test("a model that acts on the narration nudge keeps its run alive", async () =>
 test("edit-check thrash with byte-identical failures is guided at three generations and stopped at five", async () => {
   let revision = 0;
   const writer: ToolPort = {
-    name: "workspace.write",
-    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    name: "write_file",
+    definition: { ...toolDefinition("write_file"), effect: "mutate" },
     async execute() { revision += 1; return { ok: true, output: { written: revision } }; },
   };
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() { return { ok: false, output: { status: "failed", detail: "assertion X is false" } }; },
   };
   const decisions: ModelDecision[] = [];
   for (let cycle = 1; cycle <= 5; cycle += 1) {
-    decisions.push({ kind: "tools", calls: [{ id: `m${cycle}`, name: "workspace.write", input: { path: "src/a.ts", cycle } }] });
-    decisions.push({ kind: "tools", calls: [{ id: `c${cycle}`, name: "project.check", input: {} }] });
+    decisions.push({ kind: "tools", calls: [{ id: `m${cycle}`, name: "write_file", input: { path: "src/a.ts", cycle } }] });
+    decisions.push({ kind: "tools", calls: [{ id: `c${cycle}`, name: "check_project", input: {} }] });
   }
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
@@ -1520,13 +1520,13 @@ test("edit-check thrash with byte-identical failures is guided at three generati
 test("a check whose failure output changes after each edit never trips the thrash guard", async () => {
   let revision = 0;
   const writer: ToolPort = {
-    name: "workspace.write",
-    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    name: "write_file",
+    definition: { ...toolDefinition("write_file"), effect: "mutate" },
     async execute() { revision += 1; return { ok: true, output: { written: revision } }; },
   };
   const check: ToolPort = {
-    name: "project.check",
-    definition: trustedExecutionDefinition("project.check"),
+    name: "check_project",
+    definition: trustedExecutionDefinition("check_project"),
     async execute() {
       // Failures shrink as edits land: real progress, not thrash.
       return revision < 6
@@ -1536,8 +1536,8 @@ test("a check whose failure output changes after each edit never trips the thras
   };
   const decisions: ModelDecision[] = [];
   for (let cycle = 1; cycle <= 6; cycle += 1) {
-    decisions.push({ kind: "tools", calls: [{ id: `m${cycle}`, name: "workspace.write", input: { path: "src/a.ts", cycle } }] });
-    decisions.push({ kind: "tools", calls: [{ id: `c${cycle}`, name: "project.check", input: {} }] });
+    decisions.push({ kind: "tools", calls: [{ id: `m${cycle}`, name: "write_file", input: { path: "src/a.ts", cycle } }] });
+    decisions.push({ kind: "tools", calls: [{ id: `c${cycle}`, name: "check_project", input: {} }] });
   }
   decisions.push({ kind: "complete", answer: "fixed" });
   const kernel = new AgentKernel({

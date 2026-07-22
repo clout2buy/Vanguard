@@ -20,7 +20,7 @@ const REGION_COLUMNS = 8;
 const REGION_ROWS = 6;
 
 export class ImageInspectionTool implements ToolPort {
-  readonly name = "artifact.inspect_image";
+  readonly name = "inspect_image";
   readonly definition: ToolDefinition = {
     name: this.name,
     description: "Decode a workspace BMP or PNG and return model-readable visual evidence: exposure, color diversity, regional occlusion/detail, a luminance map, HUD-like contrast, and an optional pixel comparison.",
@@ -81,7 +81,7 @@ function decodeImage(buffer: Buffer): DecodedImage {
   if (buffer.length >= 2 && buffer.subarray(0, 2).toString("ascii") === "BM") return decodeBmp(buffer);
   const pngSignature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   if (buffer.length >= 8 && buffer.subarray(0, 8).equals(pngSignature)) return decodePng(buffer);
-  throw new Error("Unsupported image format. artifact.inspect_image currently accepts BMP and PNG files.");
+  throw new Error("Unsupported image format. inspect_image currently accepts BMP and PNG files.");
 }
 
 function decodeBmp(buffer: Buffer): DecodedImage {

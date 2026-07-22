@@ -19,16 +19,17 @@ const request: SerializableModelRequest = {
   mode: "execution",
   workingState: null,
   remainingSteps: 10,
-  // Vanguard's real tool names: every one contains a dot.
+  // Extension tools (custom tools, MCP servers) carry dotted namespace.tool
+  // names that no provider accepts on the wire; built-ins are already flat.
   tools: [
-    { name: "workspace.read", description: "read", inputSchema: { type: "object", properties: {} } },
-    { name: "project.check", description: "check", inputSchema: { type: "object", properties: {} } },
+    { name: "read_file", description: "read", inputSchema: { type: "object", properties: {} } },
+    { name: "mcp_docs.search", description: "search docs", inputSchema: { type: "object", properties: {} } },
   ],
   transcript: [
     { role: "task", content: "repair" },
     {
       role: "decision",
-      content: { kind: "tool", call: { id: "call-1", name: "workspace.read", input: { path: "a.ts" } } },
+      content: { kind: "tool", call: { id: "call-1", name: "mcp_docs.search", input: { query: "cart" } } },
     },
     { role: "observation", content: { ok: true, output: { contents: "code" } } },
   ],
@@ -63,8 +64,8 @@ for (const [vendor, codec] of [
       assert.match(name, VENDOR_TOOL_NAME, `${vendor} sent an unacceptable tool name: ${name}`);
     }
     // The tool definitions and the replayed call must both be translated.
-    assert.ok(names.includes("workspace_read"), `${vendor} must translate workspace.read`);
-    assert.ok(names.includes("project_check"), `${vendor} must translate project.check`);
+    assert.ok(names.includes("read_file"), `${vendor} must pass read_file through unchanged`);
+    assert.ok(names.includes("mcp_docs_search"), `${vendor} must translate mcp_docs.search`);
   });
 }
 
@@ -72,25 +73,38 @@ test("Anthropic tool calls decode back to their internal dotted names", () => {
   const codec = new AnthropicMessagesCodec("claude-opus-4-8");
   codec.encode(request);
   const decision = codec.decode({
-    content: [{ type: "tool_use", id: "call-9", name: "workspace_read", input: { path: "b.ts" } }],
+    content: [{ type: "tool_use", id: "call-9", name: "mcp_docs_search", input: { query: "checkout" } }],
     stop_reason: "tool_use",
   });
   // A vendor name that survived into the kernel would never match a real tool.
   assert.equal(decision.kind, "tools");
   assert.deepEqual(
     decision.kind === "tools" ? decision.calls.map((call) => call.name) : [],
-    ["workspace.read"],
+    ["mcp_docs.search"],
   );
 });
 
 test("a control tool decodes even when the codec has not encoded yet", () => {
   // Providers answer with the sanitized spelling; a fresh codec has no mapping.
   const decision = new AnthropicMessagesCodec("claude-opus-4-8").decode({
-    content: [{ type: "tool_use", id: "c-1", name: "task_complete", input: { summary: "done" } }],
+    content: [{ type: "tool_use", id: "c-1", name: "complete_task", input: { summary: "done" } }],
     stop_reason: "tool_use",
   });
   // Resolved as the control tool it is, not passed through as an unknown call.
   assert.equal(decision.kind, "complete");
+});
+
+test("a pre-rename spelling decodes to the tool it meant", () => {
+  // Sessions journaled before the flat snake_case rename replay old names.
+  const decision = new AnthropicMessagesCodec("claude-opus-4-8").decode({
+    content: [{ type: "tool_use", id: "c-2", name: "workspace_read", input: { path: "a.ts" } }],
+    stop_reason: "tool_use",
+  });
+  assert.equal(decision.kind, "tools");
+  assert.deepEqual(
+    decision.kind === "tools" ? decision.calls.map((call) => call.name) : [],
+    ["read_file"],
+  );
 });
 
 test("the translator refuses a collision instead of misrouting a call", () => {
@@ -115,5 +129,5 @@ test("each provider's documented length limit is enforced", () => {
 test("an unmapped name passes through rather than being dropped", () => {
   const translator = new ToolNameTranslator(ANTHROPIC_TOOL_NAMING);
   assert.equal(translator.toInternal("something_unknown"), "something_unknown");
-  assert.equal(sanitizeToolName("workspace.read"), "workspace_read");
+  assert.equal(sanitizeToolName("read_file"), "read_file");
 });

@@ -83,7 +83,7 @@ test("degeneration detector never blames repetition that already existed", () =>
   assert.equal(found.line, "// TODO fix this later");
 });
 
-test("workspace.write rejects degenerated contents and honors allowRepetition", async () => {
+test("write_file rejects degenerated contents and honors allowRepetition", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-degen-"));
   try {
     const workspace = new WorkspaceBoundary(root);
@@ -108,7 +108,7 @@ test("workspace.write rejects degenerated contents and honors allowRepetition", 
   }
 });
 
-test("workspace.replace rejects a splice that completes a degenerate run", async () => {
+test("edit_file rejects a splice that completes a degenerate run", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-degen-replace-"));
   try {
     const original = `start\n${repeated("// filler comment line", DEGENERATE_RUN_THRESHOLD - 1)}\nMARKER\nend\n`;

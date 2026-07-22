@@ -173,7 +173,7 @@ test("fixed commands tolerate provider noise while keeping command and argv runt
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-fixed-schema-"));
   try {
     const tool = new FixedCommandTool(
-      "project.check",
+      "check_project",
       "Run the runtime-owned check.",
       new ProcessTool(new WorkspaceBoundary(root), { allowedCommands: [process.execPath] }),
       { command: process.execPath, args: ["-e", "process.stdout.write('runtime-owned')"] },

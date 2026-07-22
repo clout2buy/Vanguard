@@ -72,7 +72,7 @@ test("scope enforcement stays inactive for scope-free plans and malformed globs 
 });
 
 const stateToolDefinition = {
-  name: "plan.update",
+  name: "update_plan",
   description: "test plan tool",
   inputSchema: { type: "object" as const },
   effect: "state" as const,
@@ -85,14 +85,14 @@ function kernelWithScopedPlan(decisions: readonly ModelDecision[]): {
 } {
   let writes = 0;
   const planTool: ToolPort = {
-    name: "plan.update",
+    name: "update_plan",
     definition: stateToolDefinition,
     execute: async () => ({ ok: true, output: {} }),
   };
   const writeTool: ToolPort = {
-    name: "workspace.write",
+    name: "write_file",
     definition: {
-      name: "workspace.write",
+      name: "write_file",
       description: "test mutate tool",
       inputSchema: { type: "object" },
       effect: "mutate",
@@ -116,7 +116,7 @@ function kernelWithScopedPlan(decisions: readonly ModelDecision[]): {
 test("the kernel rejects out-of-scope mutations before they execute", async () => {
   const outOfScope = (id: string): ModelDecision => ({
     kind: "tools",
-    calls: [{ id, name: "workspace.write", input: { path: "docs/notes.md", contents: "drift" } }],
+    calls: [{ id, name: "write_file", input: { path: "docs/notes.md", contents: "drift" } }],
   });
   const { kernel, journal, writes } = kernelWithScopedPlan([
     outOfScope("c1"),
@@ -136,7 +136,7 @@ test("the kernel lets in-scope mutations through the scope guard", async () => {
   const { kernel, journal, writes } = kernelWithScopedPlan([
     {
       kind: "tools",
-      calls: [{ id: "c1", name: "workspace.write", input: { path: "src/app.ts", contents: "ok" } }],
+      calls: [{ id: "c1", name: "write_file", input: { path: "src/app.ts", contents: "ok" } }],
     },
     { kind: "respond", message: "narration" },
     { kind: "respond", message: "narration" },
