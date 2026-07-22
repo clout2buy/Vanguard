@@ -18,6 +18,8 @@ import {
   WorkspaceVersionLedger,
   WriteFileTool,
   contentHash,
+  renameWithRetry,
+  validateJsonSchema,
 } from "../src/index.js";
 import { nodePermissionFlag } from "../src/runtime/nodePackageManager.js";
 
@@ -46,6 +48,10 @@ test("file tools write atomically, read, and enumerate workspace files", async (
     assert.equal(writeResult.ok, true);
     assert.equal(await readFile(path.join(root, "src", "answer.txt"), "utf8"), "forty-two");
 
+    const providerWrite = { path: "src/provider.txt", contents: "safe", contents_size: 4 } as const;
+    assert.deepEqual(validateJsonSchema(providerWrite, writer.definition.inputSchema), []);
+    assert.equal((await writer.execute(providerWrite, context)).ok, true);
+
     const readResult = await reader.execute({ path: "src/answer.txt" }, context);
     assert.equal(readResult.ok, true);
     assert.deepEqual(readResult.output, {
@@ -60,7 +66,7 @@ test("file tools write atomically, read, and enumerate workspace files", async (
 
     const listResult = await list.execute({}, context);
     assert.equal(listResult.ok, true);
-    assert.deepEqual(listResult.output, { files: [path.join("src", "answer.txt")] });
+    assert.deepEqual(listResult.output, { files: [path.join("src", "answer.txt"), path.join("src", "provider.txt")] });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -69,7 +75,7 @@ test("file tools write atomically, read, and enumerate workspace files", async (
 test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-pages-"));
   try {
-    const contents = "alpha αβγ\n".repeat(16_000);
+    const contents = "alpha αβγ\n".repeat(50_000);
     await writeFile(path.join(root, "large.txt"), contents);
     const reader = new ReadFileTool(new WorkspaceBoundary(root), 1_000_000);
 
@@ -87,7 +93,7 @@ test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", 
     assert.equal(firstOutput.sha256, contentHash(contents));
     assert.equal(firstOutput.totalBytes, Buffer.byteLength(contents));
     assert.deepEqual(firstOutput.range, { startByte: 0, endByte: Buffer.byteLength(firstOutput.contents) });
-    assert.equal(Buffer.byteLength(firstOutput.contents) <= 64 * 1_024, true);
+    assert.equal(Buffer.byteLength(firstOutput.contents) <= 256 * 1_024, true);
     assert.equal(firstOutput.contents.includes("\ufffd"), false);
     assert.equal(firstOutput.truncated, true);
     assert.equal(typeof firstOutput.nextCursor, "string");
@@ -101,7 +107,7 @@ test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", 
       assert.equal(nextOutput.sha256, firstOutput.sha256);
       assert.equal(nextOutput.totalBytes, firstOutput.totalBytes);
       assert.equal(nextOutput.range.startByte, current.range.endByte);
-      assert.equal(Buffer.byteLength(nextOutput.contents) <= 64 * 1_024, true);
+      assert.equal(Buffer.byteLength(nextOutput.contents) <= 256 * 1_024, true);
       assert.equal(nextOutput.contents.includes("\ufffd"), false);
       pages.push(nextOutput.contents);
       current = nextOutput;
@@ -115,7 +121,7 @@ test("workspace.read returns bounded UTF-8 pages with a stable full-file hash", 
   }
 });
 
-test("workspace.read supports exact byte ranges and rejects ambiguous or unknown input", async () => {
+test("workspace.read supports exact byte ranges and rejects unsafe ambiguous or unknown input", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-read-range-"));
   try {
     await writeFile(path.join(root, "value.txt"), "0123456789");
@@ -158,18 +164,22 @@ test("workspace.read supports exact byte ranges and rejects ambiguous or unknown
       }, context),
       /mutually exclusive/u,
     );
-    await assert.rejects(
-      reader.execute({ path: "value.txt", range: { startByte: 0, endByte: 1 }, maxBytes: 4 }, context),
-      /cannot be combined/u,
-    );
+    const redundantLimit = await reader.execute({
+      path: "value.txt",
+      range: { startByte: 0, endByte: 1 },
+      maxBytes: 4,
+    }, context);
+    assert.equal(redundantLimit.ok, true);
+    assert.equal((redundantLimit.output as { contents: string }).contents, "0");
     await assert.rejects(
       reader.execute({ path: "value.txt", maxBytes: 3 }, context),
-      /from 4 through 131072/u,
+      /from 4 through 1048576/u,
     );
-    await assert.rejects(
-      reader.execute({ path: "unicode.txt", range: { startByte: 0, endByte: 1 } }, context),
-      /UTF-8 character boundaries/u,
-    );
+    const unicode = await reader.execute({ path: "unicode.txt", range: { startByte: 0, endByte: 1 } }, context);
+    assert.equal(unicode.ok, true);
+    assert.equal((unicode.output as { contents: string }).contents.includes("�"), false);
+    assert.equal(Buffer.byteLength((unicode.output as { contents: string }).contents) > 1, true,
+      "a byte estimate inside a multi-byte character expands to that whole character");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -341,6 +351,25 @@ test("process tool enforces its command allowlist", async () => {
   }
 });
 
+test("process tool refuses persistent server commands before they occupy a turn", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-process-server-"));
+  try {
+    const tool = new ProcessTool(new WorkspaceBoundary(root), { allowedCommands: ["cmd", "python", "npm"] });
+    for (const input of [
+      { command: "cmd", args: ["/c", "serve.bat"] },
+      { command: "python", args: ["-m", "http.server", "3000"] },
+      { command: "npm", args: ["run", "dev"] },
+    ]) {
+      const result = await tool.execute(input, context);
+      assert.equal(result.ok, false);
+      assert.match(JSON.stringify(result.output), /Persistent server commands/u);
+      assert.match(JSON.stringify(result.output), /artifact\.render/u);
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("fixed command tool exposes a trusted check without model-controlled arguments", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-fixed-command-"));
   try {
@@ -390,6 +419,15 @@ test("image inspection gives non-vision models regional evidence and pixel compa
     assert.match(evidence, /"changedPixelRatio":/);
     const identical = await tool.execute({ path: "images/first.bmp", comparePath: "images/first.bmp" }, context);
     assert.match(JSON.stringify(identical.output), /"exactPixelMatch":true/);
+    // Models keep passing absolute paths; one inside the workspace resolves.
+    const absolute = await tool.execute({ path: path.join(root, "images", "first.bmp") }, context);
+    assert.equal(absolute.ok, true);
+    assert.match(JSON.stringify(absolute.output), /"format":"bmp"/);
+    // An absolute path outside the workspace stays rejected, clearly.
+    await assert.rejects(
+      tool.execute({ path: path.join(os.tmpdir(), "outside-workspace.bmp") }, context),
+      /outside the workspace/u,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -564,3 +602,24 @@ function createBmp(
   }
   return buffer;
 }
+
+
+test("renameWithRetry survives transient OneDrive-style locks", async () => {
+  let calls = 0;
+  const flaky = async (): Promise<void> => {
+    calls += 1;
+    if (calls < 3) throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+  };
+  await renameWithRetry("a", "b", flaky);
+  assert.equal(calls, 3, "two EPERM locks then a success");
+});
+
+test("renameWithRetry refuses to retry a real failure", async () => {
+  let calls = 0;
+  const missing = async (): Promise<void> => {
+    calls += 1;
+    throw Object.assign(new Error("no such file or directory"), { code: "ENOENT" });
+  };
+  await assert.rejects(() => renameWithRetry("a", "b", missing), /no such file/);
+  assert.equal(calls, 1, "a non-lock code throws immediately");
+});

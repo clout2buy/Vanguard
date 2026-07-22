@@ -78,10 +78,21 @@ export function sanitizedChildEnvironment(environment: NodeJS.ProcessEnv = proce
   return output;
 }
 
+/**
+ * Provider error bodies are kept, but bounded and compacted: the message is
+ * what makes a 400 debuggable ("this model is not supported on a ChatGPT
+ * account"), and total withholding turned every provider rejection into an
+ * unactionable shrug. Secret patterns are scrubbed by the redactor's later
+ * passes over this same text, so the kept snippet carries no credentials.
+ */
 function stripProviderDetail(text: string): string {
   return text.replace(
-    /(Inference endpoint returned HTTP\s+\d+)(?::[\s\S]*)/gi,
-    "$1: [provider detail withheld]",
+    /(Inference endpoint returned HTTP\s+\d+):([\s\S]*)/gi,
+    (_match, head: string, detail: string) => {
+      const compact = detail.replace(/\s+/gu, " ").trim();
+      if (compact.length === 0) return `${head}: [no provider detail]`;
+      return `${head}: ${compact.length <= 240 ? compact : `${compact.slice(0, 239)}…`}`;
+    },
   );
 }
 

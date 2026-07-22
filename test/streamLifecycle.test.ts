@@ -397,3 +397,162 @@ test("the stream presenter flushes the provisional tail before committing and di
     "agent.stream_committed",
   ], "reset must discard buffered text instead of flushing it");
 });
+
+test("an unlabeled SSE body still streams: the Codex backend sends no content-type at all", async () => {
+  // Verified against the live Codex backend: 200, valid SSE, `content-type`
+  // header absent. Demanding the label misrouted the stream into the JSON
+  // parser, which reported valid SSE as "Provider returned malformed JSON."
+  const log = lifecycleLog();
+  const sse = [
+    '{"choices":[{"delta":{"content":"Hi"}}]}',
+    '{"choices":[{"finish_reason":"stop","delta":{}}]}',
+  ].map((event) => `data: ${event}\n\n`).join("") + "data: [DONE]\n\n";
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/codex",
+    codec: new OpenAIChatCompletionsCodec("m"),
+    streamObserver: log.observer,
+    fetchImplementation: (async () => new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(encoder.encode(sse));
+        controller.close();
+      },
+    }), { status: 200 })) as typeof fetch,
+  });
+  const decision = await adapter.decide(baseRequest());
+  assert.equal(decision.kind, "respond");
+  assert.equal(decision.kind === "respond" ? decision.message : "", "Hi");
+  assert.ok(log.events.includes("delta:Hi"), "the unlabeled stream must still render live text");
+});
+
+test("a hollow Codex terminal is assembled from the streamed output items", async () => {
+  // Mirrors the live Codex backend capture: response.completed carries
+  // `output: []`; the items exist only in the output_item events.
+  const log = lifecycleLog();
+  const events = [
+    '{"type":"response.created","response":{"id":"r1","status":"in_progress"}}',
+    '{"type":"response.output_item.added","output_index":0,"item":{"id":"m1","type":"message","role":"assistant","content":[]}}',
+    '{"type":"response.output_text.delta","output_index":0,"delta":"vanguard "}',
+    '{"type":"response.output_text.delta","output_index":0,"delta":"online"}',
+    '{"type":"response.output_text.done","output_index":0,"text":"vanguard online"}',
+    '{"type":"response.output_item.done","output_index":0,"item":{"id":"m1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"vanguard online"}]}}',
+    '{"type":"response.completed","response":{"id":"r1","status":"completed","output":[],"usage":{"input_tokens":9,"output_tokens":2}}}',
+  ];
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/codex",
+    codec: new OpenAIResponsesCodec("gpt-5.6-terra"),
+    streamObserver: log.observer,
+    fetchImplementation: (async () => new Response(
+      events.map((event) => `data: ${event}\n\n`).join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as typeof fetch,
+  });
+  const decision = await adapter.decide(baseRequest());
+  assert.equal(decision.kind, "respond");
+  assert.equal(decision.kind === "respond" ? decision.message : "", "vanguard online");
+  assert.ok(log.events.includes("delta:vanguard "), "text must stream live");
+
+  // Belt and suspenders: even when the done item itself arrives hollow, the
+  // output_text.done text backfills the message.
+  const hollowItem = events.map((event) =>
+    event.replace('"content":[{"type":"output_text","text":"vanguard online"}]', '"content":[]'));
+  const hollowAdapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/codex",
+    codec: new OpenAIResponsesCodec("gpt-5.6-terra"),
+    fetchImplementation: (async () => new Response(
+      hollowItem.map((event) => `data: ${event}\n\n`).join("") + "data: [DONE]\n\n",
+      { status: 200, headers: { "content-type": "text/event-stream" } },
+    )) as typeof fetch,
+  });
+  const hollowDecision = await hollowAdapter.decide(baseRequest());
+  assert.equal(hollowDecision.kind === "respond" ? hollowDecision.message : "", "vanguard online");
+});
+
+test("a stalled SSE stream aborts as a retryable timeout instead of riding out the flat cap", async () => {
+  const log = lifecycleLog();
+  const previous = process.env.VANGUARD_STREAM_STALL_MS;
+  process.env.VANGUARD_STREAM_STALL_MS = "50";
+  try {
+    const adapter = new HttpModelAdapter({
+      endpoint: "http://127.0.0.1:9/stalled",
+      codec: new OpenAIChatCompletionsCodec("m"),
+      streamObserver: log.observer,
+      maxAttempts: 1,
+      retryBaseMs: 1,
+      timeoutMs: 60_000,
+      fetchImplementation: (async () => new Response(
+        // A wedged connection: the stream opens and never delivers a chunk,
+        // so only the inactivity watchdog can end the attempt.
+        new ReadableStream<Uint8Array>({ pull() {} }),
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      )) as typeof fetch,
+    });
+    const failure = await adapter.decide(baseRequest()).then(
+      () => {
+        throw new Error("decide must not succeed on a stalled stream");
+      },
+      (error: unknown) => error,
+    );
+    assert.ok(failure instanceof InferenceError);
+    assert.equal(failure.kind, "timeout");
+    assert.equal(failure.retryable, true);
+    assert.match(failure.message, /stalled/u);
+    assert.deepEqual(log.events, ["started:1", "failed:Inference stream stalled"]);
+  } finally {
+    if (previous === undefined) delete process.env.VANGUARD_STREAM_STALL_MS;
+    else process.env.VANGUARD_STREAM_STALL_MS = previous;
+  }
+});
+
+test("reasoning deltas stream on the thinking channel and never reach visible text", async () => {
+  const log = lifecycleLog();
+  const thinking: string[] = [];
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/thinking",
+    codec: new OpenAIChatCompletionsCodec("kimi-for-coding"),
+    streamObserver: {
+      ...log.observer,
+      thinking: (text) => thinking.push(text),
+    },
+    fetchImplementation: (async () => sseResponse([
+      '{"choices":[{"delta":{"reasoning_content":"planning the rain layer"}}]}',
+      '{"choices":[{"delta":{"reasoning_content":" and the lightning"}}]}',
+      '{"choices":[{"delta":{"content":"Here is the scene."}}]}',
+      '{"choices":[{"finish_reason":"stop","delta":{}}]}',
+    ])) as typeof fetch,
+  });
+  const decision = await adapter.decide(baseRequest());
+  assert.equal(decision.kind, "respond");
+  assert.deepEqual(thinking, ["planning the rain layer", " and the lightning"]);
+  // The visible channel saw only the reply, never the reasoning.
+  assert.deepEqual(log.events.filter((event) => event.startsWith("delta:")), ["delta:Here is the scene."]);
+});
+
+test("the presenter coalesces thinking into agent.thinking and discards the tail at commit", () => {
+  const emitted: PublicRunEvent[] = [];
+  const presenter = createStreamLifecyclePresenter((event) => emitted.push(event), () => {}, 10_000);
+  presenter.started?.(1);
+  presenter.thinking?.("x".repeat(450));
+  presenter.thinking?.("an unflushed fragment");
+  presenter.delta("Visible reply");
+  presenter.committed?.();
+  const types = emitted.map((event) => event.type);
+  assert.deepEqual(types, [
+    "agent.stream_started",
+    "agent.thinking",
+    "agent.delta",
+    "agent.stream_committed",
+  ], "thinking flushes at its size threshold; the leftover fragment dies at commit");
+  assert.equal(emitted[1]?.message, "x".repeat(450));
+  assert.ok(!emitted.some((event) => event.type === "agent.delta" && (event.message ?? "").includes("fragment")),
+    "reasoning must never leak into the visible reply channel");
+});
+
+test("provider usage surfaces a context-size event for the UI gauge", () => {
+  const emitted: PublicRunEvent[] = [];
+  const presenter = createStreamLifecyclePresenter((event) => emitted.push(event), () => {}, 10_000);
+  presenter.usage?.({ prompt_tokens: 24_100, completion_tokens: 512 });
+  presenter.usage?.({ nonsense: true });
+  const gauges = emitted.filter((event) => event.type === "agent.usage");
+  assert.equal(gauges.length, 1, "malformed usage must emit nothing");
+  assert.equal(gauges[0]?.detail, "24100");
+});

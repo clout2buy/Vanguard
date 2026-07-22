@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "A clean-room, verification-first coding agent kernel.",
+  "description": "A clean-room, verification-first coding agent kernel. Closed source: distributed compiled, embedded via its documented engine surface.",
+  "license": "SEE LICENSE IN LICENSE",
   "engines": {
     "node": ">=20.19 <25"
   },
@@ -18,6 +19,8 @@
   },
   "files": [
     "dist/src",
+    "LICENSE",
+    "docs/EMBEDDING.md",
     "docs/ACCEPTANCE.md",
     "docs/ARCHITECTURE.md",
     "docs/ARES_INTEGRATION.md",
@@ -49,13 +52,14 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true }); for (const f of ['.tsbuildinfo', '.tsbuildinfo.declarations']) require('node:fs').rmSync(f, { force: true })\"",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.declarations.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "test": "npm run build && node scripts/run-tests.mjs",
     "test:providers": "npm run build && node --test dist/test/providerConformance.test.js",
     "test:portability": "npm run build && node --test dist/test/portability.test.js",
     "test:pack": "node scripts/package-smoke.mjs",
-    "prepack": "npm run build",
+    "prepack": "npm run clean && npm run build",
     "vanguard": "npm run build && node dist/src/cli.js",
     "certify": "npm run build && node dist/src/evaluation/certificationCli.js"
   },

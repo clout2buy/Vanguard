@@ -108,6 +108,30 @@ export interface TreeSnapshot {
   readonly entries: readonly TreeEntry[];
 }
 
+/**
+ * Snapshot traversal parallelism. The walk is I/O-bound stat/read work; a
+ * bounded pool keeps the syscalls in flight without exhausting descriptors.
+ * The snapshot itself stays deterministic — entries are sorted canonically
+ * after the walk, so completion order never reaches the output.
+ */
+const SNAPSHOT_FS_CONCURRENCY = 16;
+
+/** Run async filesystem operations with bounded parallelism. */
+function createFsLimiter(limit: number): <T>(operation: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiters: (() => void)[] = [];
+  return async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (active >= limit) await new Promise<void>((resolve) => waiters.push(resolve));
+    active += 1;
+    try {
+      return await operation();
+    } finally {
+      active -= 1;
+      waiters.shift()?.();
+    }
+  };
+}
+
 export async function snapshotTree(root: string, options: TreeSnapshotOptions = {}): Promise<TreeSnapshot> {
   const requestedRoot = path.resolve(root);
   const rootMetadata = await lstat(requestedRoot);
@@ -119,17 +143,73 @@ export async function snapshotTree(root: string, options: TreeSnapshotOptions = 
   const cache = options.cache;
   cache?.bindRoot(absoluteRoot);
   const seenFiles = new Set<string>();
-  const queue = [absoluteRoot];
-  while (queue.length > 0) {
-    const directory = queue.shift()!;
-    const children = (await readdir(directory, { withFileTypes: true }))
-      .sort((left, right) => compareText(left.name, right.name));
-    for (const child of children) {
+  const limitFs = createFsLimiter(SNAPSHOT_FS_CONCURRENCY);
+
+  const snapshotFile = async (absolute: string, relative: string, details: { size: number; mtimeMs: number; ctimeMs: number; mode: number }): Promise<void> => {
+    const cached = cache?.lookup(absolute, details);
+    if (cached !== undefined) {
+      seenFiles.add(absolute);
+      entries.push({
+        path: relative,
+        kind: "file",
+        sha256: cached.sha256,
+        size: cached.size,
+        mode: details.mode & 0o777,
+        binary: cached.binary,
+      });
+      return;
+    }
+    let contents: Buffer;
+    try {
+      contents = await limitFs(() => readFile(absolute));
+    } catch (error) {
+      // OS-locked files (registry hives, running executables) are
+      // invisible to the session model; a lock-state change surfaces
+      // as an ordinary tree change once the file becomes readable.
+      if (isLockedError(error)) return;
+      throw error;
+    }
+    seenFiles.add(absolute);
+    const digest = sha256(contents);
+    const binary = contents.subarray(0, 8_192).includes(0);
+    entries.push({
+      path: relative,
+      kind: "file",
+      sha256: digest,
+      size: contents.byteLength,
+      mode: details.mode & 0o777,
+      binary,
+    });
+    // Re-stat after reading: caching the pre-read stat could bless bytes
+    // that changed between lstat and readFile.
+    const settled = await limitFs(() => lstat(absolute)).catch(() => undefined);
+    if (
+      settled !== undefined
+      && settled.isFile()
+      && settled.size === contents.byteLength
+      && settled.mtimeMs === details.mtimeMs
+      && settled.ctimeMs === details.ctimeMs
+    ) {
+      cache?.store(absolute, settled, digest, binary);
+    }
+  };
+
+  const walk = async (directory: string): Promise<void> => {
+    const children = await limitFs(() => readdir(directory, { withFileTypes: true }));
+    const subdirectories: string[] = [];
+    await Promise.all(children.map(async (child) => {
       const absolute = path.join(directory, child.name);
+      // The dirent already knows plain directories; everything else (files,
+      // links, unknown kinds on exotic filesystems) still gets an lstat for
+      // its mode and timestamps.
+      if (child.isDirectory() && !child.isSymbolicLink()) {
+        if (!excludedDirectories.has(child.name)) subdirectories.push(absolute);
+        return;
+      }
       const relative = normalizeRelative(path.relative(absoluteRoot, absolute));
-      const details = await lstat(absolute);
+      const details = await limitFs(() => lstat(absolute));
       if (details.isSymbolicLink()) {
-        const target = await readlink(absolute);
+        const target = await limitFs(() => readlink(absolute));
         entries.push({
           path: relative,
           kind: "symlink",
@@ -140,57 +220,15 @@ export async function snapshotTree(root: string, options: TreeSnapshotOptions = 
           linkTarget: target,
         });
       } else if (details.isDirectory()) {
-        if (!excludedDirectories.has(child.name)) queue.push(absolute);
+        if (!excludedDirectories.has(child.name)) subdirectories.push(absolute);
       } else if (details.isFile()) {
-        const cached = cache?.lookup(absolute, details);
-        if (cached !== undefined) {
-          seenFiles.add(absolute);
-          entries.push({
-            path: relative,
-            kind: "file",
-            sha256: cached.sha256,
-            size: cached.size,
-            mode: details.mode & 0o777,
-            binary: cached.binary,
-          });
-        } else {
-          let contents: Buffer;
-          try {
-            contents = await readFile(absolute);
-          } catch (error) {
-            // OS-locked files (registry hives, running executables) are
-            // invisible to the session model; a lock-state change surfaces
-            // as an ordinary tree change once the file becomes readable.
-            if (isLockedError(error)) continue;
-            throw error;
-          }
-          seenFiles.add(absolute);
-          const digest = sha256(contents);
-          const binary = contents.subarray(0, 8_192).includes(0);
-          entries.push({
-            path: relative,
-            kind: "file",
-            sha256: digest,
-            size: contents.byteLength,
-            mode: details.mode & 0o777,
-            binary,
-          });
-          // Re-stat after reading: caching the pre-read stat could bless bytes
-          // that changed between lstat and readFile.
-          const settled = await lstat(absolute).catch(() => undefined);
-          if (
-            settled !== undefined
-            && settled.isFile()
-            && settled.size === contents.byteLength
-            && settled.mtimeMs === details.mtimeMs
-            && settled.ctimeMs === details.ctimeMs
-          ) {
-            cache?.store(absolute, settled, digest, binary);
-          }
-        }
+        await snapshotFile(absolute, relative, details);
       }
-    }
-  }
+    }));
+    await Promise.all(subdirectories.map((subdirectory) => walk(subdirectory)));
+  };
+
+  await walk(absoluteRoot);
   cache?.retainOnly(seenFiles);
   entries.sort((left, right) => compareText(left.path, right.path));
   const canonical = JSON.stringify(entries);

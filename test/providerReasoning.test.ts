@@ -96,10 +96,19 @@ test("provider profiles validate reasoning against the wire contract", () => {
     reasoning: { effort: "high" },
   }, {}), /valid only for the OpenAI Responses wire contract/u);
 
+  // A thinking budget must stay under the output ceiling. The number has to
+  // exceed the provider's actual default (Anthropic: 64k) to test the rule.
   assert.throws(() => resolveProviderProfile({
     version: VANGUARD_PROVIDER_CONFIG_VERSION,
     provider: "anthropic",
     model: "claude-opus-4-8",
+    reasoning: { thinkingBudgetTokens: 70_000 },
+  }, {}), /smaller than maxOutputTokens/u);
+  assert.throws(() => resolveProviderProfile({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "anthropic",
+    model: "claude-opus-4-8",
+    maxOutputTokens: 16_384,
     reasoning: { thinkingBudgetTokens: 20_000 },
   }, {}), /smaller than maxOutputTokens/u);
 

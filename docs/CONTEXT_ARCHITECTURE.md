@@ -23,9 +23,22 @@ model- or workspace-authored text from becoming the final user authority.
 
 ## Bounded context projection
 
-`StickyContextPolicy` accounts for the complete serialized request tail and
-fails closed with `ContextBudgetExceededError` when the irreducible task,
-latest human correction, and runtime tail cannot fit.
+`StickyContextPolicy` accounts for the complete serialized request tail. When
+the irreducible task, latest human correction, fresh tool exchange, or runtime
+tail cannot fit, the kernel catches `ContextBudgetExceededError` and invokes a
+model-backed overflow delegate instead of ending the run.
+
+- Overflow sources are split into bounded UTF-8 chunks and summarized in
+  isolated, tool-free model calls. Large sets of chunk digests are reduced
+  hierarchically before returning to the main context.
+- Every delegated digest carries the source byte count and SHA-256; the exact
+  source remains in the durable journal. Digests are journaled and reused by
+  source hash on resume instead of being regenerated.
+- A provider context-length rejection (including HTTP 413) is treated as live
+  window discovery: Vanguard lowers the effective request budget, delegates
+  the largest remaining sources, and retries up to a bounded adaptation limit.
+- Very small artificial budgets use a deterministic hash-and-edge synopsis so
+  overflow recovery itself cannot require a request larger than the budget.
 
 - Tool decisions and all corresponding observations form one causal chunk; a
   compaction boundary never creates an orphan tool call.
@@ -34,7 +47,9 @@ latest human correction, and runtime tail cannot fit.
   workspace prose are not promoted into instructions.
 - Omitted history is represented by a bounded cumulative digest. Recent
   verification and human corrections are retained when the budget permits.
-- The newest human message and task anchor are irreducible.
+- The newest human message and task anchor remain exact whenever they fit. An
+  individually oversized source is represented by source-bound verbatim edges
+  plus an adjacent inert delegated digest in the provider projection only.
 - Private provider continuation state, including DeepSeek reasoning content and
   Anthropic thinking/signatures, is replayed only through the provider codec
   path that owns it; public streaming never emits it.

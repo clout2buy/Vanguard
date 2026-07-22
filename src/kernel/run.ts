@@ -34,6 +34,11 @@ import {
 import { compareOrdinal } from "../deterministicText.js";
 import { validateJsonSchema, validateSchemaDefinition } from "../jsonSchema.js";
 import { ContextBudgetExceededError, StickyContextPolicy } from "./stickyContext.js";
+import {
+  ModelContextOverflowDelegate,
+  hasDelegatedSource,
+  type OverflowDelegationRecord,
+} from "./contextOverflow.js";
 import { journalWorkspaceGeneration } from "./evidenceAuthority.js";
 import { logicalRunEvents } from "./logicalHistory.js";
 import { SealedVerificationState, withSealedVerificationState } from "./verificationState.js";
@@ -58,6 +63,28 @@ export interface RunOptions {
   readonly observationStagnationHardLimit: number;
   /** Steps between runtime re-grounding notes during planned execution. */
   readonly regroundIntervalSteps: number;
+  /**
+   * Decision steps between full out-of-band workspace fingerprints. Tool
+   * batches, post-inference, verification, and resume boundaries are always
+   * checked exactly; this interval only paces the redundant pre-decision
+   * check, whose unique coverage window (batch end → next decision) is tiny.
+   * 1 restores the check-every-step behavior.
+   */
+  readonly boundaryFingerprintIntervalSteps: number;
+  /**
+   * What the pre-claim execution-evidence gate accepts after a mutation.
+   *
+   * `independent` — the default: only a real executable check (a project check
+   * or an authorized process run) clears the gate. Correct for a codebase.
+   *
+   * `syntax` — a passing verify.syntax on the mutated file also clears it. For
+   * a deliverable with nothing to execute (a static page, a document), the
+   * independent gate is unsatisfiable: there is no command whose success would
+   * mean anything, so the agent invents throwaway harnesses to appease it and
+   * burns its budget. Syntax is then the strongest evidence that exists, and
+   * the sealed verifier still runs unconditionally either way.
+   */
+  readonly executionEvidence: "independent" | "syntax";
   /** Total attempts for one safe, read-only tool action (initial + retries). */
   readonly maxToolRecoveryAttempts: number;
   /** Total attempts for a provider decision when the adapter has no retry loop. */
@@ -116,6 +143,14 @@ export interface KernelDependencies {
   readonly workingState?: WorkingStatePort;
   /** Detects any reviewable workspace delta caused by tools or verifiers. */
   readonly workspaceState?: WorkspaceStatePort;
+  /**
+   * Runtime-owned parse of a freshly mutated file. When present, every
+   * successful mutation is syntax-checked automatically right after its batch
+   * — no model turn, and the journaled observation satisfies the same gates a
+   * model-called verify.syntax would. The model only re-checks when it needs
+   * a parse before its next decision.
+   */
+  readonly postMutationSyntaxCheck?: (relativePath: string) => Promise<{ ok: boolean; output: JsonValue }>;
   /** Runtime-owned policy text appended to the task when a contract is accepted. */
   readonly taskAddendum?: string;
   /** Live user-message channel enabling mid-run steering and in-process answers. */
@@ -167,6 +202,8 @@ const DEFAULT_OPTIONS: RunOptions = {
   observationStagnationSoftLimit: 3,
   observationStagnationHardLimit: 6,
   regroundIntervalSteps: 12,
+  boundaryFingerprintIntervalSteps: 4,
+  executionEvidence: "independent",
   maxToolRecoveryAttempts: 4,
   maxModelRecoveryAttempts: 4,
   interactive: false,
@@ -197,6 +234,7 @@ const EXECUTE_CONTROL_DEFINITION: ToolDefinition = {
       riskLevel: { type: "string", enum: ["low", "medium", "high"], description: "Overall regression risk of the work." },
       requiredVerification: { type: "array", items: { type: "string" }, description: "Checks that must pass beyond the sealed verifier." },
       deliverables: { type: "array", items: { type: "string" }, description: "Concrete artifacts the user receives." },
+      creativeDirection: { type: "string", description: "Required for user-facing deliverables (pages, UIs, visual or written artifacts): the named concept, visual identity, and attitude the work will commit to, drawn from the user's intent. Generic-but-correct is a failure mode for such work." },
       notes: { type: "string", description: "Optional context from the conversation the execution must honor." },
     },
     required: ["objective", "successCriteria"],
@@ -221,8 +259,10 @@ export class AgentKernel {
   readonly #verifiers: readonly VerifierPort[];
   readonly #journal: JournalPort;
   readonly #contextPolicy: ContextPolicyPort;
+  readonly #contextOverflow: ModelContextOverflowDelegate;
   readonly #workingState: WorkingStatePort | undefined;
   readonly #workspaceState: WorkspaceStatePort | undefined;
+  readonly #postMutationSyntaxCheck: ((relativePath: string) => Promise<{ ok: boolean; output: JsonValue }>) | undefined;
   readonly #hasReviewTool: boolean;
   readonly #hasPlanTool: boolean;
   readonly #taskAddendum: string | undefined;
@@ -232,6 +272,17 @@ export class AgentKernel {
   readonly #recoveryConfiguration: RecoveryConfiguration;
   readonly #options: RunOptions;
   #sequence = 0;
+  /**
+   * Content-addressed results for pure observation tools, keyed by workspace
+   * generation + call fingerprint. A read/search/glob/code-intel call is a
+   * pure function of workspace state, so re-issuing the identical call within
+   * the same generation can return the prior result instantly instead of
+   * re-executing and re-streaming it. A mutation bumps the generation, which
+   * makes every prior key unreachable — the cache can never serve a stale view
+   * of a changed workspace. Only observe-effect tools with no independent
+   * evidence authority are eligible, so process/render/review always run fresh.
+   */
+  readonly #observeCache = new Map<string, JsonValue>();
 
   constructor(dependencies: KernelDependencies) {
     this.#model = dependencies.model;
@@ -239,8 +290,10 @@ export class AgentKernel {
     this.#verifiers = dependencies.verifiers;
     this.#journal = dependencies.journal;
     this.#contextPolicy = dependencies.contextPolicy ?? new StickyContextPolicy();
+    this.#contextOverflow = new ModelContextOverflowDelegate(dependencies.model);
     this.#workingState = dependencies.workingState;
     this.#workspaceState = dependencies.workspaceState;
+    this.#postMutationSyntaxCheck = dependencies.postMutationSyntaxCheck;
     this.#taskAddendum = dependencies.taskAddendum;
     this.#userChannel = dependencies.userChannel;
     this.#plan = dependencies.plan;
@@ -274,9 +327,11 @@ export class AgentKernel {
       || !Number.isSafeInteger(this.#options.observationStagnationSoftLimit)
       || !Number.isSafeInteger(this.#options.observationStagnationHardLimit)
       || !Number.isSafeInteger(this.#options.regroundIntervalSteps)
+      || !Number.isSafeInteger(this.#options.boundaryFingerprintIntervalSteps)
       || !Number.isSafeInteger(this.#options.maxToolRecoveryAttempts)
       || !Number.isSafeInteger(this.#options.maxModelRecoveryAttempts)
       || this.#options.regroundIntervalSteps < 1
+      || this.#options.boundaryFingerprintIntervalSteps < 1
       || this.#options.maxToolRecoveryAttempts < 1
       || this.#options.maxModelRecoveryAttempts < 1
       || this.#options.maxSteps < 1
@@ -322,6 +377,7 @@ export class AgentKernel {
     // branch. Workspace generations remain monotonic over the full audit
     // journal so every restore forces fresh proof.
     const logicalPriorEvents = logicalRunEvents(priorEvents);
+    const overflowDigests = restoredOverflowDigests(logicalPriorEvents);
     const sealedVerification = SealedVerificationState.fromJournal(priorEvents);
     const restored = restoreSession(logicalPriorEvents, this.#tools);
     const transcript = [...restored.transcript];
@@ -342,6 +398,7 @@ export class AgentKernel {
     let workspaceGeneration = journalWorkspaceGeneration(priorEvents) ?? 0;
     let lastWorkspaceFingerprint = restored.lastWorkspaceFingerprint;
     const observationStagnation = restored.observationStagnation;
+    const executionThrash = restored.executionThrash;
     this.#sequence = restored.sequence;
     const recordSealedVerification = async (
       type: "verification.started" | "verification.completed" | "verification.finished",
@@ -350,10 +407,19 @@ export class AgentKernel {
       await this.#record(type, data);
       sealedVerification.observe({ sequence: this.#sequence, type, data });
     };
+    // Retry budgets scale with the step budget: eight transient blips are a
+    // reasonable ceiling for a 50-step run and a death sentence for a
+    // 240-step one, where unrelated provider hiccups hours apart would
+    // otherwise share one small pot. Explicit configuration always wins.
+    const scaledRecovery: RecoveryConfiguration = {
+      maxGlobalRetries: Math.max(8, Math.ceil(this.#options.maxSteps / 15)),
+      maxRetriesPerClass: Math.max(3, Math.ceil(this.#options.maxSteps / 60)),
+      ...this.#recoveryConfiguration,
+    };
     const recovery = new RecoveryController(
       logicalPriorEvents,
       (type, data) => this.#record(type, data),
-      this.#recoveryConfiguration,
+      scaledRecovery,
     );
 
     const emitObservationStagnationGuidance = async (repeatedBatches: number): Promise<void> => {
@@ -525,6 +591,16 @@ export class AgentKernel {
         openVerifierRecoveryEpoch(observationStagnation);
       }
       failedVerificationAttempts += restored.interruptedVerificationIds.length;
+      if (input.userMessage !== undefined) {
+        // This advance carries fresh human input. The completion budgets exist
+        // to stop UNATTENDED claim-thrashing; the human message IS the
+        // escalation they force, so it re-arms them. Without this, a session
+        // that ever exhausted its claims died instantly on every later
+        // instruction while the UI said "keep talking to steer". A bare
+        // resume with no message keeps the fail-closed check below.
+        failedVerificationAttempts = 0;
+        failedCompletionEvidenceAttempts = 0;
+      }
       if (failedVerificationAttempts >= this.#options.maxFailedVerificationAttempts) {
         return this.#fail(
           `Verification failure budget exhausted after ${failedVerificationAttempts} failed or interrupted completion claims.`,
@@ -593,12 +669,22 @@ export class AgentKernel {
     }
 
     const turnStartStep = restored.completedSteps;
+    // The provider's real context ceiling is learned by rejection (see the
+    // overflow adaptation below). Hoisted above the step loop so the learned
+    // floor persists: re-initializing it per step re-pays up to three rejected
+    // round-trips plus three model-driven overflow projections on every step.
+    let effectiveContextBytes = this.#options.maxContextBytes;
     for (let step = restored.completedSteps + 1; step <= this.#options.maxSteps; step += 1) {
       if (signal.aborted) {
         return this.#fail("Run aborted.", step - 1);
       }
 
-      await observeWorkspaceBoundary("decision-boundary");
+      // The pre-decision fingerprint is paced: tool batches, post-inference,
+      // verification, and resume boundaries are all checked exactly, so this
+      // one only needs to cover the tiny batch-end → next-decision window.
+      if ((step - turnStartStep - 1) % this.#options.boundaryFingerprintIntervalSteps === 0) {
+        await observeWorkspaceBoundary("decision-boundary");
+      }
 
       // Steering messages land at decision boundaries: journaled first, so
       // they survive interruption, and never spliced into a tool call.
@@ -607,6 +693,16 @@ export class AgentKernel {
         transcript.push({ role: "user", content: steering });
         consecutiveNarrations = 0;
         resetObservationStagnation(observationStagnation);
+        // Steering can redirect the whole approach; failure streaks from the
+        // pre-steering strategy would punish the new one.
+        executionThrash.streaks.clear();
+        // The completion budgets exist to stop UNATTENDED claim-thrashing. A
+        // human message is the escalation they force, so it re-arms them —
+        // otherwise a session that ever exhausted its claims stays dead to
+        // every later instruction, failing instantly while the UI says
+        // "keep talking to steer".
+        failedVerificationAttempts = 0;
+        failedCompletionEvidenceAttempts = 0;
       }
 
       // Periodic re-grounding pins the contract and the unproven plan state
@@ -632,42 +728,90 @@ export class AgentKernel {
 
       let selectedTranscript: readonly TranscriptEntry[];
       let workingStateSnapshot: JsonValue = null;
+      let modelTask = task;
+      let projectedTranscript: readonly TranscriptEntry[] = transcript;
+      let reservedTail: readonly TranscriptEntry[] = [];
       try {
         const durableWorkingState = mode === "execution" ? this.#workingState?.snapshot() ?? null : null;
-        workingStateSnapshot = mode === "execution"
+        const exactWorkingStateSnapshot = mode === "execution"
           ? withSealedVerificationState(durableWorkingState, sealedVerification.snapshot())
           : null;
-        const reservedTail = workingStateSnapshot === null
+        workingStateSnapshot = exactWorkingStateSnapshot;
+        reservedTail = workingStateSnapshot === null
           ? []
-          : workingStateTailEntries(workingStateSnapshot, transcript);
-        selectedTranscript = this.#contextPolicy.select(
-          task,
-          transcript,
-          this.#options.maxContextBytes,
-          reservedTail,
-        );
+          : workingStateTailEntries(workingStateSnapshot, projectedTranscript);
+        try {
+          selectedTranscript = this.#contextPolicy.select(
+            modelTask,
+            projectedTranscript,
+            effectiveContextBytes,
+            reservedTail,
+          );
+        } catch (error) {
+          if (!(error instanceof ContextBudgetExceededError)) throw error;
+          const projection = await this.#contextOverflow.project({
+            task,
+            transcript,
+            workingState: workingStateSnapshot,
+            maxBytes: effectiveContextBytes,
+            signal,
+            cachedDigests: overflowDigests,
+          });
+          modelTask = projection.task;
+          projectedTranscript = projection.transcript;
+          workingStateSnapshot = projection.workingState;
+          reservedTail = workingStateSnapshot === null
+            ? []
+            : workingStateTailEntries(workingStateSnapshot, projectedTranscript);
+          selectedTranscript = this.#contextPolicy.select(
+            modelTask,
+            projectedTranscript,
+            effectiveContextBytes,
+            reservedTail,
+          );
+          for (const delegation of projection.delegations) {
+            overflowDigests.set(`${delegation.kind}:${delegation.sha256}`, delegation.digest);
+            await this.#recordOverflowDelegation(delegation);
+          }
+        }
         const latestHuman = [...transcript].reverse().find((entry) => entry.role === "user");
-        if (latestHuman !== undefined && !selectedTranscript.includes(latestHuman)) {
+        if (latestHuman !== undefined && !selectedTranscript.includes(latestHuman)
+          && !hasDelegatedSource(selectedTranscript, "latest_user", JSON.stringify(latestHuman.content))) {
           throw new Error("Context policy dropped the exact latest human message.");
         }
         const freshToolExchange = newestUnconsumedToolExchange(transcript);
-        if (freshToolExchange.length > 0 && !containsContiguousEntries(selectedTranscript, freshToolExchange)) {
+        if (freshToolExchange.length > 0 && !containsContiguousEntries(selectedTranscript, freshToolExchange)
+          && !hasDelegatedSource(selectedTranscript, "fresh_tool_exchange", JSON.stringify(freshToolExchange))) {
           throw new Error("Context policy dropped or rewrote the newest unconsumed tool exchange.");
         }
-        const fullContextBytes = Buffer.byteLength(JSON.stringify([...transcript, ...reservedTail]));
+        // Serializing the full transcript every step costs a second full
+        // stringify purely to detect compaction. Skip it when compaction is
+        // implausible -- no overflow projection ran and the selection dropped
+        // no entries -- because the selected view cannot then be smaller, so
+        // no context.compacted event is due.
+        const compactionPlausible = projectedTranscript !== transcript
+          || selectedTranscript.length < transcript.length + reservedTail.length;
         const selectedContextBytes = Buffer.byteLength(JSON.stringify([...selectedTranscript, ...reservedTail]));
-        if (selectedContextBytes > this.#options.maxContextBytes) {
-          throw new ContextBudgetExceededError(selectedContextBytes, this.#options.maxContextBytes);
+        if (selectedContextBytes > effectiveContextBytes) {
+          throw new ContextBudgetExceededError(selectedContextBytes, effectiveContextBytes);
         }
-        if (selectedContextBytes < fullContextBytes) {
-          await this.#record("context.compacted", {
-            operation: "request_projection",
-            durableHistoryChanged: false,
-            fullEntries: transcript.length,
-            selectedEntries: selectedTranscript.length,
-            fullBytes: fullContextBytes,
-            selectedBytes: selectedContextBytes,
-          });
+        if (compactionPlausible) {
+          const fullContextBytes = Buffer.byteLength(JSON.stringify([
+            ...transcript,
+            ...(exactWorkingStateSnapshot === null
+              ? []
+              : workingStateTailEntries(exactWorkingStateSnapshot, transcript)),
+          ]));
+          if (selectedContextBytes < fullContextBytes) {
+            await this.#record("context.compacted", {
+              operation: "request_projection",
+              durableHistoryChanged: false,
+              fullEntries: transcript.length,
+              selectedEntries: selectedTranscript.length,
+              fullBytes: fullContextBytes,
+              selectedBytes: selectedContextBytes,
+            });
+            }
         }
       } catch (error) {
         const failure = classifyFailure(error, { source: "context" });
@@ -683,10 +827,11 @@ export class AgentKernel {
 
       let decision: ModelDecision | undefined;
       let terminalModelError: unknown;
+      let providerContextAdaptations = 0;
       for (let attempt = 1; attempt <= this.#options.maxModelRecoveryAttempts; attempt += 1) {
         try {
           decision = await this.#model.decide({
-            task,
+            task: modelTask,
             mode,
             transcript: selectedTranscript,
             tools: this.#offeredTools(mode),
@@ -699,6 +844,47 @@ export class AgentKernel {
         } catch (error) {
           if (signal.aborted) return this.#fail("Run aborted by its time or cancellation budget.", step - 1);
           terminalModelError = error;
+          if (isProviderContextOverflow(error) && providerContextAdaptations < 3) {
+            providerContextAdaptations += 1;
+            const selectedBytes = Buffer.byteLength(JSON.stringify([...selectedTranscript, ...reservedTail]));
+            effectiveContextBytes = Math.max(4_096, Math.floor(Math.min(effectiveContextBytes, selectedBytes) * 0.62));
+            try {
+              const projection = await this.#contextOverflow.project({
+                task: modelTask,
+                transcript: projectedTranscript,
+                workingState: workingStateSnapshot,
+                maxBytes: effectiveContextBytes,
+                signal,
+                cachedDigests: overflowDigests,
+              });
+              modelTask = projection.task;
+              projectedTranscript = projection.transcript;
+              workingStateSnapshot = projection.workingState;
+              reservedTail = workingStateSnapshot === null
+                ? []
+                : workingStateTailEntries(workingStateSnapshot, projectedTranscript);
+              selectedTranscript = this.#contextPolicy.select(
+                modelTask,
+                projectedTranscript,
+                effectiveContextBytes,
+                reservedTail,
+              );
+              for (const delegation of projection.delegations) {
+                overflowDigests.set(`${delegation.kind}:${delegation.sha256}`, delegation.digest);
+                await this.#recordOverflowDelegation(delegation);
+              }
+              await this.#record("context.compacted", {
+                operation: "provider_window_adaptation",
+                durableHistoryChanged: false,
+                rejectedBytes: selectedBytes,
+                adaptedBudgetBytes: effectiveContextBytes,
+                attempt: providerContextAdaptations,
+              });
+              continue;
+            } catch (adaptationError) {
+              terminalModelError = adaptationError;
+            }
+          }
           if (wasRecoveryHandled(error)) break;
           const failure = classifyFailure(error, { source: "provider" });
           let recoveryDecision;
@@ -734,7 +920,14 @@ export class AgentKernel {
       // later turn.
       const modelDecisionSequence = this.#sequence;
       transcript.push({ role: "decision", content: decision as unknown as JsonValue });
-      await observeWorkspaceBoundary("post-inference-boundary");
+      // A tools decision is immediately bracketed by the batch's own
+      // fingerprint pair, which detects inference-window drift against the
+      // same baseline; a second full-tree walk here would only duplicate it.
+      // Non-batch decisions (respond, ask, complete) keep the exact check —
+      // completion claims especially must see drift before verification.
+      if (decision.kind !== "tools") {
+        await observeWorkspaceBoundary("post-inference-boundary");
+      }
 
       if (decision.kind === "respond") {
         if (mode === "conversation") {
@@ -743,6 +936,16 @@ export class AgentKernel {
         consecutiveNarrations += 1;
         if (consecutiveNarrations >= this.#options.maxConsecutiveNarrations) {
           return this.#fail("Execution stalled in narration without tool actions.", step);
+        }
+        // One reply before the stall guard fires, shove instead of shooting:
+        // most narration spirals are a model warming up on prose, and a hard
+        // runtime demand for an action converts them into a working run.
+        if (consecutiveNarrations === this.#options.maxConsecutiveNarrations - 1) {
+          const note = "[Vanguard runtime] That is another reply with no tool action, and narration does not advance the contract. "
+            + "Take a concrete tool action in your next decision — read, plan, mutate, or run a check — ask the user only if genuinely blocked, "
+            + "or claim completion if every criterion already has evidence. One more actionless reply ends the run.";
+          await this.#record("runtime.note", { text: note, kind: "narration-stall" });
+          transcript.push({ role: "runtime", content: note });
         }
         continue;
       }
@@ -809,19 +1012,47 @@ export class AgentKernel {
 
       if (decision.kind === "complete") {
         const unprovenMilestones = this.#hasPlanTool ? this.#plan!.unproven() : [];
-        const stalePlanEvidence = this.#hasPlanTool
+        let stalePlanEvidence = this.#hasPlanTool
           ? await this.#plan!.evidenceBlockers?.() ?? []
           : [];
+        if (stalePlanEvidence.length > 0 && this.#plan!.refreshStaleProofs !== undefined) {
+          // Runtime-owned staleness repair: re-bind stale proofs to fresh
+          // current-generation evidence instead of charging the model a
+          // plan.update turn for bookkeeping the journal already contains.
+          const refresh = await this.#plan!.refreshStaleProofs();
+          if (refresh.refreshed) {
+            const output = {
+              revision: refresh.revision,
+              stateSha256: refresh.stateSha256,
+              milestones: refresh.milestones,
+              unproven: [...this.#plan!.unproven()],
+              automatic: true,
+            } as unknown as JsonValue;
+            const stamped = {
+              callId: `auto:${modelDecisionSequence}:plan.refresh`,
+              tool: "plan.update",
+              ok: true,
+              output,
+              workspaceGeneration,
+            };
+            transcript.push({ role: "observation", content: stamped as unknown as JsonValue });
+            // Journaled in the plan.update tool shape so the durable-state
+            // anchor chain survives resume exactly like a model-driven update.
+            await this.#record("tool.completed", stamped as unknown as JsonValue);
+          }
+          stalePlanEvidence = refresh.remaining;
+        }
         const runtimeBlockers = this.#completionGates.flatMap((gate) => gate.blockers());
         if (mutationNeedsExecutionEvidence || mutationNeedsReview || unprovenMilestones.length > 0
           || stalePlanEvidence.length > 0 || runtimeBlockers.length > 0) {
-          const smallChangeLaneOpen = (!this.#hasPlanTool || this.#plan!.isEmpty())
-            && completedMutations > 0
-            && completedMutations <= SMALL_CHANGE_MUTATION_BUDGET;
+          const syntaxLaneOpen = this.#options.executionEvidence === "syntax"
+            || ((!this.#hasPlanTool || this.#plan!.isEmpty())
+              && completedMutations > 0
+              && completedMutations <= SMALL_CHANGE_MUTATION_BUDGET);
           const missing = [
             mutationNeedsExecutionEvidence
-              ? (smallChangeLaneOpen
-                ? "a successful executable check (for this small plan-free change, a passing verify.syntax on the edited file also satisfies it)"
+              ? (syntaxLaneOpen
+                ? "a successful executable check (a passing verify.syntax on the edited file also satisfies it)"
                 : "a successful executable check")
               : undefined,
             mutationNeedsReview ? "workspace.changes review" : undefined,
@@ -831,7 +1062,7 @@ export class AgentKernel {
             unprovenMilestones.length === 0 ? undefined
               : `These plan milestones remain unproven: ${unprovenMilestones.join("; ")}. Prove each with evidence references via plan.update, or invalidate it with a reason, before completing.`,
             stalePlanEvidence.length === 0 ? undefined
-              : `These proven milestones have stale workspace evidence: ${stalePlanEvidence.join("; ")}. Refresh their evidence with an authorized check/review from the current workspace generation via plan.update.`,
+              : `These proven milestones have stale workspace evidence: ${stalePlanEvidence.join("; ")}. Run an authorized check/review in the current workspace generation — the runtime re-binds the proof automatically; no eligible fresh evidence exists yet.`,
             runtimeBlockers.length === 0 ? undefined
               : `Runtime work is still active: ${runtimeBlockers.join("; ")}. Wait for or cancel it before completing.`,
           ].filter((item) => item !== undefined);
@@ -971,6 +1202,7 @@ export class AgentKernel {
       const batchOutcome = await this.#executeBatch(decision.calls, {
         task, step, signal, transcript, actionFailures,
         recovery,
+        executionThrash,
         mode,
         modelDecisionSequence,
         completedMutations: () => completedMutations,
@@ -1027,10 +1259,12 @@ export class AgentKernel {
   }
 
   /**
-   * Executes a batch of tool calls. Batches consisting solely of observe
-   * tools run concurrently; any batch containing a mutating, executing,
-   * reviewing, or state call runs strictly in call order. Observations are
-   * journaled in call order either way. Returns a failure reason when a
+   * Executes a batch of tool calls in call order, with concurrency inside
+   * maximal observe-only segments: a run of consecutive observe tools executes
+   * in parallel, while every mutating, executing, reviewing, or state call
+   * runs alone, in order. One decision can therefore fan out reconnaissance
+   * and still follow with a mutation, without extra round trips. Observations
+   * are journaled in call order either way. Returns a failure reason when a
    * circuit breaker opens.
    */
   async #executeBatch(
@@ -1042,6 +1276,7 @@ export class AgentKernel {
       transcript: TranscriptEntry[];
       actionFailures: Map<string, number>;
       recovery: RecoveryPort;
+      executionThrash: ExecutionThrashState;
       mode: KernelMode;
       modelDecisionSequence: number;
       completedMutations: () => number;
@@ -1059,6 +1294,7 @@ export class AgentKernel {
     },
   ): Promise<BatchFailure | undefined> {
     const allObserve = calls.every((call) => this.#tools.get(call.name)?.definition.effect === "observe");
+    const effectOf = (call: ToolCall) => this.#tools.get(call.name)?.definition.effect;
     const mutationCalls = calls.filter((call) => this.#tools.get(call.name)?.definition.effect === "mutate");
     // Effect declarations control scheduling and UX, never side-effect trust.
     // Every implementation, including an allegedly read-only extension, is
@@ -1070,9 +1306,11 @@ export class AgentKernel {
     let containmentPoisonReason: string | undefined;
     const runCall = async (call: ToolCall, callIndex: number): Promise<ToolObservation> => {
       const evidenceId = toolEvidenceId(context.modelDecisionSequence, callIndex);
+      const dispatchedAtMs = Date.now();
       const withEvidence = (observation: ToolObservation): ToolObservation => ({
         ...observation,
         evidenceId,
+        durationMs: Date.now() - dispatchedAtMs,
       });
       if (hasTopLevelHistoricalElisionMarker(call.input)) {
         return this.#terminalObservation(
@@ -1147,9 +1385,41 @@ export class AgentKernel {
           evidenceId,
         );
       }
+      // Declared milestone scopes are ownership boundaries, not documentation:
+      // a mutation of a path no active milestone owns is plan drift and is
+      // rejected before it touches the workspace.
+      if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
+        && !this.#plan!.isEmpty()) {
+        const target = mutationTargetPath(call.input);
+        const scopeBlocker = target === undefined ? undefined : this.#plan!.scopeBlocker?.(target);
+        if (scopeBlocker !== undefined) {
+          return this.#terminalObservation(
+            call,
+            scopeBlocker,
+            "policy",
+            context.recovery,
+            context.signal,
+            evidenceId,
+          );
+        }
+      }
 
       const source = tool.definition.effect === "execute" ? "process" : "tool";
       const idempotent = tool.definition.effect === "observe";
+      // Pure observations memoize by generation + fingerprint. Independent-
+      // evidence tools (process.run, artifact.render, review) are excluded so
+      // a cached result can never impersonate a fresh execution or review that
+      // a completion gate relies on.
+      const cacheable = idempotent && tool.definition.evidenceAuthority === undefined;
+      const cacheKey = cacheable
+        ? `${context.workspaceGeneration()} ${call.name} ${fingerprint}`
+        : undefined;
+      if (cacheKey !== undefined) {
+        const hit = this.#observeCache.get(cacheKey);
+        if (hit !== undefined) {
+          return withEvidence({ callId: call.id, tool: call.name, ok: true, output: hit });
+        }
+      }
       for (let attempt = 1; attempt <= this.#options.maxToolRecoveryAttempts; attempt += 1) {
         let output: JsonValue | undefined;
         let error: unknown;
@@ -1159,7 +1429,12 @@ export class AgentKernel {
             step: context.step,
             signal: context.signal,
           });
-          if (result.ok) return withEvidence({ callId: call.id, tool: call.name, ok: true, output: result.output });
+          if (result.ok) {
+            if (cacheKey !== undefined && result.output !== undefined) {
+              rememberObservation(this.#observeCache, cacheKey, result.output);
+            }
+            return withEvidence({ callId: call.id, tool: call.name, ok: true, output: result.output });
+          }
           if (tool.definition.effect === "execute" && isContainmentUncertain(result.output)) {
             containmentPoisonReason = `Execution containment became uncertain in '${call.name}'; this run is permanently fenced.`;
             return withEvidence({
@@ -1216,13 +1491,20 @@ export class AgentKernel {
       throw new Error("Unreachable tool recovery loop.");
     };
 
-    const observations: ToolObservation[] = allObserve && calls.length > 1
-      ? await Promise.all(calls.map((call, index) => runCall(call, index)))
-      : [];
-    if (observations.length === 0) {
-      for (const [index, call] of calls.entries()) {
-        observations.push(await runCall(call, index));
-        if (containmentPoisonReason !== undefined) break;
+    const observations: ToolObservation[] = [];
+    for (let index = 0; index < calls.length;) {
+      if (containmentPoisonReason !== undefined) break;
+      if (effectOf(calls[index]!) === "observe") {
+        // Maximal observe-only run: independent reads execute concurrently, so
+        // one decision can fan out reconnaissance without extra round trips.
+        let end = index + 1;
+        while (end < calls.length && effectOf(calls[end]!) === "observe") end += 1;
+        const segment = await Promise.all(calls.slice(index, end).map((call, offset) => runCall(call, index + offset)));
+        observations.push(...segment);
+        index = end;
+      } else {
+        observations.push(await runCall(calls[index]!, index));
+        index += 1;
       }
     }
 
@@ -1260,12 +1542,17 @@ export class AgentKernel {
       const fingerprint = stableFingerprint(call.name, call.input);
       const definition = this.#tools.get(call.name)?.definition;
       const effect = definition?.effect;
+      // Syntax clears the pre-claim gate in two situations: inside the
+      // plan-free small-change lane, or when the run has no independent check
+      // to give — where demanding one would only invite a throwaway harness.
+      const syntaxSatisfiesGate = this.#options.executionEvidence === "syntax"
+        || ((!this.#hasPlanTool || this.#plan!.isEmpty())
+          && context.completedMutations() > 0
+          && context.completedMutations() <= SMALL_CHANGE_MUTATION_BUDGET);
       const smallChangeSyntaxEvidence = observation.ok && !workspaceChanged
         && call.name === "verify.syntax"
         && context.mode === "execution"
-        && (!this.#hasPlanTool || this.#plan!.isEmpty())
-        && context.completedMutations() > 0
-        && context.completedMutations() <= SMALL_CHANGE_MUTATION_BUDGET
+        && syntaxSatisfiesGate
         && syntaxCheckPassed(observation.output);
       if (observation.ok) {
         context.actionFailures.delete(fingerprint);
@@ -1316,6 +1603,37 @@ export class AgentKernel {
             // dispatching the tool and then terminates the run.
           }
         }
+        // Cross-generation thrash: the same execution check failing with
+        // byte-identical output in several distinct workspace generations
+        // means the intervening edits never touched the failure. The
+        // per-generation circuit breaker above cannot see this by design.
+        if (effect === "execute" && !circuitBlockedCallIds.has(call.id)) {
+          const signature = executionFailureSignature(call.name, call.input, observation.output ?? null);
+          const streak = trackExecutionThrash(context.executionThrash, signature, context.workspaceGeneration());
+          if (streak.count >= EXECUTION_THRASH_SOFT_LIMIT && !streak.guided) {
+            streak.guided = true;
+            const note = "[Vanguard runtime] Edit-check thrash detected: "
+              + `'${call.name}' has now failed with byte-identical output in ${streak.count} different workspace generations, `
+              + "so the edits between runs are not moving this failure. Stop and re-diagnose: re-read the exact failure output, "
+              + "form a different hypothesis about the cause, and change the approach — a different file, a different fix, "
+              + "a targeted observation, or plan revision. Two more identical failures end the run.";
+            await this.#record("recovery.replan_required", {
+              operation: "execution.thrash",
+              fingerprint: signature,
+              generations: streak.count,
+              tool: call.name,
+              feedback: {
+                action: "replan_and_checkpoint",
+                instruction: "The same check fails identically after every edit; re-diagnose the cause instead of editing again.",
+              },
+            });
+            await this.#record("runtime.note", { text: note, kind: "execution-thrash", signature });
+            context.transcript.push({ role: "runtime", content: note });
+          }
+          if (streak.count >= EXECUTION_THRASH_HARD_LIMIT && failureReason === undefined) {
+            failureReason = { reason: executionThrashFailureReason(streak.count, call.name) };
+          }
+        }
       }
       observation = {
         ...observation,
@@ -1327,7 +1645,11 @@ export class AgentKernel {
         ...(smallChangeSyntaxEvidence ? { smallChangeExecutionEvidence: true as const } : {}),
       };
       context.transcript.push({ role: "observation", content: observation as unknown as JsonValue });
-      await this.#record(observation.ok ? "tool.completed" : "tool.failed", observation as unknown as JsonValue);
+      // The transcript keeps the exact observation; only the journaled record
+      // gains a top-level error string, because a structured failure
+      // ({ok:false, output}) otherwise journals output with no scannable reason.
+      const journaled = observation.ok ? observation : withJournalError(observation);
+      await this.#record(observation.ok ? "tool.completed" : "tool.failed", journaled as unknown as JsonValue);
     }
     if (allObserve && !workspaceChanged && observations.length === calls.length
       && observations.every((observation) => observation.ok)) {
@@ -1341,6 +1663,61 @@ export class AgentKernel {
       return observation.ok && effect !== undefined && effect !== "observe" && effect !== "state";
     })) {
       context.onMeaningfulNonObserveProgress();
+    }
+
+    // Runtime-owned syntax rung: every file a mutation just touched is parsed
+    // immediately, on the runtime's initiative — the model spends no turn on
+    // it, and the journaled observation satisfies the same gates a
+    // model-called verify.syntax would (the small-change lane included).
+    if (this.#postMutationSyntaxCheck !== undefined && context.mode === "execution"
+      && containmentPoisonReason === undefined) {
+      const targets = new Set<string>();
+      for (const [index, observation] of observations.entries()) {
+        const call = calls[index]!;
+        if (!observation.ok || effectOf(call) !== "mutate" || call.name === "workspace.delete") continue;
+        const target = mutationTargetPath(call.input);
+        if (target !== undefined) targets.add(target);
+      }
+      if (targets.size > 0) {
+        const syntaxSatisfiesGate = this.#options.executionEvidence === "syntax"
+          || ((!this.#hasPlanTool || this.#plan!.isEmpty())
+            && context.completedMutations() > 0
+            && context.completedMutations() <= SMALL_CHANGE_MUTATION_BUDGET);
+        // The parses are independent per file; run them concurrently and
+        // journal in the batch's stable target order afterward.
+        const checkedTargets = [...targets];
+        const results = await Promise.all(checkedTargets.map(async (target): Promise<{ ok: boolean; output: JsonValue }> => {
+          try {
+            return await this.#postMutationSyntaxCheck!(target);
+          } catch (error) {
+            return { ok: false, output: { status: "failed", detail: error instanceof Error ? error.message : String(error) } };
+          }
+        }));
+        for (const [targetIndex, target] of checkedTargets.entries()) {
+          const result = results[targetIndex]!;
+          const output = { ...(typeof result.output === "object" && result.output !== null && !Array.isArray(result.output) ? result.output : {}), automatic: true } as JsonValue;
+          // The batch bracket above already accounted for the mutation itself:
+          // it opened the new epoch and re-armed the gates before this check
+          // ran, so a pass here is evidence about the post-mutation tree, in
+          // the current generation — exactly what the gate demands.
+          const passed = result.ok && syntaxSatisfiesGate && syntaxCheckPassed(output);
+          const stamped = {
+            callId: `auto:${context.modelDecisionSequence}:${target}`,
+            tool: "verify.syntax",
+            ok: result.ok,
+            output,
+            workspaceGeneration: context.workspaceGeneration(),
+            ...(passed ? { smallChangeExecutionEvidence: true as const } : {}),
+          };
+          // A runtime-owned pass clears the same pre-claim gate; failures are
+          // journaled for the model's next decision but never trip the
+          // circuit breaker, since the model did not choose this call.
+          if (passed) context.onExecute();
+          context.transcript.push({ role: "observation", content: stamped as unknown as JsonValue });
+          const journaled = stamped.ok ? stamped : withJournalError(stamped as unknown as ToolObservation);
+          await this.#record(stamped.ok ? "tool.completed" : "tool.failed", journaled as unknown as JsonValue);
+        }
+      }
     }
     return failureReason;
   }
@@ -1427,6 +1804,18 @@ export class AgentKernel {
     await this.#journal.append({ sequence: this.#sequence, type, data });
   }
 
+  async #recordOverflowDelegation(delegation: OverflowDelegationRecord): Promise<void> {
+    await this.#record("context.compacted", {
+      operation: "overflow_delegation",
+      durableHistoryChanged: false,
+      sourceKind: delegation.kind,
+      sourceSha256: delegation.sha256,
+      sourceBytes: delegation.sourceBytes,
+      chunks: delegation.chunks,
+      digest: delegation.digest,
+    });
+  }
+
   async #fail(reason: string, steps: number, poisoned = false): Promise<RunOutcome> {
     await this.#record("run.failed", { reason, steps, ...(poisoned ? { poisoned: true } : {}) });
     return { status: "failed", reason, steps };
@@ -1454,6 +1843,7 @@ interface RestoredSession {
   readonly stepsSinceReground: number;
   readonly completedMutations: number;
   readonly observationStagnation: ObservationStagnationState;
+  readonly executionThrash: ExecutionThrashState;
   readonly poisonedReason: string | undefined;
   /** A durable execute decision whose matching run.contracted event was interrupted. */
   readonly pendingContract: TaskContract | undefined;
@@ -1555,6 +1945,70 @@ function observationStagnationFailureReason(
     + `${workspaceGeneration}, after durable replan guidance.`;
 }
 
+/**
+ * Edit↔check thrash detection. The identical-action circuit breaker clears on
+ * every mutation — correctly, because a check re-run after an edit is a new
+ * diagnostic. The blind spot that leaves: edit → check fails identically →
+ * edit → same failure → …, where each mutation wipes the count and a model
+ * can burn an entire step budget oscillating. This guard counts, per exact
+ * (tool, input, failure output) signature, the number of DISTINCT workspace
+ * generations in which the same check failed byte-identically. Edits that do
+ * not move the failure at all are the signal; any change in the failure
+ * output starts a fresh signature and the guard never fires.
+ */
+const EXECUTION_THRASH_SOFT_LIMIT = 3;
+const EXECUTION_THRASH_HARD_LIMIT = 5;
+const EXECUTION_THRASH_MAX_TRACKED = 200;
+
+interface ExecutionThrashEntry {
+  count: number;
+  lastGeneration: number;
+  guided: boolean;
+}
+
+interface ExecutionThrashState {
+  readonly streaks: Map<string, ExecutionThrashEntry>;
+}
+
+function freshExecutionThrashState(): ExecutionThrashState {
+  return { streaks: new Map() };
+}
+
+function executionFailureSignature(tool: string, input: JsonValue, output: JsonValue): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ tool, input, output }, objectKeySorter), "utf8")
+    .digest("hex");
+}
+
+/** Count a failing signature at most once per workspace generation. */
+function trackExecutionThrash(
+  state: ExecutionThrashState,
+  signature: string,
+  generation: number,
+): ExecutionThrashEntry {
+  const existing = state.streaks.get(signature);
+  if (existing !== undefined) {
+    if (existing.lastGeneration !== generation) {
+      existing.count += 1;
+      existing.lastGeneration = generation;
+    }
+    return existing;
+  }
+  if (state.streaks.size >= EXECUTION_THRASH_MAX_TRACKED) {
+    const oldest = state.streaks.keys().next().value;
+    if (oldest !== undefined) state.streaks.delete(oldest);
+  }
+  const fresh: ExecutionThrashEntry = { count: 1, lastGeneration: generation, guided: false };
+  state.streaks.set(signature, fresh);
+  return fresh;
+}
+
+function executionThrashFailureReason(generations: number, tool: string): string {
+  return `Edit-check thrash guard stopped the run: '${tool}' failed with byte-identical output across `
+    + `${generations} workspace generations, so the intervening edits never moved the failure, `
+    + "after durable replan guidance.";
+}
+
 function restoreSession(
   events: readonly RunEvent[],
   tools: ReadonlyMap<string, ToolPort>,
@@ -1570,6 +2024,7 @@ function restoreSession(
   let pendingObservationBatch: PendingObservationBatch | undefined;
   const pendingVerificationIds = new Set<string>();
   const observationStagnation = freshObservationStagnationState();
+  const executionThrash = freshExecutionThrashState();
   let currentWorkspaceGeneration = 0;
   let lastWorkspaceFingerprint: string | undefined;
   let mutationNeedsExecutionEvidence = false;
@@ -1600,6 +2055,7 @@ function restoreSession(
   for (const event of events) {
     if (event.type === "run.started") {
       resetObservationStagnation(observationStagnation);
+      executionThrash.streaks.clear();
       pendingContract = undefined;
       const data = recordValue(event.data);
       if (typeof data?.task === "string") {
@@ -1612,6 +2068,7 @@ function restoreSession(
     }
     if (event.type === "run.contracted") {
       resetObservationStagnation(observationStagnation);
+      executionThrash.streaks.clear();
       pendingContract = undefined;
       const data = recordValue(event.data);
       if (typeof data?.task === "string") {
@@ -1628,6 +2085,13 @@ function restoreSession(
       pendingQuestion = undefined;
       trailingNarrations = 0;
       resetObservationStagnation(observationStagnation);
+      executionThrash.streaks.clear();
+      // Mirror of the live steering drain: settle any claim that already
+      // failed before this message, then re-arm the completion budgets —
+      // human intervention grants a fresh set of attempts.
+      flushCompletion();
+      failedVerificationAttempts = 0;
+      failedCompletionEvidenceAttempts = 0;
       continue;
     }
     if (event.type === "runtime.note") {
@@ -1636,6 +2100,10 @@ function restoreSession(
       if (data?.kind === "observation-stagnation") {
         observationStagnation.guidanceRecorded = true;
         observationStagnation.guidanceDelivered = true;
+      }
+      if (data?.kind === "execution-thrash" && typeof data.signature === "string") {
+        const streak = executionThrash.streaks.get(data.signature);
+        if (streak !== undefined) streak.guided = true;
       }
       stepsSinceReground = 0;
       continue;
@@ -1676,6 +2144,7 @@ function restoreSession(
       mutationNeedsReview = mode === "execution" && hasReviewTool;
       timeTravelResumePending = true;
       resetObservationStagnation(observationStagnation);
+      executionThrash.streaks.clear();
       transcript.push({
         role: "runtime",
         content: event.type === "session.restored"
@@ -1782,6 +2251,13 @@ function restoreSession(
         } else {
           if (pendingObservationBatch !== undefined) pendingObservationBatch.invalidated = true;
           actionFailures.set(fingerprint, (actionFailures.get(fingerprint) ?? 0) + 1);
+          if (event.type === "tool.failed" && observedEffect === "execute") {
+            trackExecutionThrash(
+              executionThrash,
+              executionFailureSignature(call.name, call.input, data?.output ?? null),
+              currentWorkspaceGeneration,
+            );
+          }
         }
       }
       if (pendingCalls.length === 0 && pendingObservationBatch !== undefined) {
@@ -1840,6 +2316,7 @@ function restoreSession(
     trailingNarrations,
     stepsSinceReground,
     completedMutations,
+    executionThrash,
     observationStagnation,
     poisonedReason,
     pendingContract,
@@ -1849,6 +2326,21 @@ function restoreSession(
 
 function stableFingerprint(name: string, input: JsonValue): string {
   return `${name}:${JSON.stringify(input, objectKeySorter)}`;
+}
+
+/** Cap the observe cache so a long session cannot grow it without bound. */
+const MAX_OBSERVE_CACHE_ENTRIES = 512;
+
+function rememberObservation(cache: Map<string, JsonValue>, key: string, output: JsonValue): void {
+  // A large tool payload in the cache would defeat the point: the win is
+  // skipping re-execution and re-streaming of results the model already has,
+  // and an oversized entry costs more to hold than the re-read it saves.
+  if (JSON.stringify(output).length > 256_000) return;
+  if (cache.size >= MAX_OBSERVE_CACHE_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, output);
 }
 
 /**
@@ -1908,6 +2400,13 @@ function syntaxCheckPassed(output: JsonValue | undefined): boolean {
   return (output as { status?: JsonValue }).status === "passed";
 }
 
+/** The workspace-relative target of a mutation call, when the tool names one. */
+function mutationTargetPath(input: JsonValue): string | undefined {
+  if (input === null || Array.isArray(input) || typeof input !== "object") return undefined;
+  const target = input.path;
+  return typeof target === "string" && target.length > 0 ? target : undefined;
+}
+
 function isNarrowPlanFreeMutation(call: ToolCall): boolean {
   if (call.name !== "workspace.replace" || call.input === null || Array.isArray(call.input)
     || typeof call.input !== "object") return false;
@@ -1930,6 +2429,49 @@ function recordValue(value: JsonValue): Record<string, JsonValue> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value : undefined;
 }
 
+/**
+ * Journals a failed observation with a guaranteed top-level error string.
+ * An explicit error wins unchanged; otherwise the reason is derived from the
+ * structured output so journal scans never face a reason-less failure.
+ */
+function withJournalError(observation: ToolObservation): ToolObservation {
+  if (typeof observation.error === "string" && observation.error.length > 0) return observation;
+  return { ...observation, error: journalFailureSummary(observation) };
+}
+
+function journalFailureSummary(observation: ToolObservation): string {
+  const output = recordValue(observation.output ?? null);
+  const explicit = output?.error;
+  if (typeof explicit === "string" && explicit.trim().length > 0) return boundedJournalText(explicit.trim());
+  const exitCode = typeof output?.exitCode === "number" ? output.exitCode : undefined;
+  if (exitCode !== undefined) {
+    // process.run-style failure: the reason lives on stderr, so keep its tail.
+    const stderr = typeof output?.stderr === "string" ? output.stderr.trim() : "";
+    const tail = stderr.length === 0 ? "" : ` · ${stderr.slice(-200)}`;
+    return boundedJournalText(`exit ${exitCode}${tail}`);
+  }
+  if (observation.output !== undefined) return boundedJournalText(JSON.stringify(observation.output));
+  return observation.failure?.message ?? "Tool call failed.";
+}
+
+function boundedJournalText(value: string, maximum = 300): string {
+  return value.length <= maximum ? value : `${value.slice(0, maximum - 1)}…`;
+}
+
+function restoredOverflowDigests(events: readonly RunEvent[]): Map<string, string> {
+  const digests = new Map<string, string>();
+  for (const event of events) {
+    if (event.type !== "context.compacted") continue;
+    const data = recordValue(event.data);
+    if (data?.operation !== "overflow_delegation"
+      || typeof data.sourceKind !== "string"
+      || typeof data.sourceSha256 !== "string"
+      || typeof data.digest !== "string") continue;
+    digests.set(`${data.sourceKind}:${data.sourceSha256}`, data.digest);
+  }
+  return digests;
+}
+
 function isContainmentUncertain(value: JsonValue | undefined): boolean {
   if (value === undefined) return false;
   return recordValue(value)?.containmentUncertain === true;
@@ -1937,6 +2479,20 @@ function isContainmentUncertain(value: JsonValue | undefined): boolean {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isProviderContextOverflow(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== null && typeof current === "object"; depth += 1) {
+    const value = current as { kind?: unknown; status?: unknown; message?: unknown; cause?: unknown };
+    if (value.kind === "context_length" || value.status === 413) return true;
+    const message = typeof value.message === "string" ? value.message : "";
+    if (/(?:context(?:_| )?(?:length|window)|maximum context|too many tokens|prompt.{0,24}too long|input.{0,24}tokens|request.{0,24}too large)/iu.test(message)) {
+      return true;
+    }
+    current = value.cause;
+  }
+  return false;
 }
 
 function wasRecoveryHandled(error: unknown): boolean {

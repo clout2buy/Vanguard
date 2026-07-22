@@ -345,6 +345,70 @@ test("independent reads in one decision all execute and journal in call order", 
   );
 });
 
+test("an identical observe call is served from cache without re-executing the tool", async () => {
+  let reads = 0;
+  const read: ToolPort = {
+    name: "read",
+    definition: { ...toolDefinition("read"), effect: "observe" },
+    async execute(input) {
+      reads += 1;
+      return { ok: true, output: { path: (input as { path: string }).path, contents: "SERVER SOURCE" } };
+    },
+  };
+  const call: ModelDecision = {
+    kind: "tools",
+    calls: [{ id: "r", name: "read", input: { path: "server.js" } }],
+  };
+  const journal = new MemoryJournal();
+  const outcome = await new AgentKernel({
+    // The exact re-read pattern from the slow run: the model reads server.js,
+    // reads it again unchanged, then answers. The second read must be free.
+    model: new ScriptedModel([call, { ...call, calls: [{ ...call.calls[0]!, id: "r2" }] }, { kind: "complete", answer: "done" }]),
+    tools: [read],
+    verifiers: [passingVerifier],
+    journal,
+  }).run("re-read the same file");
+  assert.equal(outcome.status, "completed");
+  assert.equal(reads, 1, "the second identical read must be served from the observe cache");
+  const completed = journal.events.filter((event) => event.type === "tool.completed");
+  assert.equal(completed.length, 2, "both reads still journal a result, one of them from cache");
+  assert.match(JSON.stringify(completed[1]?.data), /SERVER SOURCE/, "the cached result is byte-identical to a fresh read");
+});
+
+test("a mutation invalidates the observe cache so the next read runs fresh", async () => {
+  let reads = 0;
+  const read: ToolPort = {
+    name: "read",
+    definition: { ...toolDefinition("read"), effect: "observe" },
+    async execute() { reads += 1; return { ok: true, output: { contents: `read #${reads}` } }; },
+  };
+  const write: ToolPort = {
+    name: "write",
+    definition: { ...toolDefinition("write"), effect: "mutate" },
+    async execute() { return { ok: true, output: "changed" }; },
+  };
+  const execution: ToolPort = {
+    name: "check",
+    definition: { ...toolDefinition("check"), effect: "execute", evidenceAuthority: "independent-execution" },
+    async execute() { return { ok: true, output: "verified" }; },
+  };
+  const readCall: ModelDecision = { kind: "tools", calls: [{ id: "r", name: "read", input: { path: "server.js" } }] };
+  const outcome = await new AgentKernel({
+    model: new ScriptedModel([
+      readCall,
+      { kind: "tools", calls: [{ id: "w", name: "write", input: { path: "server.js" } }] },
+      { kind: "tools", calls: [{ id: "c", name: "check", input: {} }] },
+      { ...readCall, calls: [{ ...readCall.calls[0]!, id: "r2" }] },
+      { kind: "complete", answer: "done" },
+    ]),
+    tools: [read, write, execution],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  }).run("read, change, read again");
+  assert.equal(outcome.status, "completed");
+  assert.equal(reads, 2, "a workspace generation bump must invalidate the cached read");
+});
+
 test("a batch containing a mutation runs strictly sequentially", async () => {
   const order: string[] = [];
   let concurrent = 0;
@@ -654,7 +718,11 @@ test("successful observation stagnation detects reordered and reshaped batches b
   assert.equal(outcome.status, "failed");
   assert.match(outcome.status === "failed" ? outcome.reason : "", /observation stagnation/i);
   assert.equal(outcome.steps, 4, "the independent guard must stop well before the general step budget");
-  assert.equal(reads, 6);
+  // The stagnation guard still fires on the identical observations, but the
+  // observe cache now serves every repeat of a.ts/b.ts within the unchanged
+  // workspace generation, so only the two distinct reads ever execute. The
+  // loop is caught by the guard AND made free by the cache.
+  assert.equal(reads, 2, "repeated identical reads must be served from the observe cache, not re-executed");
   const replan = journal.events.find((event) => event.type === "recovery.replan_required"
     && (event.data as { operation?: string }).operation === "successful-observation.stagnation");
   assert.ok(replan, "the hard bound must be preceded by actionable soft replan guidance");
@@ -1375,4 +1443,151 @@ test("an interrupted sealed verifier opens an uncertain epoch and closes its tra
     && JSON.stringify(event.data).includes("interrupted-verification")), true);
   assert.equal(journal.events.some((event) => event.type === "verification.finished"
     && JSON.stringify(event.data).includes("interrupted")), true);
+});
+
+test("a narration stall gets one hard runtime nudge before the guard ends the run", async () => {
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "respond", message: "let me explain the plan" },
+      { kind: "respond", message: "here is more prose" },
+      { kind: "respond", message: "and even more prose" },
+    ]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal,
+  });
+  const outcome = await kernel.run("build the feature");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /stalled in narration/u);
+  const nudges = journal.events.filter((event) =>
+    event.type === "runtime.note" && JSON.stringify(event.data).includes("narration-stall"));
+  assert.equal(nudges.length, 1, "exactly one nudge lands before the guard fires");
+  assert.match(JSON.stringify(nudges[0]!.data), /Take a concrete tool action/u);
+});
+
+test("a model that acts on the narration nudge keeps its run alive", async () => {
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      { kind: "respond", message: "let me explain the plan" },
+      { kind: "respond", message: "here is more prose" },
+      { kind: "complete", answer: "done" },
+    ]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+  });
+  const outcome = await kernel.run("build the feature");
+  assert.equal(outcome.status, "completed", "the decision after the nudge can still rescue the run");
+});
+
+test("edit-check thrash with byte-identical failures is guided at three generations and stopped at five", async () => {
+  let revision = 0;
+  const writer: ToolPort = {
+    name: "workspace.write",
+    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    async execute() { revision += 1; return { ok: true, output: { written: revision } }; },
+  };
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() { return { ok: false, output: { status: "failed", detail: "assertion X is false" } }; },
+  };
+  const decisions: ModelDecision[] = [];
+  for (let cycle = 1; cycle <= 5; cycle += 1) {
+    decisions.push({ kind: "tools", calls: [{ id: `m${cycle}`, name: "workspace.write", input: { path: "src/a.ts", cycle } }] });
+    decisions.push({ kind: "tools", calls: [{ id: `c${cycle}`, name: "project.check", input: {} }] });
+  }
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel(decisions),
+    tools: [writer, check],
+    verifiers: [passingVerifier],
+    journal,
+    workspaceState: { async fingerprint() { return `rev-${revision}`; } },
+  });
+
+  const outcome = await kernel.run("fix the failing check");
+  assert.equal(outcome.status, "failed");
+  assert.match(outcome.status === "failed" ? outcome.reason : "", /thrash guard stopped the run/u);
+  // Durable replan guidance landed before the stop, at the soft limit.
+  assert.equal(journal.events.some((event) => event.type === "recovery.replan_required"
+    && JSON.stringify(event.data).includes("execution.thrash")), true);
+  assert.equal(journal.events.some((event) => event.type === "runtime.note"
+    && JSON.stringify(event.data).includes("execution-thrash")), true);
+});
+
+test("a check whose failure output changes after each edit never trips the thrash guard", async () => {
+  let revision = 0;
+  const writer: ToolPort = {
+    name: "workspace.write",
+    definition: { ...toolDefinition("workspace.write"), effect: "mutate" },
+    async execute() { revision += 1; return { ok: true, output: { written: revision } }; },
+  };
+  const check: ToolPort = {
+    name: "project.check",
+    definition: trustedExecutionDefinition("project.check"),
+    async execute() {
+      // Failures shrink as edits land: real progress, not thrash.
+      return revision < 6
+        ? { ok: false, output: { status: "failed", failing: 6 - revision } }
+        : { ok: true, output: { status: "passed" } };
+    },
+  };
+  const decisions: ModelDecision[] = [];
+  for (let cycle = 1; cycle <= 6; cycle += 1) {
+    decisions.push({ kind: "tools", calls: [{ id: `m${cycle}`, name: "workspace.write", input: { path: "src/a.ts", cycle } }] });
+    decisions.push({ kind: "tools", calls: [{ id: `c${cycle}`, name: "project.check", input: {} }] });
+  }
+  decisions.push({ kind: "complete", answer: "fixed" });
+  const kernel = new AgentKernel({
+    model: new ScriptedModel(decisions),
+    tools: [writer, check],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    workspaceState: { async fingerprint() { return `rev-${revision}`; } },
+  });
+
+  const outcome = await kernel.run("fix all failing tests");
+  assert.equal(outcome.status, "completed");
+});
+
+test("a fresh user message re-arms an exhausted verification budget; a bare resume stays failed", async () => {
+  const prior = [
+    { sequence: 1, type: "run.started" as const, data: { task: "polish the artwork" } },
+    { sequence: 2, type: "model.decided" as const, data: { kind: "complete", answer: "claim one" } },
+    { sequence: 3, type: "verification.completed" as const, data: { verifier: "creative direction", passed: false, evidence: "flat" } },
+    { sequence: 4, type: "model.decided" as const, data: { kind: "complete", answer: "claim two" } },
+    { sequence: 5, type: "verification.completed" as const, data: { verifier: "creative direction", passed: false, evidence: "flat" } },
+    { sequence: 6, type: "model.decided" as const, data: { kind: "complete", answer: "claim three" } },
+    { sequence: 7, type: "verification.completed" as const, data: { verifier: "creative direction", passed: false, evidence: "flat" } },
+    { sequence: 8, type: "run.failed" as const, data: { reason: "Verification failure budget exhausted after 3 failed completion claims." } },
+  ];
+  // A bare resume keeps the exhausted budget fail-closed; the model is never consulted.
+  const stuck = new AgentKernel({
+    model: new ScriptedModel([]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { maxFailedVerificationAttempts: 3 },
+  });
+  const dead = await stuck.advance({ expectedTask: "polish the artwork" }, undefined, prior);
+  assert.equal(dead.status, "failed");
+  assert.match(dead.status === "failed" ? dead.reason : "", /budget exhausted/u);
+
+  // The same journal plus a human instruction gets a fresh set of attempts.
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([{ kind: "complete", answer: "reworked per your note" }]),
+    tools: [],
+    verifiers: [passingVerifier],
+    journal: new MemoryJournal(),
+    options: { maxFailedVerificationAttempts: 3 },
+  });
+  const outcome = await kernel.advance(
+    { expectedTask: "polish the artwork", userMessage: "put it in its own folder with a launcher" },
+    undefined,
+    prior,
+  );
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "reworked per your note");
 });

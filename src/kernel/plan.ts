@@ -3,6 +3,7 @@ import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type {
   JsonValue,
+  PlanProofRefresh,
   PlanStatusPort,
   RunEvent,
   TaskContract,
@@ -80,6 +81,12 @@ export interface EvidenceResolverPort {
   resolve(claim: EvidenceClaim): Promise<EvidenceRef | undefined>;
   /** Revalidate an exact persisted reference without requiring it to be fresh. */
   revalidate?(reference: EvidenceRef): Promise<EvidenceRef | undefined>;
+  /** Recent fresh runtime-authorized proof handles for actionable recovery. */
+  eligibleToolEvidence?(limit?: number): Promise<readonly {
+    evidenceId: string;
+    tool: string;
+    evidenceAuthority: ToolEvidenceAuthority;
+  }[]>;
 }
 
 interface JournalReader {
@@ -96,6 +103,27 @@ export class JournalEvidenceResolver implements EvidenceResolverPort {
 
   async revalidate(reference: EvidenceRef): Promise<EvidenceRef | undefined> {
     return this.#resolve(reference, false);
+  }
+
+  async eligibleToolEvidence(limit = 8): Promise<readonly {
+    evidenceId: string;
+    tool: string;
+    evidenceAuthority: ToolEvidenceAuthority;
+  }[]> {
+    const auditEvents = await this.journal.readValidated();
+    const events = logicalRunEvents(auditEvents);
+    const candidates: Array<{ evidenceId: string; tool: string; evidenceAuthority: ToolEvidenceAuthority }> = [];
+    for (const event of [...events].reverse()) {
+      const data = eligibleToolData(event, auditEvents, true);
+      if (data === undefined || typeof data.evidenceId !== "string" || typeof data.tool !== "string") continue;
+      candidates.push({
+        evidenceId: data.evidenceId,
+        tool: data.tool,
+        evidenceAuthority: data.evidenceAuthority as ToolEvidenceAuthority,
+      });
+      if (candidates.length >= limit) break;
+    }
+    return candidates;
   }
 
   async #resolve(claim: EvidenceClaim, requireCurrent: boolean): Promise<EvidenceRef | undefined> {
@@ -280,6 +308,104 @@ export class PlanLedger implements PlanStatusPort {
     if (resolver !== undefined) this.#evidenceResolver = resolver;
   }
 
+  /**
+   * Runtime-owned staleness repair. A proven milestone whose evidence went
+   * stale (a later mutation/restore advanced the workspace generation) is
+   * re-bound to a fresh, eligible journal event — the exact refresh the model
+   * could request via plan.update, derived without spending a model turn.
+   * The write goes through the ordinary validated revision path, so the
+   * strictly-newer-generation rule, monotonicity, and persistence integrity
+   * all still hold; a refresh can never prove an unproven milestone, weaken a
+   * milestone, or bind evidence the journal does not contain.
+   */
+  async refreshStaleProofs(): Promise<PlanProofRefresh> {
+    if (this.#state === undefined || this.#evidenceResolver === undefined) {
+      return { refreshed: false, remaining: [] };
+    }
+    const resolver = this.#evidenceResolver;
+    const stale = new Set<string>();
+    for (const milestone of this.#state.milestones) {
+      if (milestone.status !== "proven") continue;
+      let current = true;
+      for (const reference of milestone.evidence) {
+        if (reference.kind !== "tool" && reference.kind !== "verification") continue;
+        // resolve() requires the current workspace generation — exactly the
+        // staleness test evidenceBlockers() applies.
+        const resolved = await resolver.resolve(reference);
+        if (resolved === undefined || !sameEvidence(reference, resolved)) {
+          current = false;
+          break;
+        }
+      }
+      if (!current) stale.add(milestone.id);
+    }
+    if (stale.size === 0) return { refreshed: false, remaining: [] };
+    const labels = () => this.#state!.milestones
+      .filter((milestone) => stale.has(milestone.id))
+      .map((milestone) => `${milestone.id} - ${milestone.title}`);
+
+    const candidates = await resolver.eligibleToolEvidence?.(24) ?? [];
+    if (candidates.length === 0) return { refreshed: false, remaining: labels() };
+
+    const milestones: PlanMilestone[] = [];
+    for (const milestone of this.#state.milestones) {
+      if (!stale.has(milestone.id)) { milestones.push(milestone); continue; }
+      // Prefer the freshest candidate matching the authority family the
+      // milestone was proven with; any eligible candidate outranks staleness.
+      const authorities = new Set(
+        milestone.evidence
+          .filter((reference) => reference.kind === "tool")
+          .map((reference) => reference.evidenceAuthority),
+      );
+      const pick = candidates.find((candidate) => authorities.has(candidate.evidenceAuthority)) ?? candidates[0]!;
+      const resolved = await resolver.resolve({ kind: "tool", evidenceId: pick.evidenceId });
+      milestones.push(resolved === undefined ? milestone : { ...milestone, evidence: [resolved] });
+    }
+    try {
+      const next = await this.update(
+        "runtime refresh: re-bound stale proof to fresh current-generation evidence",
+        milestones,
+      );
+      return {
+        refreshed: true,
+        revision: next.revision,
+        stateSha256: planStateSha256(next),
+        milestones: next.milestones.length,
+        remaining: await this.evidenceBlockers(),
+      };
+    } catch {
+      // The validated revision path refused (e.g. a reference shape it cannot
+      // advance). Fall back to the model-driven refresh — nothing was written.
+      return { refreshed: false, remaining: labels() };
+    }
+  }
+
+  /**
+   * Ownership-boundary drift guard. Scope entries are workspace-relative
+   * paths, directory prefixes, or globs. Enforcement activates only when at
+   * least one non-invalidated milestone declares scope, so scope-free plans
+   * stay unrestricted; once ownership is declared anywhere, a mutation of a
+   * path outside every declared scope is plan drift and returns a rejection
+   * reason with the current owners.
+   */
+  scopeBlocker(relativePath: string): string | undefined {
+    if (this.#state === undefined) return undefined;
+    const scoped = this.#state.milestones.filter(
+      (milestone) => milestone.status !== "invalidated" && milestone.scope.length > 0,
+    );
+    if (scoped.length === 0) return undefined;
+    const target = normalizeScopePath(relativePath);
+    for (const milestone of scoped) {
+      if (milestone.scope.some((entry) => scopeEntryMatches(entry, target))) return undefined;
+    }
+    const owners = scoped
+      .map((milestone) => `${milestone.id} owns [${milestone.scope.join(", ")}]`)
+      .join("; ");
+    return `Path '${relativePath}' is outside every declared milestone scope (${owners}). `
+      + "This mutation is plan drift. Work within the declared scope, or first revise the plan "
+      + "with plan.update, adding a milestone that owns this path, before mutating it.";
+  }
+
   requiredCriteria(): readonly string[] {
     return this.#requiredCriteria;
   }
@@ -343,12 +469,13 @@ export class PlanTool implements ToolPort {
     const criteria = ledger.requiredCriteria();
     this.definition = {
       name: this.name,
-      description: "Establish or revise the durable engineering plan. Revisions are monotonic: never delete or weaken a milestone. Proven milestones require fresh runtime-authorized independent execution/review or sealed-verifier evidence; reads, writes, state tools, and unmarked execute tools cannot prove work. Cite an eligible successful tool result with exactly {\"kind\":\"tool\",\"evidenceId\":\"<observation evidenceId>\"}; Vanguard derives its provider call id, tool, authority, workspace generation, journal sequence, and hash. Legacy callId-only citations remain supported. Never invent runtime fields or copy output text. Initial plans cannot contain invalidations. A later invalidation requires the latest user message to be exactly `VANGUARD_PLAN_INVALIDATION_APPROVAL {\"milestoneId\":\"<invalidated-id>\",\"supersededBy\":\"<superseding-id>\"}`. The non-invalidated superseder must inherit every acceptance criterion and contract criterion, and must remain unproven in that revision until later executable proof."
+      description: "Establish or revise the durable engineering plan. Revisions are monotonic: never delete or weaken a milestone. Proven milestones require fresh runtime-authorized independent execution/review or sealed-verifier evidence; reads, writes, state tools, and unmarked execute tools cannot prove work. Cite an eligible successful tool result with exactly {\"kind\":\"tool\",\"evidenceId\":\"<observation evidenceId>\"}; Vanguard derives its provider call id, tool, authority, workspace generation, journal sequence, and hash. If no successful observation includes evidenceAuthority, keep milestones active and run an independent check instead of guessing an ID. Legacy callId-only citations remain supported. Never invent runtime fields or copy output text. Initial plans cannot contain invalidations. A later invalidation requires the latest user message to be exactly `VANGUARD_PLAN_INVALIDATION_APPROVAL {\"milestoneId\":\"<invalidated-id>\",\"supersededBy\":\"<superseding-id>\"}`. The non-invalidated superseder must inherit every acceptance criterion and contract criterion, and must remain unproven in that revision until later executable proof."
         + (criteria.length === 0 ? "" : ` Contract criterion IDs that must be covered exactly: ${criteria.join(", ")}.`),
       inputSchema: {
         type: "object",
         properties: {
           summary: { type: "string" },
+          note: { type: "string", description: "Optional progress note for provider compatibility; milestone notes remain authoritative." },
           milestones: {
             type: "array",
             items: {
@@ -361,7 +488,7 @@ export class PlanTool implements ToolPort {
                 covers: { type: "array", items: { type: "string" } },
                 status: { type: "string", enum: [...MILESTONE_STATUSES] },
                 evidence: { type: "array", items: evidenceSchema() },
-                scope: { type: "array", items: { type: "string" } },
+                scope: { type: "array", items: { type: "string" }, description: "Workspace-relative paths, directory prefixes, or globs this milestone owns. Once any milestone declares scope, mutating a path outside every declared scope is rejected as plan drift; claim new paths by adding a milestone. Declare scope on every milestone or on none." },
                 note: { type: "string" },
                 invalidation: {
                   type: "object",
@@ -451,7 +578,11 @@ export class PlanTool implements ToolPort {
     for (const claim of claims) {
       const reference = await this.evidenceResolver?.resolve(claim);
       if (reference === undefined) {
-        throw new Error(`Milestone '${milestone}' cites evidence that does not resolve to one fresh runtime-authorized execution/review or sealed-verifier journal event. For tool evidence use exactly {"kind":"tool","evidenceId":"<eligible successful observation evidenceId>"}; reads, mutations, state operations, and unmarked execute tools are not proof.`);
+        const eligible = await this.evidenceResolver?.eligibleToolEvidence?.();
+        const recovery = eligible === undefined || eligible.length === 0
+          ? "No fresh eligible tool proof exists yet; keep the milestone active and run a successful independent execution or review before retrying."
+          : `Fresh eligible tool proof: ${eligible.map((item) => `${item.evidenceId} (${item.tool}, ${item.evidenceAuthority})`).join(", ")}.`;
+        throw new Error(`Milestone '${milestone}' cites evidence that does not resolve to one fresh runtime-authorized execution/review or sealed-verifier journal event. For tool evidence use exactly {"kind":"tool","evidenceId":"<eligible successful observation evidenceId>"}; reads, mutations, state operations, and unmarked execute tools are not proof. ${recovery}`);
       }
       resolved.push(reference);
     }
@@ -940,6 +1071,71 @@ async function atomicJsonWrite(file: string, state: PlanState): Promise<void> {
   } finally {
     await rm(temporary, { force: true });
   }
+}
+
+function normalizeScopePath(value: string): string {
+  const normalized = value
+    .replaceAll("\\", "/")
+    .replace(/^\.\//u, "")
+    .replace(/\/+$/u, "")
+    .replace(/\/{2,}/gu, "/");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+/**
+ * A scope entry matches a normalized workspace-relative path when it is the
+ * path itself, a directory containing it, or a matching glob. The glob subset
+ * mirrors workspace.glob: '**' spans directories, '*' and '?' stay within one
+ * segment, '[...]' classes pass through, and a pattern without '/' matches
+ * the basename. A malformed glob matches nothing rather than everything.
+ */
+function scopeEntryMatches(entry: string, normalizedTarget: string): boolean {
+  const scope = normalizeScopePath(entry);
+  if (scope.length === 0) return false;
+  if (!/[*?[]/u.test(scope)) {
+    return scope === "." || scope === normalizedTarget || normalizedTarget.startsWith(`${scope}/`);
+  }
+  let regex = "";
+  let index = 0;
+  while (index < scope.length) {
+    const char = scope[index]!;
+    if (char === "*") {
+      if (scope[index + 1] === "*") {
+        if (scope[index + 2] === "/") {
+          regex += "(?:[^/]+/)*";
+          index += 3;
+        } else {
+          regex += ".*";
+          index += 2;
+        }
+      } else {
+        regex += "[^/]*";
+        index += 1;
+      }
+    } else if (char === "?") {
+      regex += "[^/]";
+      index += 1;
+    } else if (char === "[") {
+      const closing = scope.indexOf("]", index + 2);
+      if (closing === -1 || scope.slice(index + 1, closing).includes("/")) return false;
+      regex += `[${scope.slice(index + 1, closing).replaceAll("\\", "\\\\")}]`;
+      index = closing + 1;
+    } else {
+      regex += char.replace(/[.+^${}()|\\]/u, "\\$&");
+      index += 1;
+    }
+  }
+  let matcher: RegExp;
+  try {
+    matcher = new RegExp(`^${regex}$`, "u");
+  } catch {
+    return false;
+  }
+  if (!scope.includes("/")) {
+    const basename = normalizedTarget.split("/").at(-1) ?? normalizedTarget;
+    return matcher.test(basename);
+  }
+  return matcher.test(normalizedTarget);
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

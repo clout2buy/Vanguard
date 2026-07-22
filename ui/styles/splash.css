@@ -1,0 +1,261 @@
+/* ============================================================
+   SPLASH — calibration protocol intro
+   Sequence states are driven by classes on #splash:
+   .s-grid → .s-word → .s-sub → .s-log → .s-stamp → .s-cta
+   ============================================================ */
+
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  background: var(--bg);
+  cursor: crosshair;
+  overflow: hidden;
+  transition: transform 0.95s var(--ease-io);
+}
+#splash.depart { transform: translateY(-100%); }
+#splash.depart .splash-stage { transform: translateY(6vh) scale(0.985); opacity: 0.4; }
+
+.splash-stage {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 0 8vw;
+  transition: transform 0.95s var(--ease-io), opacity 0.95s;
+}
+
+/* blueprint field */
+.splash-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(var(--line-soft) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line-soft) 1px, transparent 1px),
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 56px 56px, 56px 56px, 280px 280px, 280px 280px;
+  mask-image: radial-gradient(ellipse 90% 80% at 50% 45%, black 30%, transparent 78%);
+  opacity: 0;
+  transition: opacity 1.6s ease;
+}
+#splash.s-grid .splash-grid { opacity: 1; }
+
+.splash-vignette {
+  position: absolute; inset: 0; pointer-events: none;
+  background: radial-gradient(ellipse 120% 100% at 50% 50%, transparent 55%, rgba(0,0,0,0.55));
+}
+
+/* registration crosshairs */
+.crosshair {
+  position: absolute;
+  width: 22px; height: 22px;
+  opacity: 0;
+  transition: opacity 1s ease 0.4s;
+}
+#splash.s-grid .crosshair { opacity: 0.55; }
+.crosshair::before, .crosshair::after { content: ''; position: absolute; background: var(--ink-faint); }
+.crosshair::before { left: 50%; top: 0; width: 1px; height: 100%; }
+.crosshair::after { top: 50%; left: 0; height: 1px; width: 100%; }
+.crosshair.tl { top: 26px; left: 26px; }
+.crosshair.tr { top: 26px; right: 26px; }
+.crosshair.bl { bottom: 26px; left: 26px; }
+.crosshair.br { bottom: 26px; right: 26px; }
+
+/* meta strip */
+.splash-meta {
+  position: absolute;
+  top: 30px; left: 64px; right: 64px;
+  display: flex;
+  justify-content: space-between;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+  opacity: 0;
+  transition: opacity 0.8s ease 0.6s;
+}
+#splash.s-grid .splash-meta { opacity: 1; }
+.splash-meta .cal { color: var(--signal-hot); font-variant-numeric: tabular-nums; }
+
+/* the wordmark */
+.wordmark {
+  position: relative;
+  font-family: var(--font-display);
+  font-size: clamp(64px, 13.5vw, 220px);
+  line-height: 0.94;
+  letter-spacing: 0.015em;
+  color: var(--ink);
+  display: flex;
+  user-select: none;
+}
+.wordmark .wl { display: inline-block; overflow: hidden; padding: 0.06em 0; }
+.wordmark .wl > span {
+  display: inline-block;
+  transform: translateY(118%) skewY(9deg);
+  transition: transform 1.05s var(--ease-out);
+}
+#splash.s-word .wl > span { transform: none; }
+.wordmark .wl.accent > span { color: var(--signal); }
+
+/* measurement scan across the wordmark */
+.wordmark .scanline {
+  position: absolute;
+  top: -4%; bottom: -4%;
+  left: 0;
+  width: 2px;
+  background: linear-gradient(var(--signal), transparent 85%);
+  box-shadow: 0 0 24px 2px var(--signal-line);
+  opacity: 0;
+}
+#splash.s-word .scanline { animation: scan 1.5s var(--ease-io) 0.35s both; }
+@keyframes scan {
+  0% { left: -1%; opacity: 0; }
+  12% { opacity: 1; }
+  88% { opacity: 1; }
+  100% { left: 101%; opacity: 0; }
+}
+
+/* rule + subline */
+.splash-rule {
+  margin-top: 3.2vh;
+  height: 1px;
+  background: var(--line-bright);
+  transform: scaleX(0);
+  transform-origin: left;
+  transition: transform 1.1s var(--ease-io);
+}
+#splash.s-sub .splash-rule { transform: none; }
+
+.splash-sub {
+  margin-top: 2.2vh;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 24px;
+  overflow: hidden;
+}
+.splash-sub .tag {
+  font-family: var(--font-mono);
+  font-size: clamp(10px, 1.15vw, 14px);
+  letter-spacing: 0.42em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+  transform: translateY(140%);
+  transition: transform 0.9s var(--ease-out) 0.15s;
+}
+.splash-sub .tag b { color: var(--signal-hot); font-weight: 600; }
+#splash.s-sub .splash-sub .tag { transform: none; }
+.splash-sub .coords {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--ink-faint);
+  opacity: 0;
+  transition: opacity 0.8s ease 0.7s;
+}
+#splash.s-sub .coords { opacity: 1; }
+
+/* boot log — bottom left instrumentation */
+.splash-log {
+  position: absolute;
+  left: 64px;
+  bottom: 34px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--ink-dim);
+  min-height: 130px;
+}
+.splash-log .ll {
+  display: flex;
+  gap: 12px;
+  align-items: baseline;
+  opacity: 0;
+  transform: translateX(-10px);
+  transition: opacity 0.4s ease, transform 0.4s var(--ease-out);
+}
+.splash-log .ll.on { opacity: 1; transform: none; }
+.splash-log .ll .arrow { color: var(--signal); }
+.splash-log .ll .res { font-weight: 600; letter-spacing: 0.14em; }
+.splash-log .ll .res.ok { color: var(--verify); }
+.splash-log .ll .res.sig { color: var(--signal-hot); }
+
+/* the attestation stamp */
+.stamp {
+  position: absolute;
+  right: 9vw;
+  bottom: 16vh;
+  padding: 14px 22px;
+  border: 3px double var(--verify);
+  color: var(--verify);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  text-align: center;
+  line-height: 1.7;
+  transform: rotate(-8deg) scale(2.6);
+  opacity: 0;
+  pointer-events: none;
+  mix-blend-mode: screen;
+}
+.stamp small { display: block; font-size: 9px; letter-spacing: 0.22em; color: var(--ink-dim); }
+#splash.s-stamp .stamp { animation: stamp-in 0.5s var(--ease-io) both; }
+@keyframes stamp-in {
+  0% { transform: rotate(-8deg) scale(2.6); opacity: 0; }
+  60% { transform: rotate(-8deg) scale(0.94); opacity: 1; }
+  100% { transform: rotate(-8deg) scale(1); opacity: 1; }
+}
+#splash.s-stamp .splash-stage { animation: stamp-shake 0.4s ease 0.18s; }
+@keyframes stamp-shake {
+  0%, 100% { transform: translate(0, 0); }
+  30% { transform: translate(3px, -2px); }
+  60% { transform: translate(-2px, 2px); }
+}
+
+/* enter CTA */
+.splash-enter {
+  position: absolute;
+  left: 8vw;
+  bottom: 15vh;
+  display: inline-flex;
+  align-items: center;
+  gap: 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--ink);
+  padding: 18px 30px;
+  border: 1px solid var(--signal-line);
+  background: linear-gradient(90deg, var(--signal-soft), transparent 60%);
+  clip-path: inset(0 100% 0 0);
+  transition: clip-path 0.9s var(--ease-io), background 0.3s, color 0.3s, letter-spacing 0.35s;
+}
+#splash.s-cta .splash-enter { clip-path: inset(0 0 0 0); }
+.splash-enter .arrow { color: var(--signal); transition: transform 0.3s var(--ease-out); }
+.splash-enter:hover { background: var(--signal); color: #0c0500; letter-spacing: 0.36em; }
+.splash-enter:hover .arrow { color: #0c0500; transform: translateX(6px); }
+
+.splash-skip {
+  position: absolute;
+  right: 64px;
+  bottom: 38px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: 8px 4px;
+  border-bottom: 1px solid transparent;
+  transition: color 0.25s, border-color 0.25s;
+}
+.splash-skip:hover { color: var(--ink); border-color: var(--signal); }

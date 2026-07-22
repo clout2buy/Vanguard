@@ -46,6 +46,23 @@ test("public event stream exposes chat and tool flow without private reasoning",
   });
   assert.equal(processResult[0]?.detail, "exit 0");
   assert.doesNotMatch(JSON.stringify(processResult), /SECRET_FROM/);
+
+  const failed = presenter.present({
+    sequence: 5,
+    type: "tool.failed",
+    data: { ok: false, output: { exitCode: 1, stdout: "", stderr: "src/main.js:42: Unexpected token" } },
+  });
+  assert.equal(failed[0]?.detail, "exit 1 · src/main.js:42: Unexpected token");
+
+  const noisy = presenter.present({
+    sequence: 6,
+    type: "tool.failed",
+    data: { ok: false, output: { exitCode: 2, stderr: `${"noise line\n".repeat(100)}final: boom` } },
+  });
+  assert.match(noisy[0]?.detail ?? "", /^exit 2 · /u);
+  assert.match(noisy[0]?.detail ?? "", /final: boom$/u);
+  assert.ok((noisy[0]?.detail?.length ?? 0) <= 240, "the stderr tail stays bounded");
+  assert.doesNotMatch(noisy[0]?.detail ?? "", /\n/u, "the stderr tail is collapsed to one line");
 });
 
 test("public event stream reports recovery without exposing provider payloads", () => {
@@ -99,4 +116,28 @@ test("public event stream presents verifier and compaction state", () => {
   });
   assert.equal(projected[0]?.type, "context.compacted", "the public wire type remains backward compatible");
   assert.equal(projected[0]?.title, "Context projected");
+});
+
+test("a Responses-wire tool decision still emits its narration as agent.message", () => {
+  // The OpenAI Responses continuation is the raw output-item array with
+  // `output_text` blocks nested in `message` items — not a `content` string.
+  // Dropping it meant the TUI's provisional stream buffer never cleared and
+  // every later stream start printed a phantom "(stream reset — retrying)".
+  const presenter = new PublicRunEventPresenter();
+  const decision = presenter.present({
+    sequence: 1,
+    type: "model.decided",
+    data: {
+      kind: "tool",
+      call: { id: "call-1", name: "workspace.read", input: { path: "server.js" } },
+      continuation: [
+        { type: "reasoning", summary: [], content: "PRIVATE_CHAIN_OF_THOUGHT" },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "Hardening the timeout path now." }] },
+        { type: "function_call", call_id: "call-1", name: "workspace_read", arguments: "{}" },
+      ],
+    },
+  });
+  const message = decision.find((event) => event.type === "agent.message");
+  assert.equal(message?.message, "Hardening the timeout path now.");
+  assert.doesNotMatch(JSON.stringify(decision), /PRIVATE_CHAIN_OF_THOUGHT/);
 });

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import path from "node:path";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { LANGUAGE_PROFILES, type SupportTier } from "./repositoryModel.js";
@@ -71,9 +72,11 @@ const SYNTAX_STRATEGIES: readonly SyntaxStrategy[] = [
     command: (file) => ({ command: "gofmt", args: ["-e", file] }),
   },
   {
-    // TypeScript has no cheap file-local parse-only CLI (tsc needs the project
-    // graph); the syntax rung is a balanced-delimiter structural check and
-    // the type rung defers to the project's own tsc via targeted checks.
+    // TypeScript has no cheap parse-only CLI (tsc needs the project graph),
+    // so the rung parses in-process with the `typescript` compiler API when
+    // that module is resolvable — from the target workspace first, then from
+    // Vanguard's own installation — and only degrades to the structural
+    // delimiter check when neither exists. Types are still the tsc rung's job.
     language: "TypeScript",
     tier: "deep",
     extensions: [".ts", ".tsx", ".mts", ".cts"],
@@ -93,18 +96,68 @@ const EXTENSION_TO_STRATEGY = new Map<string, SyntaxStrategy>(
   SYNTAX_STRATEGIES.flatMap((strategy) => strategy.extensions.map((extension) => [extension, strategy])),
 );
 
+/** Minimal surface of the `typescript` compiler module used by the syntax rung. */
+export interface TypeScriptModuleLike {
+  transpileModule(input: string, options: {
+    fileName?: string;
+    reportDiagnostics?: boolean;
+    compilerOptions?: Record<string, unknown>;
+  }): { diagnostics?: ReadonlyArray<TypeScriptDiagnosticLike> };
+  flattenDiagnosticMessageText(message: unknown, newLine: string): string;
+  readonly DiagnosticCategory: { readonly Error: number };
+  readonly JsxEmit: { readonly Preserve: number };
+  readonly ScriptTarget: { readonly Latest: number };
+}
+
+export interface TypeScriptDiagnosticLike {
+  readonly category: number;
+  readonly code: number;
+  readonly messageText: unknown;
+  readonly start?: number;
+  readonly file?: { getLineAndCharacterOfPosition(position: number): { line: number; character: number } };
+}
+
+export type TypeScriptLoader = (workspaceRoot: string) => Promise<TypeScriptModuleLike | undefined>;
+
+/**
+ * Resolves the `typescript` module for in-process parsing: the target
+ * workspace's own installation wins (its parser matches the project's
+ * language level), then Vanguard's, and a missing module is a normal
+ * degradation to the structural rung — never an error.
+ */
+export async function loadWorkspaceTypeScript(workspaceRoot: string): Promise<TypeScriptModuleLike | undefined> {
+  try {
+    const require = createRequire(path.join(workspaceRoot, "package.json"));
+    return require("typescript") as TypeScriptModuleLike;
+  } catch {
+    // The workspace does not carry its own compiler; fall through.
+  }
+  try {
+    const imported = await import("typescript") as { default?: TypeScriptModuleLike };
+    return imported.default ?? (imported as unknown as TypeScriptModuleLike);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * The post-edit syntax rung. For a mutated file it runs the cheapest
  * available structural check: a first-party parse CLI for supported deep-tier
- * languages, a delimiter-balance heuristic for TypeScript and brace
- * languages, and an explicit "no cheap check" result otherwise (never a false
+ * languages, an in-process compiler-API parse for TypeScript, a
+ * delimiter-balance heuristic for brace languages without a resolvable
+ * parser, and an explicit "no cheap check" result otherwise (never a false
  * pass). Higher rungs — targeted type/lint/test, milestone integration, the
  * sealed verifier, and independent patch review — sit above this in the CLI.
  */
 export class PostEditSyntaxChecker {
+  private typescriptModule: Promise<TypeScriptModuleLike | undefined> | undefined;
+  /** Last result per file, keyed by content hash: re-checking an unchanged file is free. */
+  private readonly resultCache = new Map<string, { sha256: string; result: SyntaxCheckResult }>();
+
   constructor(
     private readonly runner: CommandRunner,
     private readonly workspace: WorkspaceBoundary,
+    private readonly typescriptLoader: TypeScriptLoader = loadWorkspaceTypeScript,
   ) {}
 
   async check(relativeFile: string): Promise<SyntaxCheckResult> {
@@ -113,10 +166,26 @@ export class PostEditSyntaxChecker {
     const absoluteFile = await this.workspace.existing(relativeFile);
     const contents = await readFile(absoluteFile, "utf8");
     const contentSha256 = createHash("sha256").update(contents).digest("hex");
+    const cached = this.resultCache.get(relativeFile);
+    if (cached?.sha256 === contentSha256) return cached.result;
+    const result = await this.checkUncached(relativeFile, absoluteFile, contents, contentSha256);
+    this.resultCache.set(relativeFile, { sha256: contentSha256, result });
+    return result;
+  }
+
+  private async checkUncached(
+    relativeFile: string,
+    absoluteFile: string,
+    contents: string,
+    contentSha256: string,
+  ): Promise<SyntaxCheckResult> {
     const extension = path.extname(relativeFile).toLowerCase();
     const strategy = EXTENSION_TO_STRATEGY.get(extension);
     const profile = LANGUAGE_PROFILES.find((candidate) => candidate.extensions.includes(extension));
 
+    if (strategy?.language === "TypeScript") {
+      return this.typescriptSyntax(relativeFile, contents, strategy, contentSha256);
+    }
     if (strategy !== undefined) {
       const spec = strategy.command(absoluteFile, contents);
       if (spec !== null) {
@@ -150,6 +219,64 @@ export class PostEditSyntaxChecker {
       tier: "unknown",
       language: "unknown",
       detail: "no syntax parser for this file type",
+      contentSha256,
+    };
+  }
+
+  /**
+   * The in-process TypeScript parse rung. `transpileModule` surfaces only
+   * syntactic diagnostics — no project graph, no type checking — which is
+   * exactly the shape of this rung: it proves the edit parses, and leaves
+   * types to the project's own tsc at the targeted-check rung.
+   */
+  private async typescriptSyntax(
+    relativeFile: string,
+    contents: string,
+    strategy: SyntaxStrategy,
+    contentSha256: string,
+  ): Promise<SyntaxCheckResult> {
+    this.typescriptModule ??= this.typescriptLoader(this.workspace.root).catch(() => undefined);
+    const ts = await this.typescriptModule;
+    if (ts === undefined) {
+      return this.structural(relativeFile, contents, strategy.language, strategy.tier, contentSha256);
+    }
+    let failures: TypeScriptDiagnosticLike[];
+    let render: (diagnostic: TypeScriptDiagnosticLike) => string;
+    try {
+      const result = ts.transpileModule(contents, {
+        fileName: relativeFile,
+        reportDiagnostics: true,
+        compilerOptions: { jsx: ts.JsxEmit.Preserve, target: ts.ScriptTarget.Latest },
+      });
+      failures = (result.diagnostics ?? []).filter((diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error);
+      render = (diagnostic) => {
+        const position = diagnostic.file !== undefined && diagnostic.start !== undefined
+          ? diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start)
+          : undefined;
+        const location = position === undefined ? "" : ` at ${position.line + 1}:${position.character + 1}`;
+        return `TS${diagnostic.code}${location}: ${ts.flattenDiagnosticMessageText(diagnostic.messageText, " ")}`;
+      };
+    } catch {
+      // A compiler-internal failure proves nothing either way; the structural
+      // scan may still prove a truncation, otherwise it is inconclusive.
+      return this.structural(relativeFile, contents, strategy.language, strategy.tier, contentSha256);
+    }
+    if (failures.length === 0) {
+      return {
+        status: "passed",
+        ok: true,
+        tier: strategy.tier,
+        language: strategy.language,
+        detail: "syntax ok (TypeScript parse)",
+        contentSha256,
+      };
+    }
+    return {
+      status: "failed",
+      ok: false,
+      tier: strategy.tier,
+      language: strategy.language,
+      detail: truncate(failures.slice(0, 5).map(render).join("; ")),
       contentSha256,
     };
   }

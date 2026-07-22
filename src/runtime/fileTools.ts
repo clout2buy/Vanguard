@@ -5,13 +5,17 @@ import { TextDecoder } from "node:util";
 import vm from "node:vm";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, stringField } from "./input.js";
+import { detectDegenerateRepetition, degenerateRepetitionError } from "./outputDegeneration.js";
 import { WorkspaceBoundary } from "./workspace.js";
 import { WorkspaceMutationPolicy } from "./mutationPolicy.js";
 import { WorkspaceVersionLedger } from "./versionLedger.js";
 
 const DEFAULT_IGNORED_DIRECTORIES = new Set([".git", ".vanguard", "node_modules", "dist", "coverage"]);
-const DEFAULT_READ_PAGE_BYTES = 64 * 1024;
-const MAX_READ_PAGE_BYTES = 128 * 1024;
+// Reads page one bounded range per model round-trip, so small pages tax big
+// files with extra decisions: 64KB pages forced 8 round trips for a 500KB
+// file. 256KB default / 1MB ceiling keeps paging safe while cutting trips.
+const DEFAULT_READ_PAGE_BYTES = 256 * 1024;
+const MAX_READ_PAGE_BYTES = 1024 * 1024;
 const READ_CURSOR_VERSION = 1;
 
 interface ReadByteRange {
@@ -35,11 +39,11 @@ export class ReadFileTool implements ToolPort {
       path: { type: "string", description: "Workspace-relative file path." },
       cursor: {
         type: "string",
-        description: "Opaque nextCursor from a prior read of the same unchanged file; mutually exclusive with range.",
+        description: "Opaque nextCursor from a prior read of the same unchanged file. Omit it for a first read; an empty string is treated as omitted. Mutually exclusive with range.",
       },
       range: {
         type: "object",
-        description: "Optional exact UTF-8 byte range: startByte is inclusive and endByte is exclusive.",
+        description: "Optional approximate UTF-8 byte range: startByte is inclusive and endByte is exclusive. Bounds are clamped to the file, one page, and complete UTF-8 characters; the response reports the range actually read with totalBytes and nextCursor.",
         properties: {
           startByte: { type: "integer", minimum: 0 },
           endByte: { type: "integer", minimum: 0 },
@@ -51,7 +55,7 @@ export class ReadFileTool implements ToolPort {
         type: "integer",
         minimum: 4,
         maximum: MAX_READ_PAGE_BYTES,
-        description: `Sequential page size in bytes; defaults to ${DEFAULT_READ_PAGE_BYTES} and cannot exceed ${MAX_READ_PAGE_BYTES}.`,
+        description: `Sequential page size in bytes; defaults to ${DEFAULT_READ_PAGE_BYTES} and cannot exceed ${MAX_READ_PAGE_BYTES}. It is ignored when an exact range is supplied.`,
       },
     },
     ["path"],
@@ -76,9 +80,6 @@ export class ReadFileTool implements ToolPort {
     }
     if (cursor !== undefined && requestedRange !== undefined) {
       throw new Error("Fields 'cursor' and 'range' are mutually exclusive.");
-    }
-    if (requestedRange !== undefined && fields.maxBytes !== undefined) {
-      throw new Error("Field 'maxBytes' cannot be combined with an exact 'range'.");
     }
 
     const file = await this.workspace.existing(relativePath);
@@ -113,8 +114,9 @@ export class ReadFileTool implements ToolPort {
       }
     }
 
-    const range = requestedRange ?? sequentialReadRange(bytes, cursor?.offset ?? 0, pageBytes);
-    validateReadRange(range, bytes);
+    const range = requestedRange === undefined
+      ? sequentialReadRange(bytes, cursor?.offset ?? 0, pageBytes)
+      : resolveReadRange(requestedRange, bytes);
     const contents = bytes.subarray(range.startByte, range.endByte).toString("utf8");
     const truncated = range.endByte < bytes.byteLength;
     const nextCursor = truncated
@@ -149,7 +151,9 @@ export class WriteFileTool implements ToolPort {
     {
       path: { type: "string", description: "Workspace-relative file path." },
       contents: { type: "string", description: "Complete UTF-8 file contents." },
+      contents_size: { type: "integer", minimum: 0, description: "Optional provider-supplied size metadata. Ignored; contents remains authoritative." },
       expectedSha256: { type: ["string", "null"], description: "Hash returned by workspace.read, or null for a new file." },
+      allowRepetition: { type: "boolean", description: "Acknowledge that heavily repeated identical lines are intentional; without it the degeneration guard rejects them." },
     },
     ["path", "contents"],
     "mutate",
@@ -198,6 +202,22 @@ export class WriteFileTool implements ToolPort {
       return { ok: false, output: { error: "Cannot match expectedSha256 because the file does not exist." } };
     }
 
+    if (optionalBooleanField(fields, "allowRepetition") !== true) {
+      const degenerate = detectDegenerateRepetition(contents, existing);
+      if (degenerate !== undefined) {
+        return {
+          ok: false,
+          output: {
+            error: degenerateRepetitionError(degenerate),
+            line: degenerate.line,
+            count: degenerate.count,
+            startLine: degenerate.startLine,
+            kind: degenerate.kind,
+          },
+        };
+      }
+    }
+
     await atomicWrite(destination, contents);
     this.versions?.record(relativePath, contentHash(contents));
     return {
@@ -217,6 +237,7 @@ export class ReplaceTextTool implements ToolPort {
       expectedSha256: { type: "string", description: "Hash returned by workspace.read." },
       before: { type: "string", description: "Exact unique text to replace." },
       after: { type: "string", description: "Replacement text." },
+      allowRepetition: { type: "boolean", description: "Acknowledge that heavily repeated identical lines are intentional; without it the degeneration guard rejects them." },
     },
     ["path", "before", "after"],
     "mutate",
@@ -259,6 +280,21 @@ export class ReplaceTextTool implements ToolPort {
     // A function replacement keeps `after` byte-literal: string replacement
     // would reinterpret $&, $', $`, and $$ as substitution patterns.
     const updated = contents.replace(before, () => after);
+    if (optionalBooleanField(fields, "allowRepetition") !== true) {
+      const degenerate = detectDegenerateRepetition(updated, contents);
+      if (degenerate !== undefined) {
+        return {
+          ok: false,
+          output: {
+            error: degenerateRepetitionError(degenerate),
+            line: degenerate.line,
+            count: degenerate.count,
+            startLine: degenerate.startLine,
+            kind: degenerate.kind,
+          },
+        };
+      }
+    }
     await atomicWrite(this.workspace.lexical(relativePath), updated);
     this.versions?.record(relativePath, contentHash(updated));
     return {
@@ -327,7 +363,7 @@ export class ListFilesTool implements ToolPort {
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
-    const requested = fields.path === undefined ? "." : stringField(fields, "path");
+    const requested = optionalWorkspacePath(fields);
     const root = await this.workspace.existing(requested);
     const files: string[] = [];
     const queue = [root];
@@ -366,7 +402,7 @@ export class SearchTextTool implements ToolPort {
     "Search bounded UTF-8 workspace files for literal text (default) or a regular expression, and return source locations with optional context lines.",
     {
       query: { type: "string", description: "Literal text, or a JavaScript regular expression when regex is true." },
-      path: { type: "string", description: "Optional workspace-relative directory." },
+      path: { type: "string", description: "Optional workspace-relative file or directory. An empty string searches the workspace root." },
       caseSensitive: { type: "boolean", description: "Whether letter case must match; defaults to true." },
       regex: { type: "boolean", description: "Interpret query as a regular expression matched per line; defaults to false." },
       filePattern: {
@@ -394,7 +430,7 @@ export class SearchTextTool implements ToolPort {
     const fields = objectInput(input);
     rejectUnknownFields(fields, ["query", "path", "caseSensitive", "regex", "filePattern", "context"], this.name);
     const query = stringField(fields, "query");
-    const requested = fields.path === undefined ? "." : stringField(fields, "path");
+    const requested = optionalWorkspacePath(fields);
     const caseSensitive = optionalBooleanField(fields, "caseSensitive") ?? true;
     const useRegex = optionalBooleanField(fields, "regex") ?? false;
     const contextLines = optionalIntegerField(fields, "context") ?? 0;
@@ -428,7 +464,14 @@ export class SearchTextTool implements ToolPort {
     }
 
     const root = await this.workspace.existing(requested);
-    const queue = [root];
+    const rootMetadata = await stat(root);
+    if (!rootMetadata.isFile() && !rootMetadata.isDirectory()) {
+      return { ok: false, output: { error: "Search path is not a regular file or directory." } };
+    }
+    const requestedFile = rootMetadata.isFile()
+      ? normalizeToolPath(path.relative(this.workspace.root, root))
+      : undefined;
+    const queue = [requestedFile === undefined ? root : path.dirname(root)];
     const matches: SearchMatch[] = [];
     const deadline = Date.now() + REGEX_SEARCH_BUDGET_MS;
     let truncated = false;
@@ -439,13 +482,14 @@ export class SearchTextTool implements ToolPort {
       for (const entry of await readdir(directory, { withFileTypes: true })) {
         const absolute = path.join(directory, entry.name);
         if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) {
+        if (entry.isDirectory() && requestedFile === undefined && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) {
           queue.push(absolute);
           continue;
         }
         if (entry.isDirectory()) continue;
         if (!entry.isFile()) continue;
         const relative = normalizeToolPath(path.relative(this.workspace.root, absolute));
+        if (requestedFile !== undefined && relative !== requestedFile) continue;
         if (pathFilter !== undefined && !pathFilter(relative)) continue;
         const metadata = await stat(absolute);
         if (metadata.size > this.maxFileBytes) continue;
@@ -514,7 +558,7 @@ export class GlobTool implements ToolPort {
     const fields = objectInput(input);
     rejectUnknownFields(fields, ["pattern", "path"], this.name);
     const pattern = stringField(fields, "pattern");
-    const requested = fields.path === undefined ? "." : stringField(fields, "path");
+    const requested = optionalWorkspacePath(fields);
     let matches: (relative: string) => boolean;
     try {
       matches = compileGlob(pattern);
@@ -693,9 +737,34 @@ async function atomicWrite(destination: string, contents: string): Promise<void>
   const temporary = path.join(path.dirname(destination), `.vanguard-${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, contents, { encoding: "utf8", flag: "wx" });
-    await rename(temporary, destination);
+    await renameWithRetry(temporary, destination);
   } finally {
     await rm(temporary, { force: true });
+  }
+}
+
+/**
+ * On OneDrive-synced folders the Windows sync client briefly holds a handle
+ * on a freshly written file, so `rename(temp, dest)` EPERM-fails even though
+ * nothing is actually wrong. Retry only the transient lock codes (EPERM,
+ * EACCES, EBUSY) with a short backoff; anything else throws immediately.
+ * The rename operation is injectable so the retry policy is testable.
+ */
+export async function renameWithRetry(
+  source: string,
+  destination: string,
+  renameOperation: (source: string, destination: string) => Promise<void> = rename,
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await renameOperation(source, destination);
+      return;
+    } catch (error) {
+      const retryable = error instanceof Error && "code" in error
+        && (error.code === "EPERM" || error.code === "EACCES" || error.code === "EBUSY");
+      if (!retryable || attempt >= 5) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50 * 2 ** attempt));
+    }
   }
 }
 
@@ -735,6 +804,12 @@ function optionalIntegerField(fields: Record<string, JsonValue>, name: string): 
   return value;
 }
 
+function optionalWorkspacePath(fields: Record<string, JsonValue>): string {
+  if (fields.path === undefined) return ".";
+  const requested = stringField(fields, "path");
+  return requested.length === 0 ? "." : requested;
+}
+
 function optionalReadRange(fields: Record<string, JsonValue>): ReadByteRange | undefined {
   const value = fields.range;
   if (value === undefined) return undefined;
@@ -754,7 +829,8 @@ function optionalReadCursor(fields: Record<string, JsonValue>): ReadCursorPayloa
   const value = fields.cursor;
   if (value === undefined) return undefined;
   if (typeof value !== "string") throw new Error("Field 'cursor' must be a string.");
-  if (value.length === 0 || value.length > 8_192) throw new Error("Field 'cursor' is invalid.");
+  if (value.length === 0) return undefined;
+  if (value.length > 8_192) throw new Error("Field 'cursor' is invalid.");
 
   let parsed: unknown;
   try {
@@ -807,26 +883,51 @@ function sequentialReadRange(bytes: Buffer, startByte: number, maxBytes: number)
   return { startByte, endByte };
 }
 
-function validateReadRange(range: ReadByteRange, bytes: Buffer): void {
-  const { startByte, endByte } = range;
+/**
+ * Resolve a requested range against the real file.
+ *
+ * Overshooting the end of a file is a normal request, not a caller error: the
+ * length is only knowable by reading, so demanding an exact endByte up front
+ * forces a guess-and-retry loop that burns turns and teaches nothing. This
+ * clamps to the file and to one page — exactly what the cursor path already
+ * does — and the result reports the range actually read next to totalBytes and
+ * nextCursor, so the caller can always continue. Model-supplied byte offsets
+ * are estimates: starts past EOF become an EOF read, and offsets inside a
+ * multi-byte character expand to the nearest safe boundaries. Only a genuinely
+ * incoherent range (inverted, negative, or unsafe integers) is refused.
+ */
+function resolveReadRange(range: ReadByteRange, bytes: Buffer): ReadByteRange {
   if (
-    !Number.isSafeInteger(startByte)
-    || !Number.isSafeInteger(endByte)
-    || startByte < 0
-    || endByte < startByte
-    || endByte > bytes.byteLength
+    !Number.isSafeInteger(range.startByte)
+    || !Number.isSafeInteger(range.endByte)
+    || range.startByte < 0
+    || range.endByte < range.startByte
   ) {
-    throw new Error("Field 'range' must be within the file and use startByte <= endByte.");
+    throw new Error("Field 'range' must use safe integers with 0 <= startByte <= endByte.");
   }
-  if (endByte - startByte > MAX_READ_PAGE_BYTES) {
-    throw new Error(`Field 'range' cannot exceed ${MAX_READ_PAGE_BYTES} bytes.`);
+
+  const clampedStart = Math.min(range.startByte, bytes.byteLength);
+  let startByte = clampedStart;
+  while (startByte > 0 && !isUtf8Boundary(bytes, startByte)) {
+    startByte -= 1;
   }
-  if (bytes.byteLength > 0 && startByte === endByte) {
+  const requestedEnd = Math.min(range.endByte, bytes.byteLength, startByte + MAX_READ_PAGE_BYTES);
+  let endByte = requestedEnd;
+  while (endByte > startByte && endByte < bytes.byteLength && !isUtf8Boundary(bytes, endByte)) {
+    endByte -= 1;
+  }
+
+  if (startByte === endByte && range.endByte > range.startByte && startByte < bytes.byteLength) {
+    // A narrow approximate range may land entirely inside one character.
+    // Include that complete character instead of returning a misleading empty page.
+    endByte = Math.min(bytes.byteLength, startByte + 1);
+    while (endByte < bytes.byteLength && !isUtf8Boundary(bytes, endByte)) {
+      endByte += 1;
+    }
+  } else if (startByte === endByte && range.endByte === range.startByte && clampedStart < bytes.byteLength) {
     throw new Error("Field 'range' must not be empty for a non-empty file.");
   }
-  if (!isUtf8Boundary(bytes, startByte) || !isUtf8Boundary(bytes, endByte)) {
-    throw new Error("Field 'range' must begin and end on UTF-8 character boundaries.");
-  }
+  return { startByte, endByte };
 }
 
 function isUtf8Boundary(bytes: Buffer, offset: number): boolean {

@@ -132,9 +132,11 @@ test("public events are allowlisted and redact environment and assignment secret
       title: "Run stopped",
       detail: "Inference endpoint returned HTTP 400: {\"raw_provider_payload\":true}",
     });
+    // The provider's message is kept (bounded, secret-scrubbed): it is what
+    // makes a 400 debuggable instead of an unactionable shrug.
     assert.equal(
       engine.events(session.sessionId).events[1]?.event.detail,
-      "Inference endpoint returned HTTP 400: [provider detail withheld]",
+      "Inference endpoint returned HTTP 400: {\"raw_provider_payload\":true}",
     );
     runner.runs.get(root)?.finish();
   } finally {
@@ -170,6 +172,31 @@ test("live session status observes the worker materialization transition", async
     assert.equal(engine.status(session.sessionId).state, "running");
     assert.equal(engine.events(session.sessionId).events[0]?.event.materialized, true);
     runner.runs.get(root)?.finish();
+  } finally {
+    await engine.shutdown();
+    await cleanup([root, source]);
+  }
+});
+
+test("engine persists in-place mode instead of relying on the worker environment", async () => {
+  const source = await workspace("engine-in-place");
+  const engine = new VanguardEngine({ runner: new FakeRunner() });
+  let root = "";
+  try {
+    const created = await engine.create({
+      workspace: source,
+      inPlace: true,
+      provider: "deepseek",
+      model: "test",
+      verification,
+    });
+    root = created.sessionRoot;
+    const metadata = JSON.parse(await readFile(path.join(root, "session.json"), "utf8")) as Record<string, unknown>;
+    const runConfig = JSON.parse(await readFile(path.join(root, "run-config.json"), "utf8")) as {
+      options: Record<string, unknown>;
+    };
+    assert.equal(metadata.inPlace, true);
+    assert.equal(runConfig.options.inPlace, true);
   } finally {
     await engine.shutdown();
     await cleanup([root, source]);

@@ -18,6 +18,7 @@ test("ollama profile defaults to keyless local chat completions", () => {
   assert.equal(profile.capabilities.streaming, true);
   assert.equal(profile.capabilities.parallelToolCalls, false);
   assert.equal(profile.capabilities.continuationReplay, false);
+  assert.ok(profile.credentialProvenance.source === "environment");
   assert.equal(profile.credentialProvenance.present, false);
 });
 
@@ -48,5 +49,6 @@ test("ollama accepts a custom https cloud endpoint", () => {
     endpoint: "https://ollama.com/v1/chat/completions",
   }, { OLLAMA_API_KEY: "key" });
   assert.equal(profile.endpoint, "https://ollama.com/v1/chat/completions");
+  assert.ok(profile.credentialProvenance.source === "environment");
   assert.equal(profile.credentialProvenance.present, true);
 });

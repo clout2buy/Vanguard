@@ -28,6 +28,13 @@ export interface TaskContract {
   readonly riskLevel?: "low" | "medium" | "high";
   readonly requiredVerification?: readonly string[];
   readonly deliverables?: readonly string[];
+  /**
+   * For user-facing deliverables: the named concept, identity, and attitude
+   * the work commits to. Correctness gates prove "done"; this is the part of
+   * the contract that defines "good", and it survives re-grounding with the
+   * rest of the contract text.
+   */
+  readonly creativeDirection?: string;
   readonly notes?: string;
 }
 
@@ -48,6 +55,17 @@ export const CONTROL_TOOL_NAMES = {
 export const PLAN_TOOL_NAME = "plan.update";
 
 /** The kernel's read-only view of the runtime-owned plan. */
+/** Result of a runtime-owned stale-proof refresh on the plan ledger. */
+export interface PlanProofRefresh {
+  /** True when stale proofs were re-bound to fresh evidence and persisted as a new revision. */
+  readonly refreshed: boolean;
+  readonly revision?: number;
+  readonly stateSha256?: string;
+  readonly milestones?: number;
+  /** Milestones still stale after the attempt, as "id - title" labels. */
+  readonly remaining: readonly string[];
+}
+
 export interface PlanStatusPort {
   /** True until an initial plan has been materialized. */
   isEmpty(): boolean;
@@ -55,6 +73,20 @@ export interface PlanStatusPort {
   unproven(): readonly string[];
   /** Proven milestones whose executable evidence is no longer current. */
   evidenceBlockers?(): Promise<readonly string[]>;
+  /**
+   * Runtime-owned staleness repair: re-bind proven-but-stale milestones to
+   * fresh current-generation execution/review evidence derived from the
+   * journal, persisting through the same validated revision path a
+   * model-driven plan.update would take. Never proves an unproven milestone.
+   */
+  refreshStaleProofs?(): Promise<PlanProofRefresh>;
+  /**
+   * Ownership-boundary drift guard: when milestones declare scope, a mutation
+   * of a workspace path that no non-invalidated milestone owns returns the
+   * rejection reason; undefined means the path is in scope (or no scope is
+   * declared anywhere, which keeps scope-free plans unrestricted).
+   */
+  scopeBlocker?(relativePath: string): string | undefined;
 }
 
 /**
@@ -138,6 +170,9 @@ export function normalizeContract(value: JsonValue | undefined): TaskContract | 
     ...(riskLevel === undefined ? {} : { riskLevel }),
     ...(requiredVerification.present ? { requiredVerification: requiredVerification.items } : {}),
     ...(deliverables.present ? { deliverables: deliverables.items } : {}),
+    ...(typeof value.creativeDirection === "string" && value.creativeDirection.length > 0
+      ? { creativeDirection: value.creativeDirection }
+      : {}),
     ...(typeof value.notes === "string" && value.notes.length > 0 ? { notes: value.notes } : {}),
   };
 }
@@ -154,6 +189,9 @@ export function renderContract(contract: TaskContract): string {
       ? ""
       : `\n\n${title}:\n${items.map((item) => `- ${item}`).join("\n")}`;
   const risk = contract.riskLevel === undefined ? "" : `\n\nRisk level: ${contract.riskLevel}`;
+  const creativeDirection = contract.creativeDirection === undefined
+    ? ""
+    : `\n\nCreative direction (commit to this identity in every element): ${contract.creativeDirection}`;
   const notes = contract.notes === undefined ? "" : `\n\nNotes: ${contract.notes}`;
   return `${contract.objective}`
     + section("Success criteria", contract.successCriteria)
@@ -162,6 +200,7 @@ export function renderContract(contract: TaskContract): string {
     + section("Assumptions", contract.assumptions)
     + section("Required verification", contract.requiredVerification)
     + section("Deliverables", contract.deliverables)
+    + creativeDirection
     + risk
     + notes;
 }
@@ -265,6 +304,13 @@ export interface ToolObservation {
    * cited as plan-milestone execution proof.
    */
   readonly smallChangeExecutionEvidence?: true;
+  /**
+   * Runtime-measured wall-clock cost of this exact call's execution, from
+   * dispatch to settled result. Presentation-grade truth: without it, clients
+   * can only bracket whole batches (fingerprints, journaling, and all) and
+   * every per-tool number they show is fiction.
+   */
+  readonly durationMs?: number;
   readonly callId: string;
   readonly tool: string;
   readonly ok: boolean;

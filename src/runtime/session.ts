@@ -43,11 +43,21 @@ export interface CodingSession {
   readonly inPlace?: true;
   /** Pristine baseline copy for in-place sessions. */
   readonly pristineRoot?: string;
+  /**
+   * Direct sessions edit the real project with no ceremony at all: no source
+   * fingerprint, no pristine copy, no baseline snapshot. The session container
+   * still holds the journal, plan, and checkpoints — none of which touch the
+   * project tree — but review/apply/undo and time travel have nothing to diff
+   * against and are refused. Version control is the user's safety net.
+   */
+  readonly direct?: true;
   readonly createdAt: string;
 }
 
 export interface CreateSessionOptions {
   readonly inPlace?: boolean;
+  /** Implies inPlace; skips fingerprints, copies, and baselines entirely. */
+  readonly direct?: boolean;
 }
 
 export interface MaterializeSessionWorkspaceOptions {
@@ -71,6 +81,7 @@ export async function createCodingSession(source: string, options: CreateSession
 export async function createSessionShell(source: string, options: CreateSessionOptions = {}): Promise<CodingSession> {
   const sourceRoot = await realpath(path.resolve(source));
   if (!(await stat(sourceRoot)).isDirectory()) throw new Error("Workspace must be a directory.");
+  const direct = options.direct === true;
   const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-session-"));
   const workspaceRoot = path.join(container, "workspace");
   const id = path.basename(container);
@@ -81,8 +92,11 @@ export async function createSessionShell(source: string, options: CreateSessionO
     metadataFile: path.join(container, "session.json"),
     baselineFile: path.join(container, "baseline.json"),
     materialized: false,
-    sourceFingerprint: await fingerprintSessionSource(sourceRoot),
-    ...(options.inPlace === true ? { inPlace: true as const } : {}),
+    // A direct session never walks the source tree: fingerprinting a home
+    // directory is exactly the cost direct mode exists to avoid.
+    ...(direct ? {} : { sourceFingerprint: await fingerprintSessionSource(sourceRoot) }),
+    ...(direct || options.inPlace === true ? { inPlace: true as const } : {}),
+    ...(direct ? { direct: true as const } : {}),
     createdAt: new Date().toISOString(),
   };
   await writeSessionMetadata(session);
@@ -100,7 +114,11 @@ export async function createSessionShellAt(
   source: string,
   container: string,
   initialize?: (stagingRoot: string, session: CodingSession) => Promise<void>,
+  options: CreateSessionOptions = {},
 ): Promise<CodingSession> {
+  if (options.direct === true) {
+    throw new Error("Durable sessions are identified by their source fingerprint, which direct mode never computes. Create a direct session without a durable container.");
+  }
   const sourceRoot = await realpath(path.resolve(source));
   if (!(await stat(sourceRoot)).isDirectory()) throw new Error("Workspace must be a directory.");
   const requestedContainer = path.resolve(container);
@@ -108,7 +126,7 @@ export async function createSessionShellAt(
   await mkdir(parent, { recursive: true });
 
   const existing = await openExistingSession(requestedContainer, sourceRoot);
-  if (existing !== undefined) return existing;
+  if (existing !== undefined) return assertRequestedSessionMode(existing, options);
 
   const staging = path.join(parent, `.${path.basename(requestedContainer)}.${randomUUID()}.tmp`);
   const session: CodingSession = {
@@ -119,6 +137,7 @@ export async function createSessionShellAt(
     baselineFile: path.join(requestedContainer, "baseline.json"),
     materialized: false,
     sourceFingerprint: await fingerprintSessionSource(sourceRoot),
+    ...(options.inPlace === true ? { inPlace: true as const } : {}),
     createdAt: new Date().toISOString(),
   };
   await mkdir(staging);
@@ -133,12 +152,19 @@ export async function createSessionShellAt(
     } catch (error) {
       const winner = await openExistingSession(requestedContainer, sourceRoot);
       if (winner === undefined) throw error;
-      return winner;
+      return assertRequestedSessionMode(winner, options);
     }
     return openCodingSession(requestedContainer);
   } finally {
     await rm(staging, { recursive: true, force: true });
   }
+}
+
+function assertRequestedSessionMode(session: CodingSession, options: CreateSessionOptions): CodingSession {
+  if ((session.inPlace === true) !== (options.inPlace === true) || session.direct === true) {
+    throw new Error("The existing durable session uses a different workspace mode.");
+  }
+  return session;
 }
 
 /**
@@ -154,6 +180,14 @@ export async function materializeSessionWorkspace(
   options: MaterializeSessionWorkspaceOptions = {},
 ): Promise<CodingSession> {
   if (session.materialized) return session;
+  // Direct sessions have nothing to materialize: no copy, no baseline. The
+  // flip to the real source tree happens here and at open time, exactly like
+  // in-place sessions, while metadata keeps the canonical container path.
+  if (session.direct === true) {
+    const materialized: CodingSession = { ...session, materialized: true };
+    await writeSessionMetadata(materialized);
+    return { ...materialized, workspaceRoot: session.sourceRoot };
+  }
   const container = await realpath(path.dirname(session.metadataFile));
   if (path.dirname(session.workspaceRoot) !== container) throw new Error("Session workspace is outside its container.");
   const sourceFingerprintBeforeCopy = await fingerprintSessionSource(session.sourceRoot);
@@ -203,6 +237,7 @@ export async function materializeSessionWorkspace(
  */
 async function copySessionWorkspace(sourceRoot: string, destinationRoot: string): Promise<void> {
   await mkdir(destinationRoot, { recursive: true });
+  const fileJobs: Array<() => Promise<void>> = [];
   const queue: Array<{ source: string; destination: string }> = [{ source: sourceRoot, destination: destinationRoot }];
   while (queue.length > 0) {
     const { source, destination } = queue.shift()!;
@@ -219,15 +254,20 @@ async function copySessionWorkspace(sourceRoot: string, destinationRoot: string)
         await mkdir(destinationPath, { recursive: true });
         queue.push({ source: sourcePath, destination: destinationPath });
       } else if (details.isFile()) {
-        try {
-          await copyFile(sourcePath, destinationPath);
-        } catch (error) {
-          if (!isLockedFileError(error)) throw error;
-          // Locked at the OS level: excluded from fingerprint and copy alike.
-        }
+        // Copies dominate first-launch time in large projects; run them on
+        // the bounded pool instead of one round-trip per file.
+        fileJobs.push(async () => {
+          try {
+            await copyFile(sourcePath, destinationPath);
+          } catch (error) {
+            if (!isLockedFileError(error)) throw error;
+            // Locked at the OS level: excluded from fingerprint and copy alike.
+          }
+        });
       }
     }
   }
+  await runFilePool(fileJobs);
 }
 
 /** Creates an isolated child at an already captured checkpoint. */
@@ -277,30 +317,36 @@ export async function openCodingSession(location: string): Promise<CodingSession
     throw new Error("Session metadata is malformed.");
   }
   const materialized = parsed.materialized !== false;
+  const direct = parsed.direct === true;
   const expectedWorkspace = path.join(container, "workspace");
   if (path.resolve(parsed.workspaceRoot) !== expectedWorkspace) {
     throw new Error("Session workspace does not belong to the requested session container.");
   }
-  if (materialized) await recoverInterruptedWorkspaceSwap(container, expectedWorkspace);
+  // A direct session's container never holds a workspace copy, so there is no
+  // interrupted swap to recover and no copy to validate.
+  if (materialized && !direct) await recoverInterruptedWorkspaceSwap(container, expectedWorkspace);
   const sourcePath = path.resolve(parsed.sourceRoot);
   if ((await lstat(sourcePath)).isSymbolicLink()) {
     throw new Error("Session source root was replaced by a symbolic link or junction.");
   }
-  if (materialized && (await lstat(expectedWorkspace)).isSymbolicLink()) {
+  if (materialized && !direct && (await lstat(expectedWorkspace)).isSymbolicLink()) {
     throw new Error("Session workspace root was replaced by a symbolic link or junction.");
   }
-  const workspaceRoot = materialized ? await realpath(parsed.workspaceRoot) : path.join(container, "workspace");
+  const workspaceRoot = materialized && !direct
+    ? await realpath(parsed.workspaceRoot)
+    : path.join(container, "workspace");
   if (path.dirname(workspaceRoot) !== container) {
     throw new Error("Session workspace does not belong to the requested session container.");
   }
   const lineage = validateLineage(parsed.lineage);
-  const inPlace = parsed.inPlace === true;
+  const inPlace = parsed.inPlace === true || direct;
   const resolvedSource = await realpath(sourcePath);
   return {
     id: parsed.id,
     sourceRoot: resolvedSource,
     // An in-place session works directly on the real source tree; the
-    // validated container workspace is its pristine baseline copy.
+    // validated container workspace is its pristine baseline copy. A direct
+    // session works on the source tree with no baseline at all.
     workspaceRoot: inPlace && materialized ? resolvedSource : workspaceRoot,
     metadataFile,
     baselineFile: path.join(container, "baseline.json"),
@@ -310,12 +356,16 @@ export async function openCodingSession(location: string): Promise<CodingSession
     ...(typeof parsed.journalGenesisHash === "string" ? { journalGenesisHash: parsed.journalGenesisHash } : {}),
     ...(lineage === undefined ? {} : { lineage }),
     ...(inPlace ? { inPlace: true as const } : {}),
-    ...(inPlace && materialized ? { pristineRoot: workspaceRoot } : {}),
+    ...(inPlace && materialized && !direct ? { pristineRoot: workspaceRoot } : {}),
+    ...(direct ? { direct: true as const } : {}),
     createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : new Date(0).toISOString(),
   };
 }
 
 export async function loadSessionBaseline(session: CodingSession): Promise<TreeSnapshot> {
+  if (session.direct === true) {
+    throw new Error("Direct sessions record no baseline: edits land straight in the project, so there is nothing to diff, apply, or undo. Use version control.");
+  }
   if (!session.materialized) throw new Error("Session workspace has not been materialized.");
   try {
     return await readTreeSnapshot(session.baselineFile);
@@ -327,13 +377,42 @@ export async function loadSessionBaseline(session: CodingSession): Promise<TreeS
   }
 }
 
+/** Content hashing beyond this size switches to size-based identity. */
+const LARGE_FILE_IDENTITY_BYTES = 8 * 1024 * 1024;
+const FILE_IO_CONCURRENCY = 8;
+
+/** Run async jobs with bounded parallelism; results keep job order. */
+async function runFilePool<T>(jobs: readonly (() => Promise<T>)[], limit = FILE_IO_CONCURRENCY): Promise<T[]> {
+  const results = new Array<T>(jobs.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, jobs.length) }, async () => {
+    while (true) {
+      const index = next;
+      next += 1;
+      if (index >= jobs.length) return;
+      results[index] = await jobs[index]!();
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 /**
  * Content-addressed source identity used across durable create and later
  * materialization. Paths and entry types are framed explicitly; file bytes
  * and symlink targets, rather than mutable timestamps, determine identity.
+ *
+ * Speed is a correctness property here: this walk runs before anything else
+ * a user sees, and on cloud-synced folders (OneDrive) reading a file forces
+ * a download while stat does not. Small files hash content in parallel;
+ * files past the large-file threshold are identified by size alone — size
+ * survives copying (mtime does not), so materialization checks still hold,
+ * at the documented cost that a same-size edit to a huge asset reads as
+ * unchanged. Assets that big are not what a coding session is guarding.
  */
 export async function fingerprintSessionSource(root: string): Promise<string> {
   const entries: string[] = [];
+  const hashJobs: Array<() => Promise<string | undefined>> = [];
   const queue = [root];
   while (queue.length > 0) {
     const directory = queue.shift()!;
@@ -351,19 +430,28 @@ export async function fingerprintSessionSource(root: string): Promise<string> {
           queue.push(absolute);
         }
       } else if (details.isFile()) {
-        const digest = await hashStableFileOrLocked(absolute, details);
-        // OS-locked files (registry hives, running executables) cannot be
-        // read and are never copied into a session, so they are invisible to
-        // the session model: excluded from fingerprints and copies alike,
-        // exactly like SESSION_EXCLUDED_DIRECTORIES. A file that later
-        // becomes readable enters the fingerprint and reads as source drift.
-        if (digest !== undefined) {
-          entries.push(JSON.stringify(["file", relative, details.mode & 0o7777, details.size, digest]));
+        if (details.size > LARGE_FILE_IDENTITY_BYTES) {
+          entries.push(JSON.stringify(["file", relative, details.mode & 0o7777, details.size, `large:${details.size}`]));
+          continue;
         }
+        hashJobs.push(async () => {
+          const digest = await hashStableFileOrLocked(absolute, details);
+          // OS-locked files (registry hives, running executables) cannot be
+          // read and are never copied into a session, so they are invisible
+          // to the session model: excluded from fingerprints and copies
+          // alike, exactly like SESSION_EXCLUDED_DIRECTORIES. A file that
+          // later becomes readable enters the fingerprint as source drift.
+          return digest === undefined
+            ? undefined
+            : JSON.stringify(["file", relative, details.mode & 0o7777, details.size, digest]);
+        });
       } else {
         throw new Error(`Source contains unsupported filesystem entry: ${relative}`);
       }
     }
+  }
+  for (const hashed of await runFilePool(hashJobs)) {
+    if (hashed !== undefined) entries.push(hashed);
   }
   entries.sort(compareOrdinal);
   return createHash("sha256").update(entries.join("\n")).digest("hex");
@@ -421,8 +509,10 @@ async function writeSessionMetadata(session: CodingSession): Promise<void> {
 async function writeSessionMetadataTo(file: string, session: CodingSession): Promise<void> {
   // Metadata always stores the canonical container workspace path, even when
   // an in-place session object carries the flipped source-tree workspaceRoot.
+  // Use the session's final metadata location rather than `file`: durable
+  // creation writes through an atomic staging directory before publication.
   const canonicalWorkspaceRoot = session.inPlace === true
-    ? path.join(path.dirname(file), "workspace")
+    ? path.join(path.dirname(session.metadataFile), "workspace")
     : session.workspaceRoot;
   await atomicWriteJson(file, {
     id: session.id,
@@ -434,6 +524,7 @@ async function writeSessionMetadataTo(file: string, session: CodingSession): Pro
     ...(session.journalGenesisHash === undefined ? {} : { journalGenesisHash: session.journalGenesisHash }),
     ...(session.lineage === undefined ? {} : { lineage: session.lineage }),
     ...(session.inPlace === true ? { inPlace: true } : {}),
+    ...(session.direct === true ? { direct: true } : {}),
     createdAt: session.createdAt,
   });
 }

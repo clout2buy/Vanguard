@@ -8,18 +8,29 @@ import { logicalRunEvents } from "./kernel/logicalHistory.js";
 import { nodePermissionFlag, resolveNodePackageManagerAlias } from "./runtime/nodePackageManager.js";
 import { detectProjectVerification, type CommandSpec } from "./runtime/projectVerification.js";
 import { SESSION_EXCLUDED_DIRECTORIES, TreeSnapshotCache, snapshotTree } from "./runtime/treeSnapshot.js";
+import { isCleanGitRepository } from "./runtime/gitTree.js";
 import {
   AgentKernel,
   CheckpointTool,
   CommandVerifier,
+  CreativeDirectionVerifier,
+  RenderableArtifactVerifier,
   DeleteFileTool,
   FileJournal,
+  HeadlessRenderTool,
   HttpModelAdapter,
+  renderDoctorReport,
+  runDoctor,
+  CodeIntelTool,
+  RepoMemoryStore,
+  RepoMemoryTool,
+  ScoutDelegateTool,
   ImageInspectionTool,
   JournalEvidenceResolver,
   GlobTool,
   ListFilesTool,
   ProcessTool,
+  prewarmExecutionRuntime,
   ReadFileTool,
   ReplaceTextTool,
   ReviewChangesTool,
@@ -30,11 +41,19 @@ import {
   WorkspaceMutationPolicy,
   WorkspaceVersionLedger,
   WriteFileTool,
+  OAUTH_PROVIDER_LABELS,
+  VANGUARD_PROVIDER_CONFIG_VERSION,
   createAnthropicModel,
   createCodingSession,
+  createConfiguredProviderModel,
+  isOAuthProvider,
+  oauthLogin,
+  oauthLogout,
+  oauthStatus,
+  vanguardHome,
+  type OAuthProvider,
   createDeepSeekModel,
   createOllamaModel,
-  createOpenAIModel,
   createSessionShell,
   materializeSessionWorkspace,
   analyzeTrajectory,
@@ -85,8 +104,14 @@ import {
 interface CliOptions {
   readonly workspace: string;
   readonly task: string;
-  readonly provider: "openai" | "anthropic" | "deepseek" | "ollama" | "http";
+  readonly provider: "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "http";
   readonly model: string;
+  /** Credential source. Defaults to the provider's API-key environment variable. */
+  readonly auth?: "api-key" | "oauth";
+  /** Runtime-enforced capability profile for delegated children. */
+  readonly agentProfile: "coder" | "explore" | "plan";
+  /** What the pre-claim gate accepts after a mutation. Defaults to independent execution. */
+  readonly executionEvidence?: "independent" | "syntax";
   readonly endpoint?: string;
   readonly verification: CommandSpec;
   readonly adaptiveVerification?: boolean;
@@ -94,6 +119,9 @@ interface CliOptions {
   readonly maxSteps: number;
   readonly maxDurationMs: number;
   readonly commandTimeoutMs: number;
+  readonly commandIdleTimeoutMs?: number;
+  /** Reasoning depth for OpenAI and Kimi; defaults to medium (env: VANGUARD_REASONING_EFFORT). "max" is Kimi's unbounded ceiling; OpenAI clamps it to high. */
+  readonly reasoningEffort?: "low" | "medium" | "high" | "max";
   readonly maxContextBytes: number;
   readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
@@ -117,6 +145,22 @@ async function main(): Promise<void> {
   }
   if (command === "--help" || command === "-h") {
     printUsage();
+    return;
+  }
+  if (command === "login" || command === "logout" || command === "auth") {
+    await authCommand(command, process.argv.slice(3));
+    return;
+  }
+  if (command === "doctor") {
+    const report = await runDoctor({
+      workspaceRoot: process.cwd(),
+      oauthConnected: async () => {
+        const status = await oauthStatus("anthropic");
+        return status.connected === true && status.expired !== true;
+      },
+    });
+    process.stdout.write(`${renderDoctorReport(report)}\n`);
+    process.exitCode = report.ready ? 0 : 1;
     return;
   }
   if (command === "advance") {
@@ -160,6 +204,9 @@ async function main(): Promise<void> {
 async function changeCommand(command: "review" | "apply" | "undo", args: readonly string[]): Promise<void> {
   const values = parseArgumentMap(args);
   const session = await openCodingSession(required(values, "--session"));
+  if (session.direct === true) {
+    throw new Error("This is a direct session: edits landed straight in the project with no baseline, so there is nothing to review, apply, or undo. Use version control (git diff, git checkout).");
+  }
   if (session.inPlace === true && command !== "review") {
     throw new Error("This is an in-place session: changes are already live in the project, so apply/undo transactions do not exist. Use 'vanguard session restore' to roll back to a checkpoint.");
   }
@@ -189,6 +236,9 @@ async function sessionCommand(args: readonly string[]): Promise<void> {
   if (subcommand === undefined) throw new Error("Session command requires checkpoint, list, restore, or fork.");
   const values = parseArgumentMap(args.slice(1));
   const session = await openCodingSession(required(values, "--session"));
+  if (session.direct === true) {
+    throw new Error("This is a direct session: it keeps no workspace baselines or checkpoints, so time travel does not exist. Use version control.");
+  }
   const container = path.dirname(session.metadataFile);
   const journal = await openSessionJournal(session, path.join(container, "run.jsonl"));
   if (subcommand === "checkpoint") {
@@ -231,7 +281,7 @@ function openSessionJournal(session: CodingSession, file: string): Promise<FileJ
 async function runCommand(resuming: boolean, args: readonly string[]): Promise<void> {
   const opened = resuming
     ? await openCodingSession(parseResumeSession(args))
-    : await createCodingSession(requiredArgument(args, "--workspace"), { inPlace: inPlaceRequested(args) });
+    : await createCodingSession(requiredArgument(args, "--workspace"), await sessionModeFor(args, requiredArgument(args, "--workspace")));
   const container = path.dirname(opened.metadataFile);
   await withSessionLease(container, resuming ? "run.resume" : "run.start", async () => {
     const session = resuming ? await openCodingSession(container) : opened;
@@ -275,7 +325,8 @@ async function advanceCommand(args: readonly string[]): Promise<void> {
   const sessionPath = single(values, "--session");
   const message = single(values, "--message");
   if (sessionPath === undefined) {
-    const session = await createSessionShell(required(values, "--workspace"), { inPlace: inPlaceRequested(args) });
+    const workspace = required(values, "--workspace");
+    const session = await createSessionShell(workspace, await sessionModeFor(args, workspace));
     const container = path.dirname(session.metadataFile);
     await withSessionLease(container, "advance", async () => {
       const options = await parseOptions(args, { requireTask: false });
@@ -338,14 +389,27 @@ async function advanceSessionUnlocked(
     // not: an interruption between journaling run.contracted and copying the
     // workspace must not strand the session on resume.
     if (!session.materialized) {
+      // Ten silent minutes in a big cloud-synced folder reads as a hang;
+      // say what is happening and what would skip it.
+      streamPublicEvent({
+        type: "session.mode",
+        agentId: "main",
+        status: "info",
+        title: "Preparing workspace",
+        detail: session.direct === true
+          ? "Direct session — nothing to copy"
+          : "Fingerprinting and copying the project (large or cloud-synced folders take longer; direct mode skips this)",
+      });
       session = await materializeSessionWorkspace(session);
       if (session.inPlace === true) {
-        process.stderr.write(`[Vanguard] IN-PLACE MODE: edits write directly to ${session.workspaceRoot}. A pristine baseline was captured for review and checkpoint rollback.\n`);
+        process.stderr.write(session.direct === true
+          ? `[Vanguard] DIRECT MODE: edits write straight to ${session.workspaceRoot}. No baseline is kept; use version control.\n`
+          : `[Vanguard] IN-PLACE MODE: edits write directly to ${session.workspaceRoot}. A pristine baseline was captured for review and checkpoint rollback.\n`);
         streamPublicEvent({
           type: "session.mode",
           agentId: "main",
           status: "info",
-          title: "In-place mode",
+          title: session.direct === true ? "Direct mode" : "In-place mode",
           detail: `Edits write directly to ${session.workspaceRoot}`,
         });
       }
@@ -401,6 +465,7 @@ function combinedObserver(presenter: StreamObserver, usage: UsageLedger): Stream
   return {
     started: (attempt) => presenter.started?.(attempt),
     delta: (text) => presenter.delta(text),
+    thinking: (text) => presenter.thinking?.(text),
     reset: () => presenter.reset?.(),
     committed: () => presenter.committed?.(),
     failed: (reason) => presenter.failed?.(reason),
@@ -421,15 +486,24 @@ function buildConversationRuntime(
   const versions = new WorkspaceVersionLedger();
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
   const { journal, journalActivity, markActivity } = instrumentJournal(fileJournal);
+  const conversationTools = [
+    new ListFilesTool(source),
+    new SearchTextTool(source),
+    new GlobTool(source),
+    new ReadFileTool(source, 1_000_000, versions),
+    new RepositoryMapTool(source, { includeInstructions: !options.disableExtensions }),
+    new HeadlessRenderTool(source),
+    new ImageInspectionTool(source),
+    new CodeIntelTool(source),
+  ];
   const kernel = new AgentKernel({
     model: createModel(options, createStreamPresenter(markActivity)),
     tools: [
-      new ListFilesTool(source),
-      new SearchTextTool(source),
-      new GlobTool(source),
-      new ReadFileTool(source, 1_000_000, versions),
-      new RepositoryMapTool(source, { includeInstructions: !options.disableExtensions }),
-      new ImageInspectionTool(source),
+      ...conversationTools,
+      // The internal delegation loop: scouts investigate on a separate model
+      // context and return digests, so even pre-contract exploration cannot
+      // flood the conversation with raw file contents.
+      new ScoutDelegateTool(createModel(options), conversationTools),
     ],
     verifiers: [],
     journal,
@@ -446,6 +520,50 @@ function buildConversationRuntime(
   return { kernel, mutationPolicyDescription: mutationPolicy.describe(), journalActivity };
 }
 
+/**
+ * Ask the owner about a command outside the allowlist, over the same control
+ * stream that carries steering: the question goes out as a public event the UI
+ * renders, and the answer arrives as an ordinary user message.
+ */
+function commandApprover(userChannel: UserChannelPort) {
+  return async (
+    request: { command: string; args: readonly string[]; cwd: string },
+    signal: AbortSignal,
+  ): Promise<"once" | "always" | "deny"> => {
+    const line = [request.command, ...request.args].join(" ");
+    const ask = (title: string): void => {
+      streamPublicEvent({
+        type: "approval.requested",
+        agentId: "main",
+        status: "info",
+        title,
+        detail: line,
+        message: line,
+      });
+    };
+    ask("Approval needed");
+    // Anything already queued predates the question and cannot be its answer.
+    userChannel.drain();
+    for (;;) {
+      const answer = await userChannel.wait(signal);
+      // A closed channel or an aborted run is not consent.
+      if (answer === undefined) return "deny";
+      const decision = parseApproval(answer);
+      if (decision !== undefined) return decision;
+      ask("Approval needed — answer 1, 2, or 3");
+    }
+  };
+}
+
+/** Accepts the numbered menu or the words behind it; anything else re-asks. */
+function parseApproval(answer: string): "once" | "always" | "deny" | undefined {
+  const value = answer.trim().toLowerCase();
+  if (value === "1" || value === "y" || value === "yes" || value === "once") return "once";
+  if (value === "2" || value === "a" || value === "always") return "always";
+  if (value === "3" || value === "n" || value === "no" || value === "deny") return "deny";
+  return undefined;
+}
+
 async function buildExecutionRuntime(
   session: CodingSession,
   options: CliOptions,
@@ -458,21 +576,30 @@ async function buildExecutionRuntime(
   const versions = new WorkspaceVersionLedger();
   const mutationPolicy = new WorkspaceMutationPolicy(options.editableRoots, options.protectedPaths);
   const commandTimeoutMs = Math.min(options.commandTimeoutMs, options.maxDurationMs);
+  // Idle watchdog for every process lane: agent commands, the sealed verifier,
+  // and the public check. A hung server or wedged test fixture is killed after
+  // sustained silence instead of occupying the full flat timeout.
+  const idleOption = options.commandIdleTimeoutMs === undefined
+    ? {}
+    : { idleTimeoutMs: Math.min(options.commandIdleTimeoutMs, commandTimeoutMs) };
   const agentAllowedCommands = options.restrictProcess
     ? [...new Set(["node", ...options.allowedCommands])]
     : [...new Set(["node", "npm", "npx", "git", options.verification.command, ...options.allowedCommands])];
   const processTool = new ProcessTool(workspace, {
     allowedCommands: agentAllowedCommands,
+    ...(userChannel === undefined ? {} : { requestApproval: commandApprover(userChannel) }),
     commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess, mutationPolicy.writableAbsoluteRoots(session.workspaceRoot)),
     deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-permission", "--no-experimental-permission"] : [],
     deniedArgumentSubstrings: options.restrictProcess ? ["console.assert"] : [],
     timeoutMs: commandTimeoutMs,
+    ...idleOption,
     maxOutputBytes: 2_000_000,
   });
   const verifierProcessTool = new ProcessTool(workspace, {
     allowedCommands: [options.verification.command],
     commandAliases: commandAliases(session.workspaceRoot, false, []),
     timeoutMs: commandTimeoutMs,
+    ...idleOption,
     maxOutputBytes: 2_000_000,
   });
   const publicCheckTool = options.publicCheck === undefined ? undefined : new FixedCommandTool(
@@ -482,6 +609,7 @@ async function buildExecutionRuntime(
       allowedCommands: [options.publicCheck.command],
       commandAliases: commandAliases(session.workspaceRoot, false, []),
       timeoutMs: commandTimeoutMs,
+      ...idleOption,
       maxOutputBytes: 2_000_000,
     }),
     options.publicCheck,
@@ -574,6 +702,37 @@ async function buildExecutionRuntime(
     && typeof contractedData === "object" && !Array.isArray(contractedData)
     ? normalizeContract(contractedData.contract)
     : undefined;
+  // Every provider gets the same browser-executed completion gate. The model
+  // cannot substitute source inspection or a plausible screenshot for a page
+  // that actually reaches a settled runtime state. The discovery scope keeps
+  // the gate honest without dragging Chromium into unrelated tasks: only
+  // session-touched files and files modified during this run qualify for the
+  // fallback scan, so a stale docs page elsewhere in the tree never triggers
+  // a render on every completion attempt.
+  const runtimeStartedAtMs = Date.now();
+  const renderScanScope = () => ({ touchedPaths: versions.paths(), modifiedSinceMs: runtimeStartedAtMs });
+  const completionRender = new HeadlessRenderTool(workspace);
+  // Overlap tool cold starts (TypeScript compiler, first Chromium launch)
+  // with the model's first thinking time instead of paying them inside the
+  // first verification of the run.
+  prewarmExecutionRuntime({ workspaceRoot: session.workspaceRoot, renderTool: completionRender });
+  verifiers.push(new RenderableArtifactVerifier(
+    workspace,
+    contract,
+    (relativePath, renderContext) => completionRender.execute({ path: relativePath }, renderContext),
+    renderScanScope,
+  ));
+  // The judge rung: a contracted creative direction makes "good" part of
+  // verification, judged from the rendered pixels where the wire carries them.
+  if (contract?.creativeDirection !== undefined) {
+    verifiers.push(new CreativeDirectionVerifier(
+      createModel(options),
+      workspace,
+      contract,
+      (relativePath, judgeContext) => completionRender.execute({ path: relativePath }, judgeContext),
+      renderScanScope,
+    ));
+  }
   const evidenceResolver = new JournalEvidenceResolver(fileJournal);
   const plan = await PlanLedger.open(
     path.join(container, "plan.json"),
@@ -595,6 +754,7 @@ async function buildExecutionRuntime(
     runner: new CliDelegateRunner({
       provider: options.provider,
       model: options.model,
+      ...(options.auth === undefined ? {} : { auth: options.auth }),
       ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
       verification: options.verification,
       ...(options.publicCheck === undefined ? {} : { publicCheck: options.publicCheck }),
@@ -618,6 +778,7 @@ async function buildExecutionRuntime(
   // a child. Delegation is offered only when the parent has a distinct trusted
   // public check the child can use for post-mutation execution evidence.
   const delegationTools = delegationDepth < delegationMaxDepth && options.publicCheck !== undefined
+    && options.agentProfile === "coder"
     ? createDelegationTools(delegation)
     : [];
   // Both durable states ride into every request as runtime-owned context.
@@ -632,6 +793,38 @@ async function buildExecutionRuntime(
   const observer: StreamObserver = interactive
     ? combinedObserver(createStreamPresenter(markActivity), usage)
     : { delta: () => {}, usage: (value) => usage.record(value) };
+  // Memory lives with the real project so it survives sessions; in isolated
+  // sessions the source tree is the durable home, not the disposable copy.
+  const repoMemory = new RepoMemoryStore(session.sourceRoot);
+  const memoryAddendum = await repoMemory.addendum();
+  const executionObserveTools = [
+    new ListFilesTool(workspace),
+    new SearchTextTool(workspace),
+    new GlobTool(workspace),
+    new ReadFileTool(workspace, 1_000_000, versions),
+    new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
+    new CodeIntelTool(workspace),
+  ];
+  // One checker instance serves both the model-facing tool and the runtime's
+  // automatic post-mutation rung; its content-hash cache makes a model
+  // re-check of an unchanged file free.
+  const postMutationSyntaxChecker = new PostEditSyntaxChecker(new SyntaxCommandRunner(), workspace);
+  const profileTools = options.agentProfile === "coder" ? [
+      new RepoMemoryTool(repoMemory),
+      new WriteFileTool(workspace, versions, mutationPolicy),
+      new ReplaceTextTool(workspace, versions, mutationPolicy),
+      new DeleteFileTool(workspace, versions, mutationPolicy),
+      ...(session.direct === true ? [] : [new ReviewChangesTool(session.pristineRoot ?? session.sourceRoot, session.workspaceRoot)]),
+      new HeadlessRenderTool(workspace),
+      new ImageInspectionTool(workspace),
+      new SyntaxCheckTool(postMutationSyntaxChecker),
+      new CheckpointTool(checkpoint),
+      new PlanTool(plan, evidenceResolver),
+      ...delegationTools,
+      ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
+      ...(options.exposeRawProcess ? [processTool] : []),
+      ...extensionTools,
+    ] : [];
   const kernel = new AgentKernel({
     model: createModel(options, observer),
     contextPolicy: new StickyContextPolicy(),
@@ -640,37 +833,42 @@ async function buildExecutionRuntime(
       new SearchTextTool(workspace),
       new GlobTool(workspace),
       new ReadFileTool(workspace, 1_000_000, versions),
-      new WriteFileTool(workspace, versions, mutationPolicy),
-      new ReplaceTextTool(workspace, versions, mutationPolicy),
-      new DeleteFileTool(workspace, versions, mutationPolicy),
-      new ReviewChangesTool(session.pristineRoot ?? session.sourceRoot, session.workspaceRoot),
-      new ImageInspectionTool(workspace),
+      // The internal delegation loop: reconnaissance on a separate model
+      // context that returns a digest instead of raw file contents.
+      new ScoutDelegateTool(createModel(options), executionObserveTools),
+      new CodeIntelTool(workspace),
       new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
-      new SyntaxCheckTool(new PostEditSyntaxChecker(new SyntaxCommandRunner(), workspace)),
-      new CheckpointTool(checkpoint),
-      new PlanTool(plan, evidenceResolver),
-      ...delegationTools,
-      ...(publicCheckTool === undefined ? [] : [publicCheckTool]),
-      ...(options.exposeRawProcess ? [processTool] : []),
-      ...extensionTools,
+      ...profileTools,
     ].map(withToolHooks),
     verifiers,
     journal,
     workingState,
-    workspaceState: {
-      fingerprint: (() => {
-        // One stat-validated cache per built runtime: boundary fingerprints
-        // run several times per step, and only changed files need re-hashing.
-        const fingerprintCache = new TreeSnapshotCache();
-        return async () => (await snapshotTree(session.workspaceRoot, {
-          excludedDirectories: SESSION_EXCLUDED_DIRECTORIES,
-          cache: fingerprintCache,
-        })).rootHash;
-      })(),
+    // Boundary fingerprinting hashes the whole workspace several times per
+    // step. That is the exact cost a direct session opts out of, so direct
+    // runs skip the out-of-band change monitor; tool effects still drive
+    // mutation epochs and evidence gates.
+    ...(session.direct === true ? {} : {
+      workspaceState: {
+        fingerprint: (() => {
+          // One stat-validated cache per built runtime: boundary fingerprints
+          // run several times per step, and only changed files need re-hashing.
+          const fingerprintCache = new TreeSnapshotCache();
+          return async () => (await snapshotTree(session.workspaceRoot, {
+            excludedDirectories: SESSION_EXCLUDED_DIRECTORIES,
+            cache: fingerprintCache,
+          })).rootHash;
+        })(),
+      },
+    }),
+    postMutationSyntaxCheck: async (relativePath) => {
+      const result = await postMutationSyntaxChecker.check(relativePath);
+      return { ok: result.ok, output: result as unknown as JsonValue };
     },
     plan,
     completionGates: [{ blockers: () => delegation.completionBlockers() }],
-    taskAddendum: `${taskAddendum(options, mutationPolicy)}${skillsAddendum}`,
+    taskAddendum: `${taskAddendum(options, mutationPolicy)}${options.agentProfile === "coder" ? "" : `\n\nThis is a runtime-enforced ${options.agentProfile} subagent. Only read-only workspace tools are available; return analysis, do not attempt edits.`}${session.direct === true
+      ? "\n\nThis is a direct session: you are editing the real project with no isolated copy and no baseline, and no workspace.changes review tool exists. Rely on targeted reads, version control, and executable checks for confidence."
+      : ""}${memoryAddendum}${skillsAddendum}`,
     ...(userChannel === undefined ? {} : { userChannel }),
     options: {
       maxSteps: options.maxSteps,
@@ -678,6 +876,9 @@ async function buildExecutionRuntime(
       maxRepeatedAction: 3,
       maxFailedVerificationAttempts: options.maxFailedVerificationAttempts,
       interactive,
+      // A project with no build/test contract has no independent check to run,
+      // so syntax is the strongest pre-claim evidence available.
+      ...(options.executionEvidence === undefined ? {} : { executionEvidence: options.executionEvidence }),
     },
   });
   return {
@@ -781,6 +982,7 @@ async function writeScorecard(context: ScorecardContext): Promise<void> {
     usage: context.usage?.usage() ?? null,
     estimatedCost: context.usage?.estimatedCost() ?? null,
     latency: context.usage?.latencyMs() ?? null,
+    cacheEfficiency: context.usage?.cacheEfficiency() ?? null,
     durationMs: Date.now() - context.startedAt,
     journalFile: context.journalFile,
     completedAt: new Date().toISOString(),
@@ -843,6 +1045,76 @@ function emitSessionReady(
   });
 }
 
+/** `vanguard login|logout|auth [anthropic|openai|kimi]` — subscription sign-in. */
+async function authCommand(command: "login" | "logout" | "auth", argv: readonly string[]): Promise<void> {
+  const target = argv[0];
+  if (target !== undefined && !isOAuthProvider(target)) {
+    throw new Error(`Unknown OAuth provider '${target}'. Use anthropic, openai, or kimi.`);
+  }
+  const providers: readonly OAuthProvider[] = target === undefined ? ["anthropic", "openai", "kimi"] : [target];
+
+  if (command === "auth") {
+    for (const provider of providers) {
+      const status = await oauthStatus(provider);
+      const detail = !status.connected
+        ? "not signed in"
+        : `${status.account ?? "signed in"}${status.plan === undefined ? "" : ` · plan: ${status.plan}`}`
+          + `${status.expired === true ? " (token expired; refreshes on next request)" : ""}`;
+      process.stdout.write(`${provider.padEnd(10)} ${detail}\n`);
+    }
+    process.stdout.write(`\nTokens: ${vanguardHome()}\n`);
+    return;
+  }
+
+  if (command === "logout") {
+    for (const provider of providers) {
+      await oauthLogout(provider);
+      process.stdout.write(`Signed out of ${OAUTH_PROVIDER_LABELS[provider]}.\n`);
+    }
+    return;
+  }
+
+  if (target === undefined) throw new Error("Login usage: vanguard login anthropic|openai|kimi");
+  const provider = providers[0]!;
+  process.stderr.write(`Opening your browser to sign in to ${OAUTH_PROVIDER_LABELS[provider]}…\n`);
+  // Always re-authorize: an explicit login is how a user switches accounts.
+  const status = await oauthLogin(provider, {
+    force: true,
+    onAuthorizeUrl: (url) => process.stderr.write(`If it does not open, visit:\n${url}\n\n`),
+  });
+  process.stdout.write(`Signed in to ${OAUTH_PROVIDER_LABELS[provider]}${status.account === undefined ? "" : ` as ${status.account}`}.\n`);
+}
+
+/**
+ * Reasoning effort for deep-reasoning wires. Left unset, a reasoning model
+ * runs at the backend's own default depth on every turn — including trivial
+ * ones — which reads as a hung agent in interactive sessions. "medium" keeps
+ * the flagship models responsive; VANGUARD_REASONING_EFFORT overrides.
+ */
+function configuredReasoningEffort(options: CliOptions): "low" | "medium" | "high" | "max" {
+  const value = options.reasoningEffort ?? process.env.VANGUARD_REASONING_EFFORT ?? "medium";
+  if (value !== "low" && value !== "medium" && value !== "high" && value !== "max") {
+    throw new Error("Reasoning effort must be low, medium, high, or max.");
+  }
+  return value;
+}
+
+/** The OpenAI Responses wire has no "max"; Kimi's ceiling clamps to high there. */
+function openaiReasoningEffort(options: CliOptions): "low" | "medium" | "high" {
+  const value = configuredReasoningEffort(options);
+  return value === "max" ? "high" : value;
+}
+
+/**
+ * Kimi K-series models think for minutes at their unbounded default depth,
+ * which dominated interactive turn latency. Thinking stays enabled — the
+ * models earn their keep with it — but the effort is bounded like OpenAI's,
+ * and "max" restores the unbounded ceiling for whoever asks for it.
+ */
+function kimiReasoning(options: CliOptions): { thinking: "enabled"; effort: "low" | "medium" | "high" | "max" } {
+  return { thinking: "enabled", effort: configuredReasoningEffort(options) };
+}
+
 function createModel(options: CliOptions, streamObserver?: StreamObserver) {
   const common = {
     model: options.model,
@@ -850,9 +1122,39 @@ function createModel(options: CliOptions, streamObserver?: StreamObserver) {
     maxAttempts: 4,
     ...(streamObserver === undefined ? {} : { streamObserver }),
   };
-  if (options.provider === "openai") return createOpenAIModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
+  if (options.auth === "oauth") {
+    if (options.provider !== "openai" && options.provider !== "anthropic" && options.provider !== "kimi") {
+      throw new Error("--auth oauth is available only for the openai, anthropic, and kimi providers.");
+    }
+    // The profile supplies the OAuth-appropriate endpoint (Codex for ChatGPT),
+    // so an explicit --endpoint stays an override rather than a requirement.
+    return createConfiguredProviderModel({
+      version: VANGUARD_PROVIDER_CONFIG_VERSION,
+      provider: options.provider,
+      model: options.model,
+      credential: { source: "oauth", provider: options.provider },
+      ...(options.provider === "anthropic" ? { apiVersion: "2023-06-01" } : {}),
+      ...(options.provider === "kimi" ? { reasoning: kimiReasoning(options) } : {}),
+      ...(options.provider === "openai" ? { reasoning: { effort: openaiReasoningEffort(options) } } : {}),
+      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    }, common);
+  }
+  if (options.provider === "openai") return createConfiguredProviderModel({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "openai",
+    model: options.model,
+    reasoning: { effort: openaiReasoningEffort(options) },
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+  }, common);
   if (options.provider === "anthropic") return createAnthropicModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.provider === "deepseek") return createDeepSeekModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
+  if (options.provider === "kimi") return createConfiguredProviderModel({
+    version: VANGUARD_PROVIDER_CONFIG_VERSION,
+    provider: "kimi",
+    model: options.model,
+    reasoning: kimiReasoning(options),
+    ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+  }, common);
   if (options.provider === "ollama") return createOllamaModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
   if (options.endpoint === undefined) throw new Error("--endpoint is required for the http provider.");
   return new HttpModelAdapter({ endpoint: options.endpoint, timeoutMs: common.timeoutMs, maxAttempts: common.maxAttempts });
@@ -962,9 +1264,24 @@ async function parseOptions(
   });
   const task = await resolveTaskInput(values, requireTask);
   const provider = required(values, "--provider");
-  if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "ollama"
+  if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "kimi" && provider !== "ollama"
     && provider !== "http") {
-    throw new Error("--provider must be openai, anthropic, deepseek, ollama, or http.");
+    throw new Error("--provider must be openai, anthropic, deepseek, kimi, ollama, or http.");
+  }
+  const authRaw = single(values, "--auth");
+  if (authRaw !== undefined && authRaw !== "api-key" && authRaw !== "oauth") {
+    throw new Error("--auth must be api-key or oauth.");
+  }
+  const evidenceRaw = single(values, "--execution-evidence");
+  if (evidenceRaw !== undefined && evidenceRaw !== "independent" && evidenceRaw !== "syntax") {
+    throw new Error("--execution-evidence must be independent or syntax.");
+  }
+  if (authRaw === "oauth" && provider !== "openai" && provider !== "anthropic" && provider !== "kimi") {
+    throw new Error("--auth oauth is available only for the openai, anthropic, and kimi providers.");
+  }
+  const agentProfileRaw = single(values, "--agent-profile") ?? "coder";
+  if (agentProfileRaw !== "coder" && agentProfileRaw !== "explore" && agentProfileRaw !== "plan") {
+    throw new Error("--agent-profile must be coder, explore, or plan.");
   }
   const model = required(values, "--model");
   const maxSteps = Number(single(values, "--max-steps") ?? "60");
@@ -984,6 +1301,16 @@ async function parseOptions(
   const commandTimeoutMs = Number(single(values, "--command-timeout-ms") ?? "1800000");
   if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs < 1) {
     throw new Error("--command-timeout-ms must be a positive integer.");
+  }
+  const commandIdleTimeoutRaw = single(values, "--command-idle-timeout-ms");
+  const commandIdleTimeoutMs = commandIdleTimeoutRaw === undefined ? undefined : Number(commandIdleTimeoutRaw);
+  if (commandIdleTimeoutMs !== undefined && (!Number.isSafeInteger(commandIdleTimeoutMs) || commandIdleTimeoutMs < 1)) {
+    throw new Error("--command-idle-timeout-ms must be a positive integer.");
+  }
+  const reasoningEffort = single(values, "--reasoning-effort");
+  if (reasoningEffort !== undefined && reasoningEffort !== "low" && reasoningEffort !== "medium"
+    && reasoningEffort !== "high" && reasoningEffort !== "max") {
+    throw new Error("--reasoning-effort must be low, medium, high, or max.");
   }
   const explicitCommand = single(values, "--verify-command");
   const detected = explicitCommand === undefined ? await detectProjectVerification(workspace) : undefined;
@@ -1018,6 +1345,9 @@ async function parseOptions(
     task,
     provider,
     model,
+    agentProfile: agentProfileRaw,
+    ...(authRaw === undefined ? {} : { auth: authRaw }),
+    ...(evidenceRaw === undefined ? {} : { executionEvidence: evidenceRaw }),
     verification,
     ...(adaptiveVerification === undefined ? {} : { adaptiveVerification: parseBoolean(adaptiveVerification, "--adaptive-verification") }),
     allowedCommands: values.get("--allow-command") ?? [],
@@ -1032,6 +1362,8 @@ async function parseOptions(
     maxSteps,
     maxDurationMs,
     commandTimeoutMs,
+    ...(commandIdleTimeoutMs === undefined ? {} : { commandIdleTimeoutMs }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     maxContextBytes,
     maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
@@ -1085,6 +1417,7 @@ async function readRunConfiguration(file: string): Promise<CliOptions> {
     securityProfile: parsed.options.securityProfile ?? "workspace",
     commandTimeoutMs: parsed.options.commandTimeoutMs ?? 1_800_000,
     disableExtensions: parsed.options.disableExtensions ?? false,
+    agentProfile: parsed.options.agentProfile ?? "coder",
   };
 }
 
@@ -1103,6 +1436,43 @@ function inPlaceRequested(args: readonly string[]): boolean {
   if (args.includes("--in-place")) return true;
   const environment = process.env.VANGUARD_IN_PLACE?.trim().toLowerCase() ?? "";
   return environment === "1" || environment === "true" || environment === "yes";
+}
+
+/**
+ * Direct mode edits the launch directory with no fingerprint, no session copy,
+ * and no baseline — the zero-ceremony mode. Implies in-place.
+ */
+function directRequested(args: readonly string[]): boolean {
+  if (args.includes("--direct")) return true;
+  const environment = process.env.VANGUARD_IN_PLACE?.trim().toLowerCase() ?? "";
+  return environment === "direct";
+}
+
+/**
+ * Isolated mode (disposable copy) is the fallback, and can be forced when a
+ * clean git repository would otherwise default to direct.
+ */
+function isolatedRequested(args: readonly string[]): boolean {
+  if (args.includes("--isolated")) return true;
+  const environment = process.env.VANGUARD_IN_PLACE?.trim().toLowerCase() ?? "";
+  return environment === "isolated" || environment === "off" || environment === "0" || environment === "no" || environment === "false";
+}
+
+/**
+ * Workspace mode resolution: explicit flags/env win first. With no explicit
+ * choice, a clean git repository already provides review (git diff), undo
+ * (git checkout), and a drift baseline, so Vanguard skips the copy and
+ * fingerprint tax and works direct. Anything else keeps the isolated copy.
+ */
+async function sessionModeFor(args: readonly string[], workspace: string): Promise<{ inPlace?: boolean; direct?: boolean }> {
+  if (directRequested(args)) return { inPlace: true, direct: true };
+  if (inPlaceRequested(args)) return { inPlace: true };
+  if (isolatedRequested(args)) return {};
+  if (await isCleanGitRepository(workspace)) {
+    process.stderr.write("vanguard: clean git repository — working directly in it (no copy, no baseline; git is your undo). --isolated overrides.\n");
+    return { inPlace: true, direct: true };
+  }
+  return {};
 }
 
 function requiredArgument(args: readonly string[], name: string): string {
@@ -1221,10 +1591,11 @@ function formatDuration(durationMs: number): string {
 }
 
 function printUsage(): void {
+  process.stdout.write("Kimi Code: vanguard login kimi; use --provider kimi --model kimi-for-coding --auth oauth.\n\n");
   process.stdout.write(`Safe review/apply commands:\n  vanguard review --session SESSION_PATH\n  vanguard apply --session SESSION_PATH --manifest SHA256 --confirm SHA256\n  vanguard undo --session SESSION_PATH --apply TRANSACTION_ID --confirm TRANSACTION_ID\n  vanguard session checkpoint|list|restore|fork --session SESSION_PATH [options]\n\n`);
   process.stdout.write("Security profiles: --security-profile workspace (default) or guarded (no raw process, restricted mode, summary verifier evidence)\n\n");
   process.stdout.write("Hermetic evaluation: --disable-extensions true ignores every user/workspace extension layer.\n\n");
-  process.stdout.write(`Vanguard expert coding agent\n\nUsage:\n  vanguard                         Start the conversational agent in the current directory\n  vanguard tui                     Start the conversational agent in the current directory\n  vanguard serve --stdio [--create-store ABS_PATH]\n                                   Start the versioned NDJSON engine protocol\n  vanguard advance --workspace PATH --provider P --model M [options] [--message TEXT]\n                                   Create a conversational session and advance it one turn\n  vanguard advance --session SESSION_PATH [--message TEXT]\n                                   Continue an existing conversational session\n  vanguard run --workspace PATH (--task TEXT | --task-file PATH) --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n\nDefault TUI overrides:\n  VANGUARD_PROVIDER                deepseek, openai, or anthropic\n  VANGUARD_MODEL                   Provider model ID\n  VANGUARD_MAX_STEPS               Expert turn budget (default: 240)\n  VANGUARD_CREATE_OPERATION_STORE  Absolute persistent store for idempotent stdio create\n\nAdvanced run options:\n  --task-file PATH        Read the task as strict UTF-8 instead of native-shell argument text\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --adaptive-verification BOOL  Blank-project mode requiring the agent to establish a build/test contract\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
+  process.stdout.write(`Vanguard expert coding agent\n\nUsage:\n  vanguard                         Start the conversational agent in the current directory\n  vanguard tui                     Start the conversational agent in the current directory\n  vanguard serve --stdio [--create-store ABS_PATH]\n                                   Start the versioned NDJSON engine protocol\n  vanguard advance --workspace PATH --provider P --model M [options] [--message TEXT]\n                                   Create a conversational session and advance it one turn\n  vanguard advance --session SESSION_PATH [--message TEXT]\n                                   Continue an existing conversational session\n  vanguard run --workspace PATH (--task TEXT | --task-file PATH) --provider openai|anthropic|deepseek --model MODEL [options]\n  vanguard resume --session SESSION_PATH\n  vanguard login anthropic|openai  Sign in with a Claude or ChatGPT subscription\n  vanguard logout [anthropic|openai]\n                                   Discard stored subscription tokens\n  vanguard auth [anthropic|openai] Show subscription sign-in status\n  vanguard doctor                  Check credentials, browser, and parser rungs; report degraded evidence capabilities\n\nDefault TUI overrides (each skips its launch selector):\n  VANGUARD_PROVIDER                deepseek, openai, anthropic, or ollama\n  VANGUARD_MODEL                   Provider model ID\n  VANGUARD_AUTH                    api-key or oauth (default: oauth when signed in)\n  VANGUARD_MAX_STEPS               Expert turn budget (default: 240)\n  VANGUARD_HOME                    Token directory (default: ~/.vanguard)\n  VANGUARD_CREATE_OPERATION_STORE  Absolute persistent store for idempotent stdio create\n\nAdvanced run options:\n  --task-file PATH        Read the task as strict UTF-8 instead of native-shell argument text\n  --verify-command CMD     Required sealed verifier executable when auto-detection is unavailable\n  --verify-arg ARG         Repeat for each sealed verifier argument\n  --check-command CMD      Trusted public compile/test executable exposed as project.check\n  --check-arg ARG          Repeat for each fixed public-check argument\n  --allow-command CMD      Repeat to expose another executable to the agent\n  --expose-raw-process BOOL Expose arbitrary allowlisted process.run calls (default: true)\n  --protect PATH           Repeat for files that must remain byte-identical\n  --editable-root PATH     Repeat to restrict all changes to these roots\n  --restrict-process BOOL  Confine Node subprocess filesystem access to the workspace\n  --verifier-evidence MODE Use full or summary verifier feedback\n  --adaptive-verification BOOL  Blank-project mode requiring the agent to establish a build/test contract\n  --auth MODE              api-key (default) or oauth for a Claude/ChatGPT subscription\n  --endpoint URL           Override provider endpoint, or required for provider=http\n  --max-steps N            Total agent step budget across resumes (default: 60)\n  --max-duration-ms N      Wall-clock budget per invocation (default: 7200000 / two hours)\n  --command-timeout-ms N   Per-build/test budget (default: 1800000 / thirty minutes)\n  --command-idle-timeout-ms N  Kill a command after N ms with no output (default: disabled; TUI: 90000)\n  --reasoning-effort LEVEL Reasoning depth for OpenAI and Kimi models: low, medium, high, or max (Kimi only; default: medium)\n  --max-context-bytes N    Provider context budget before evidence compaction (default: 2000000)\n  --max-verification-attempts N  Failed completion-claim budget (default: 3)\n`);
 }
 
 main().catch((error: unknown) => {

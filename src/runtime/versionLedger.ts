@@ -3,9 +3,13 @@ import { lowercaseInvariant } from "../deterministicText.js";
 
 export class WorkspaceVersionLedger {
   readonly #versions = new Map<string, string>();
+  /** Normalized key → the caller's original relative path, for enumeration. */
+  readonly #originals = new Map<string, string>();
 
   record(relativePath: string, sha256: string): void {
-    this.#versions.set(key(relativePath), sha256);
+    const normalized = key(relativePath);
+    this.#versions.set(normalized, sha256);
+    this.#originals.set(normalized, relativePath);
   }
 
   get(relativePath: string): string | undefined {
@@ -13,7 +17,14 @@ export class WorkspaceVersionLedger {
   }
 
   forget(relativePath: string): void {
-    this.#versions.delete(key(relativePath));
+    const normalized = key(relativePath);
+    this.#versions.delete(normalized);
+    this.#originals.delete(normalized);
+  }
+
+  /** Every path this session has observed or written through the file tools. */
+  paths(): readonly string[] {
+    return [...this.#originals.values()];
   }
 }
 

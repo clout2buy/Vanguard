@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   applyReviewedManifest,
   createCodingSession,
+  createSessionShellAt,
   FileJournal,
   openCodingSession,
   reviewSessionChanges,
@@ -102,5 +103,75 @@ test("sandboxed sessions are unchanged by the in-place feature", async () => {
   } finally {
     await rm(project, { recursive: true, force: true });
     if (container !== undefined) await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("durable session creation binds retries to the requested workspace mode", async () => {
+  const project = await projectFixture();
+  const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-inplace-owned-"));
+  await rm(container, { recursive: true, force: true });
+  try {
+    const created = await createSessionShellAt(project, container, undefined, { inPlace: true });
+    assert.equal(created.inPlace, true);
+    const retried = await createSessionShellAt(project, container, undefined, { inPlace: true });
+    assert.equal(retried.inPlace, true);
+    await assert.rejects(
+      createSessionShellAt(project, container),
+      /different workspace mode/u,
+    );
+  } finally {
+    await rm(project, { recursive: true, force: true });
+    await rm(container, { recursive: true, force: true });
+  }
+});
+
+test("a direct session edits the real tree with no fingerprint, copy, or baseline", async () => {
+  const project = await projectFixture();
+  let container: string | undefined;
+  try {
+    const session = await createCodingSession(project, { direct: true });
+    container = path.dirname(session.metadataFile);
+    assert.equal(session.direct, true);
+    assert.equal(session.inPlace, true, "direct implies in-place");
+    assert.equal(session.workspaceRoot, project, "the workspace is the real project");
+    assert.equal(session.materialized, true);
+    assert.equal(session.sourceFingerprint, undefined, "direct sessions never walk the source tree");
+    assert.equal(session.pristineRoot, undefined, "direct sessions keep no pristine copy");
+
+    // Nothing was copied and no baseline was recorded in the container.
+    await assert.rejects(() => readFile(path.join(container!, "baseline.json")), /ENOENT/u);
+    await assert.rejects(() => readFile(path.join(container!, "workspace", "readme.md")), /ENOENT/u);
+
+    // An edit through the workspace root lands in the real project.
+    await writeFile(path.join(session.workspaceRoot, "src", "main.ts"), "export const value = 3;\n");
+    assert.equal(await readFile(path.join(project, "src", "main.ts"), "utf8"), "export const value = 3;\n");
+
+    // The mode round-trips through metadata, flipping back to the real tree.
+    const reopened = await openCodingSession(container!);
+    assert.equal(reopened.direct, true);
+    assert.equal(reopened.inPlace, true);
+    assert.equal(reopened.workspaceRoot, project);
+    assert.equal(reopened.pristineRoot, undefined);
+
+    // Baseline-dependent flows refuse with a version-control pointer.
+    const { loadSessionBaseline } = await import("../src/index.js");
+    await assert.rejects(() => loadSessionBaseline(reopened), /no baseline.*version control/iu);
+  } finally {
+    if (container !== undefined) await rm(container, { recursive: true, force: true });
+    await rm(project, { recursive: true, force: true });
+  }
+});
+
+test("durable session containers refuse direct mode by name", async () => {
+  const project = await projectFixture();
+  const parent = await mkdtemp(path.join(os.tmpdir(), "vanguard-direct-durable-"));
+  try {
+    await assert.rejects(
+      () => createSessionShellAt(project, path.join(parent, "session"), undefined, { direct: true }),
+      /source fingerprint, which direct mode never computes/u,
+    );
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+    await rm(project, { recursive: true, force: true });
   }
 });

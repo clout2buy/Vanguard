@@ -6,11 +6,13 @@ import { createSecretRedactor, sanitizePublicEvent } from "../engine/security.js
 import { compareOrdinal } from "../deterministicText.js";
 
 export type DelegateState = "queued" | "running" | "completed" | "failed" | "cancelled" | "interrupted" | "merged";
+export type DelegateProfile = "coder" | "explore" | "plan";
 
 export interface DelegateRequest {
   readonly task: string;
   readonly scopes: readonly string[];
   readonly maxSteps: number;
+  readonly profile?: DelegateProfile;
 }
 
 export interface DelegateReview {
@@ -149,6 +151,7 @@ export class DelegationCoordinator {
       task: normalized.task,
       scopes: normalized.scopes,
       maxSteps: normalized.maxSteps,
+      profile: normalized.profile,
       depth: this.#depth + 1,
       createdAt: new Date().toISOString(),
     };
@@ -208,6 +211,7 @@ export class DelegationCoordinator {
   async merge(id: string, confirmation: string): Promise<DelegateRecord> {
     this.#assertOpen();
     const record = this.#required(id);
+    if ((record.profile ?? "coder") !== "coder") throw new Error(`A ${record.profile ?? "read-only"} subagent cannot be merged.`);
     if (record.state !== "completed" || record.review === undefined) {
       throw new Error("Only a completed, reviewed child can be merged.");
     }
@@ -310,6 +314,7 @@ export class DelegationCoordinator {
         task: record.task,
         scopes: record.scopes,
         maxSteps: record.maxSteps,
+        profile: record.profile ?? "coder",
         depth: record.depth,
       }, {
         onEvent: (event) => this.#onEvent({ ...sanitizePublicEvent(event), agentId: record.id }),
@@ -392,7 +397,7 @@ export class DelegationCoordinator {
   }
 }
 
-function validateRequest(request: DelegateRequest, maxChildSteps: number): DelegateRequest {
+function validateRequest(request: DelegateRequest, maxChildSteps: number): Required<DelegateRequest> {
   if (request === null || typeof request !== "object") throw new Error("Delegate request is required.");
   const task = request.task.trim();
   if (task.length === 0 || Buffer.byteLength(task) > 32_768) throw new Error("Delegate task must contain 1 to 32,768 UTF-8 bytes.");
@@ -400,7 +405,9 @@ function validateRequest(request: DelegateRequest, maxChildSteps: number): Deleg
     throw new Error("Delegate scopes must contain 1 to 16 workspace-relative roots.");
   }
   const scopes = [...new Set(request.scopes.map(normalizeScope))];
-  return { task, scopes, maxSteps: boundedInteger(request.maxSteps, "maxSteps", 1, maxChildSteps) };
+  const profile = request.profile ?? "coder";
+  if (profile !== "coder" && profile !== "explore" && profile !== "plan") throw new Error("Delegate profile must be coder, explore, or plan.");
+  return { task, scopes, maxSteps: boundedInteger(request.maxSteps, "maxSteps", 1, maxChildSteps), profile };
 }
 
 function validateStoredRecord(value: unknown, maxChildSteps: number): DelegateRecord {
@@ -411,12 +418,12 @@ function validateStoredRecord(value: unknown, maxChildSteps: number): DelegateRe
     || typeof record.createdAt !== "string" || !Number.isSafeInteger(record.depth)) {
     throw new Error("Delegation record is malformed.");
   }
-  validateRequest(record as DelegateRequest, maxChildSteps);
+  const normalized = validateRequest(record as DelegateRequest, maxChildSteps);
   if ((record.state === "completed" || record.state === "merged") && record.review === undefined) {
     throw new Error("Completed delegation lacks a review manifest.");
   }
   if (record.review !== undefined) validateReview(record.review);
-  return record as DelegateRecord;
+  return { ...record, profile: normalized.profile } as DelegateRecord;
 }
 
 function validateReview(review: DelegateReview): DelegateReview {

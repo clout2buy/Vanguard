@@ -23,22 +23,48 @@ evidence, but its artifact explicitly sets `competitiveClaimEligible: false`
 and `phase13CertificationEligible: false`. See
 [`docs/LIVE_RESULTS.md`](docs/LIVE_RESULTS.md) for the complete audit record.
 
-It also exposes a versioned engine surface for embedding in other agents:
+## Powered by Vanguard
 
-```powershell
-vanguard serve --stdio
-```
+Vanguard is built to be the coding core inside *other* agents, not just a
+standalone CLI. An agent that embeds it inherits the whole
+verification-first runtime — contracted execution, journaling, recovery,
+independent verifiers, review/apply/undo — and only has to render events and
+deliver user messages. The supported integration surfaces, in order of
+directness:
 
-The same surface is available in TypeScript through `VanguardEngine`. See
-[`docs/ENGINE_PROTOCOL.md`](docs/ENGINE_PROTOCOL.md) and the clients under
-`examples/`.
+1. **In-process engine (Node hosts)** — construct `VanguardEngine`, create a
+   session per task, call `advance()`, and render the sanitized public event
+   stream. Mid-run `steer()`, `cancel()`, and `stopAndWait()` give the host
+   full control. This is the primary surface; the walkthrough is
+   [`docs/EMBEDDING.md`](docs/EMBEDDING.md) and a runnable client is
+   [`examples/embedded-engine.mjs`](examples/embedded-engine.mjs).
+2. **Stdio protocol (any language)** — run `vanguard serve --stdio` and speak
+   versioned NDJSON. Same session model as the in-process engine, so a host
+   can start on stdio and move in-process without redesign. Contract:
+   [`docs/ENGINE_PROTOCOL.md`](docs/ENGINE_PROTOCOL.md); client:
+   [`examples/stdio-client.mjs`](examples/stdio-client.mjs).
+3. **Host-loop adapters** — agents with an existing orchestration loop map
+   Vanguard sessions onto it the way `AresVanguardAdapter` does (fail-closed,
+   off by default, kill-switched). The adapter is the reference pattern for
+   any host that owns its own routing:
+   [`docs/ARES_INTEGRATION.md`](docs/ARES_INTEGRATION.md).
+4. **Extension ports** — hosts extend the runtime itself (skills, custom
+   tools, MCP servers, hooks, provider adapters) through the fail-closed
+   config boundary in [`docs/EXTENSIONS.md`](docs/EXTENSIONS.md), so an
+   embedding agent can ship its own capabilities without forking.
+5. **Browser front ends** — [`ui/`](ui/) is a working reference: a
+   dependency-free web UI whose [`ui/bridge.mjs`](ui/bridge.mjs) drives one
+   embedded `VanguardEngine` over loopback HTTP/SSE (providers, OAuth login,
+   sessions, advance/steer/cancel, live events).
 
-The off-by-default Ares migration adapter, rollout/kill-switch contract, and
-20-user beta protocol are documented in
-[`docs/ARES_INTEGRATION.md`](docs/ARES_INTEGRATION.md).
+Session outcomes are engine-derived, never inferred from model text, and the
+event stream is sanitized for display — the embedding host never has to parse
+agent output to know what happened.
 
-Native provider support uses documented HTTP contracts plus API keys or an
-explicit custom endpoint; it never extracts another CLI's OAuth/session
+Native provider support uses documented HTTP contracts plus API keys, an
+explicit custom endpoint, or a Claude/ChatGPT subscription signed in through
+`vanguard login`. Subscription tokens are minted by Vanguard's own OAuth flow
+and stored under `~/.vanguard`; it never extracts another CLI's OAuth/session
 tokens. Versioned provider profiles and the offline conformance boundary are
 documented in [`docs/PROVIDERS.md`](docs/PROVIDERS.md). Supported Node/OS
 versions, launchers, and clean-tarball smoke testing are documented in
@@ -82,14 +108,14 @@ Then open PowerShell in any codebase and run:
 vanguard
 ```
 
-The default launch is a real conversation with the model, not a task launcher. The kernel itself is stateful: it starts in conversation mode, where the model can reply, inspect the repository with read-only tools, or ask a clarifying question — and nothing can be mutated, scaffolded, or verified. Coding begins only when the model emits an explicit task contract (`task.execute` with an objective and success criteria) drawn from an actionable request; the disposable workspace copy is materialized at that moment, never before. During execution, plain model text is narration that streams live into the terminal, completion requires an explicit `task.complete` claim that independent verifiers must accept, and the model can ask with `user.ask` when it is blocked on something only you know — the run stays alive while you answer, and a composer at the bottom of the screen lets you steer the work at any time; steering lands safely at the next decision boundary and is journaled so it survives interruption. Vanguard silently uses DeepSeek V4 Pro, a 240-turn expert budget, the stored credential, and the strongest project verification it can detect; in a blank project, the adaptive trusted verifier requires Vanguard to establish a deterministic build/test contract. The animated view streams agent messages, tool calls, build results, compaction, and verifier state. The original project remains unchanged; the final handoff prints the disposable workspace, journal, scorecard, and resume command.
+The default launch is a real conversation with the model, not a task launcher. The kernel itself is stateful: it starts in conversation mode, where the model can reply, inspect the repository with read-only tools, or ask a clarifying question — and nothing can be mutated, scaffolded, or verified. Coding begins only when the model emits an explicit task contract (`task.execute` with an objective and success criteria) drawn from an actionable request; the disposable workspace copy is materialized at that moment, never before. During execution, plain model text is narration that streams live into the terminal, completion requires an explicit `task.complete` claim that independent verifiers must accept, and the model can ask with `user.ask` when it is blocked on something only you know — the run stays alive while you answer, and a composer at the bottom of the screen lets you steer the work at any time; steering lands safely at the next decision boundary and is journaled so it survives interruption. Launch opens a provider and model selector — arrow keys, Enter — that shows which providers are ready to run and offers subscription sign-in for Claude and ChatGPT; setting `VANGUARD_PROVIDER` and `VANGUARD_MODEL` skips it entirely so Vanguard stays scriptable. Vanguard then silently uses a 240-turn expert budget, the selected credential, and the strongest project verification it can detect; in a blank project, the adaptive trusted verifier requires Vanguard to establish a deterministic build/test contract. The animated view streams agent messages, tool calls, build results, compaction, and verifier state as an inline transcript in your normal terminal scrollback: every message, tool card (with its target, duration, and failure reason), and verifier verdict prints once and stays — scroll up at any time, nothing is ever deleted. A two-line footer pinned beneath the transcript shows exactly what is running right now (tool, target, elapsed time, turn budget) above the composer, so a minute of model thinking reads as progress, never a freeze. Set `VANGUARD_NO_INTRO=1` to skip the launch animation. The original project remains unchanged; the final handoff prints the disposable workspace, journal, scorecard, and resume command.
 
-Advanced provider overrides are available through `VANGUARD_PROVIDER`, `VANGUARD_MODEL`, and `VANGUARD_MAX_STEPS`; the explicit `vanguard run ...` interface remains available for evaluation and policy configuration.
+Advanced provider overrides are available through `VANGUARD_PROVIDER`, `VANGUARD_MODEL`, `VANGUARD_ENDPOINT`, and `VANGUARD_MAX_STEPS`; the explicit `vanguard run ...` interface remains available for evaluation and policy configuration. The Ollama launcher discovers the local daemon, the authenticated direct Cloud API when `OLLAMA_API_KEY` is present, and Ollama's current public Cloud library. Its model picker is searchable and scrollable; Cloud entries that are not installed yet are pulled through the signed-in local daemon when selected.
 
 ## Review, apply, and time travel
 
-Execution still never edits the original project. Returning verified work is
-an explicit, content-addressed workflow:
+In an isolated or in-place session, execution never edits the original
+project. Returning verified work is an explicit, content-addressed workflow:
 
 ```powershell
 vanguard review --session C:\path\to\vanguard-session
@@ -100,6 +126,20 @@ vanguard undo --session C:\path\to\vanguard-session --apply apply-ID --confirm a
 Review produces a deterministic JSON manifest. Apply refuses if either the
 original project or candidate changed after review, and rolls back injected or
 ordinary partial failures. Undo refuses if anything changed after apply.
+
+### Workspace modes
+
+The default is zero-ceremony where the safety net already exists: in a clean
+git work tree (any untracked-but-not-ignored change counts as dirty) Vanguard
+works **direct** — edits land in the real tree as the model makes them, with
+no session copy, no baseline snapshot, and no per-step tree fingerprinting.
+`git diff` is the review surface and `git checkout` is the undo; review/apply/
+undo and time travel have nothing to diff against and are refused in this
+mode. Dirty trees and non-git directories get the **isolated** disposable copy
+with the full review/apply/undo workflow. `--in-place` keeps edits in the real
+tree but retains a pristine baseline copy for review and rollback;
+`--isolated` (or `VANGUARD_IN_PLACE=isolated`) forces the copied workspace,
+and `--direct` forces the zero-ceremony mode.
 
 Durable candidate snapshots are available through `vanguard session
 checkpoint`, `list`, `restore`, and `fork`. Restore requires an exact

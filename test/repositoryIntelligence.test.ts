@@ -74,6 +74,34 @@ test("hermetic repository maps omit extension instruction names and contents", a
   }
 });
 
+test("repository map accepts root aliases and workspace-relative directory scopes", async () => {
+  const root = await scaffold({
+    "package.json": "{}\n",
+    "src/index.ts": "export const value = 1;\n",
+    "src/worker.py": "print(1)\n",
+  });
+  try {
+    const tool = new RepositoryMapTool(new WorkspaceBoundary(root), { includeInstructions: false });
+    const context = { task: "inspect", step: 1, signal: new AbortController().signal };
+    for (const pathAlias of [undefined, "", "."]) {
+      const result = await tool.execute(pathAlias === undefined ? {} : { path: pathAlias }, context);
+      assert.equal(result.ok, true);
+      assert.equal((result.output as { fileCount: number }).fileCount, 3);
+    }
+
+    const scoped = await tool.execute({ path: "src" }, context);
+    assert.equal(scoped.ok, true);
+    assert.equal((scoped.output as { path: string }).path, "src");
+    assert.equal((scoped.output as { fileCount: number }).fileCount, 2);
+    assert.deepEqual(
+      (scoped.output as { languages: { language: string }[] }).languages.map((language) => language.language).sort(),
+      ["Python", "TypeScript"],
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("repository model tiers languages: Python/Rust/Go deep, Java/C# generic", async () => {
   const cases: { files: Record<string, string>; language: string; tier: string; build: string }[] = [
     { files: { "pyproject.toml": "", "app/main.py": "print(1)\n", "app/test_app.py": "def test(): pass\n" }, language: "Python", tier: "deep", build: "python/pyproject" },
@@ -188,9 +216,12 @@ test("post-edit syntax checker falls back to structural check when the toolchain
   }
 });
 
-test("TypeScript uses the structural rung and generic languages get a structural check too", async () => {
+test("TypeScript gets a real compiler parse and generic languages get a structural check", async () => {
   const root = await scaffold({
     "src/a.ts": "export const x: number = 1;",
+    "src/broken.ts": "const x: = {};",
+    "src/typeError.ts": "const wrong: number = notDeclaredAnywhere;",
+    "src/component.tsx": "export const View = () => <div>ok</div>;",
     "Main.java": "class Main { }",
     "notes.txt": "anything at all (",
   });
@@ -200,13 +231,37 @@ test("TypeScript uses the structural rung and generic languages get a structural
     const ts = await checker.check("src/a.ts");
     assert.equal(ts.language, "TypeScript");
     assert.equal(ts.tier, "deep");
-    assert.equal(ts.status, "inconclusive");
+    assert.equal(ts.status, "passed", "a real parse must prove a valid file, not shrug");
+    const broken = await checker.check("src/broken.ts");
+    assert.equal(broken.status, "failed", "a delimiter-balanced parse error must still fail");
+    assert.match(broken.detail, /TS\d+/u);
+    const typeError = await checker.check("src/typeError.ts");
+    assert.equal(typeError.status, "passed", "the syntax rung must not leak type checking");
+    const tsx = await checker.check("src/component.tsx");
+    assert.equal(tsx.status, "passed", "JSX must parse in .tsx files");
     const java = await checker.check("Main.java");
     assert.equal(java.tier, "generic");
     assert.equal(java.status, "inconclusive");
     const unknownType = await checker.check("notes.txt");
     assert.equal(unknownType.status, "inconclusive", "unknown file types cannot claim syntax validity");
     assert.equal(unknownType.tier, "unknown");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("TypeScript degrades to the structural rung when no compiler module is resolvable", async () => {
+  const root = await scaffold({
+    "src/a.ts": "export const x: number = 1;",
+    "src/truncated.ts": "export function f() { return [1, 2;",
+  });
+  const runner: CommandRunner = { async run() { return { exitCode: 0, output: "" }; } };
+  try {
+    const checker = new PostEditSyntaxChecker(runner, new WorkspaceBoundary(root), async () => undefined);
+    const balanced = await checker.check("src/a.ts");
+    assert.equal(balanced.status, "inconclusive", "without a parser the rung must not claim a pass");
+    const truncated = await checker.check("src/truncated.ts");
+    assert.equal(truncated.status, "failed");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

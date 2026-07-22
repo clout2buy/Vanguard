@@ -20,12 +20,31 @@ export const VANGUARD_IDEMPOTENT_CREATE_CAPABILITY = "sessions.create.idempotent
 export const VANGUARD_WORKER_FENCING_CAPABILITY = "sessions.workerFenced" as const;
 export const VANGUARD_EXECUTION_TREE_FENCING_CAPABILITY = "sessions.executionTreeFenced" as const;
 
-export type VanguardProvider = "openai" | "anthropic" | "deepseek" | "ollama" | "http";
+export type VanguardProvider = "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "http";
 
 export interface VanguardSessionConfig {
   readonly workspace: string;
+  /**
+   * Edit the selected workspace directly while retaining a pristine session
+   * baseline for review and rollback. This is persisted with the session so
+   * embedded callers and resumed workers cannot disagree about where edits go.
+   */
+  readonly inPlace?: boolean;
+  /** Edit the launch directory itself: no fingerprint, no copy, no baseline. Implies inPlace. */
+  readonly direct?: boolean;
   readonly provider: VanguardProvider;
   readonly model: string;
+  /**
+   * Credential source for the provider. Defaults to `api-key` (the provider's
+   * environment variable); `oauth` uses the subscription tokens minted by
+   * `vanguard login` and is accepted only for openai, anthropic, and kimi.
+   */
+  readonly auth?: "api-key" | "oauth";
+  /**
+   * What the pre-claim gate accepts after a mutation. `syntax` suits a project
+   * with no build/test contract, where no independent check exists to run.
+   */
+  readonly executionEvidence?: "independent" | "syntax";
   readonly endpoint?: string;
   readonly verification?: CommandSpec;
   readonly publicCheck?: CommandSpec;
@@ -41,6 +60,8 @@ export interface VanguardSessionConfig {
   readonly maxSteps?: number;
   readonly maxDurationMs?: number;
   readonly commandTimeoutMs?: number;
+  /** Kill an agent-run command after this long with no output; unset disables the idle watchdog. */
+  readonly commandIdleTimeoutMs?: number;
   readonly maxContextBytes?: number;
   readonly maxFailedVerificationAttempts?: number;
 }

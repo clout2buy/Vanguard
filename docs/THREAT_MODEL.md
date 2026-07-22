@@ -4,10 +4,12 @@ Status: Phase 12 local security boundary, 2026-07-13.
 
 Vanguard is a coding engine, not a universal operating-system sandbox. Its
 runtime separates model proposals from trusted completion checks, confines its
-own file tools to a disposable workspace, protects declared paths, journals
-state, and requires explicit evidence. Those controls prevent a large class of
-accidental and model-driven mistakes. They do not make arbitrary project code
-safe to execute on a developer workstation.
+own file tools to a disposable workspace (or, in a clean git work tree, works
+direct with version control as the declared undo path — see README "Workspace
+modes"), protects declared paths, journals state, and requires explicit
+evidence. Those controls prevent a large class of accidental and model-driven
+mistakes. They do not make arbitrary project code safe to execute on a
+developer workstation.
 
 ## Assets and trust boundaries
 

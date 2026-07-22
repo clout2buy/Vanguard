@@ -62,6 +62,25 @@ test("search filePattern restricts scope and context lines are returned", async 
   }
 });
 
+test("search accepts a single file path and empty root paths", async () => {
+  const root = await fixture();
+  try {
+    const search = new SearchTextTool(new WorkspaceBoundary(root));
+    const single = await search.execute({ query: "alpha", path: "src/alpha.ts" }, context);
+    assert.equal(single.ok, true);
+    assert.deepEqual(
+      (single.output as { matches: Array<{ path: string }> }).matches.map((match) => match.path),
+      ["src/alpha.ts"],
+    );
+
+    const fromEmptyRoot = await search.execute({ query: "needle_beta", path: "" }, context);
+    assert.equal(fromEmptyRoot.ok, true);
+    assert.equal((fromEmptyRoot.output as { matches: unknown[] }).matches.length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("catastrophic regex fails closed instead of hanging", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-redos-"));
   try {

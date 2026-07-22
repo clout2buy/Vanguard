@@ -34,8 +34,13 @@ export interface ModelWireCodec {
   /**
    * Optional streaming support: an accumulator for one response. Only
    * user-visible text may reach onTextDelta — never reasoning or thinking.
+   * Reasoning/thinking deltas may reach onThinkingDelta for live progress
+   * display; the two channels never mix.
    */
-  createStreamAccumulator?(onTextDelta?: (text: string) => void): StreamAccumulator;
+  createStreamAccumulator?(
+    onTextDelta?: (text: string) => void,
+    onThinkingDelta?: (text: string) => void,
+  ): StreamAccumulator;
 }
 
 export interface HeaderProvider {
@@ -54,6 +59,8 @@ export interface StreamObserver {
   started?(attempt: number): void;
   /** User-visible provisional text. Never reasoning or thinking. */
   delta(text: string): void;
+  /** Live reasoning/thinking progress. Display-only; never part of the reply. */
+  thinking?(text: string): void;
   /** Discard all provisional text; the response is being retried. */
   reset?(): void;
   /** The decision decoded successfully; provisional text is now final. */
@@ -223,14 +230,46 @@ export class HttpModelAdapter implements ModelPort {
             visibleText = false;
           }
           observer?.started?.(attempt);
-          const accumulator = this.#codec.createStreamAccumulator!((text) => {
-            visibleText = true;
-            observer?.delta(text);
-          });
+          const accumulator = this.#codec.createStreamAccumulator!(
+            (text) => {
+              visibleText = true;
+              observer?.delta(text);
+            },
+            (text) => observer?.thinking?.(text),
+          );
+          // Stall watchdog: a wedged connection can hold the socket open for
+          // the full flat attempt timeout without delivering a single SSE
+          // chunk. Abort the attempt after stallMs of inactivity instead; the
+          // abort is re-armed on every chunk and surfaces below as a
+          // retryable timeout, so the normal retry/failure logic handles it.
+          const stallMs = Number(process.env.VANGUARD_STREAM_STALL_MS) > 0
+            ? Number(process.env.VANGUARD_STREAM_STALL_MS)
+            : 120_000;
+          const stall = new AbortController();
+          attemptSignal.addEventListener("abort", () => stall.abort(), { once: true });
+          let stallTimer: ReturnType<typeof setTimeout> | undefined;
+          const armStallWatchdog = (): void => {
+            if (stallTimer !== undefined) clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => stall.abort(), stallMs);
+          };
           try {
-            await consumeServerSentEvents(response, accumulator, attemptSignal);
+            armStallWatchdog();
+            await consumeServerSentEvents(
+              response,
+              accumulator,
+              AbortSignal.any([attemptSignal, stall.signal]),
+              armStallWatchdog,
+            );
           } catch (error) {
             reportPartialUsage(accumulator, observer);
+            if (stall.signal.aborted && !attemptSignal.aborted) {
+              throw new InferenceError(
+                "timeout",
+                `Inference stream stalled for ${stallMs}ms without an SSE chunk.`,
+                undefined,
+                true,
+              );
+            }
             if (error instanceof SyntaxError || error instanceof StreamProtocolError) {
               const detail = error instanceof StreamProtocolError
                 ? error.message
@@ -238,6 +277,8 @@ export class HttpModelAdapter implements ModelPort {
               throw new InferenceError("protocol", detail, response.status, true);
             }
             throw error;
+          } finally {
+            if (stallTimer !== undefined) clearTimeout(stallTimer);
           }
           let canonical: JsonValue;
           try {
@@ -337,6 +378,7 @@ export class HttpModelAdapter implements ModelPort {
     return {
       started: (attempt) => safely(() => source.started?.(attempt)),
       delta: (text) => safely(() => source.delta(text)),
+      thinking: (text) => safely(() => source.thinking?.(text)),
       reset: () => safely(() => source.reset?.()),
       committed: () => safely(() => source.committed?.()),
       failed: (reason) => safely(() => source.failed?.(reason)),
@@ -461,7 +503,13 @@ export class VanguardJsonCodec implements ModelWireCodec {
 
 /** Whether a compatible endpoint actually honored the stream flag. */
 function isEventStream(response: Response): boolean {
-  const contentType = response.headers.get("content-type") ?? "";
+  const contentType = response.headers.get("content-type");
+  // The Codex backend streams SSE with no content-type header at all
+  // (verified against the live endpoint). The call site only asks when a
+  // stream was requested, so an unlabeled 200 is the stream we asked for;
+  // demanding the label here misrouted valid SSE into the JSON parser, which
+  // reported it as "malformed JSON".
+  if (contentType === null || contentType.trim().length === 0) return true;
   return contentType.includes("text/event-stream");
 }
 
@@ -484,11 +532,15 @@ function reportUsage(canonical: JsonValue, observer: StreamObserver | undefined)
 /**
  * Reads an SSE response body, feeding each event's data payload to the
  * accumulator. Handles multi-line data fields and the [DONE] terminator.
+ * `onChunk` fires on every received body chunk so callers can re-arm an
+ * inactivity watchdog; the signal aborts even a pending read, because a
+ * stalled connection delivers no chunk for an in-loop check to observe.
  */
 async function consumeServerSentEvents(
   response: Response,
   accumulator: StreamAccumulator,
   signal?: AbortSignal,
+  onChunk?: () => void,
 ): Promise<void> {
   if (response.body === null) throw new Error("Streaming response has no body.");
   const decoder = new TextDecoder();
@@ -529,8 +581,12 @@ async function consumeServerSentEvents(
     }
     // event:/id:/retry:/comment lines carry no payload we need.
   };
-  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+  const chunks = signal === undefined
+    ? response.body as unknown as AsyncIterable<Uint8Array>
+    : abortableChunks(response.body, signal);
+  for await (const chunk of chunks) {
     if (signal?.aborted) throw new Error("Streaming response cancelled.");
+    onChunk?.();
     buffer += decoder.decode(chunk, { stream: true });
     let boundary = buffer.indexOf("\n");
     while (boundary !== -1) {
@@ -558,6 +614,42 @@ class StreamProtocolError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "StreamProtocolError";
+  }
+}
+
+/**
+ * Races each pending body read against the abort signal. A plain
+ * `for await` loop only observes cancellation when a chunk arrives, which a
+ * wedged connection never delivers; the race lets an abort (attempt timeout
+ * or the stall watchdog) interrupt the read. The reader is cancelled without
+ * awaiting it — a truly stuck source may never settle cancel() — so the read
+ * side is torn down and the generator exits promptly.
+ */
+async function* abortableChunks(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): AsyncGenerator<Uint8Array> {
+  const reader = body.getReader();
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    const cancel = (): void => reject(new Error("Streaming response cancelled."));
+    if (signal.aborted) {
+      cancel();
+      return;
+    }
+    signal.addEventListener("abort", cancel, { once: true });
+  });
+  // The same rejection is raced once per chunk; keep a handler attached so a
+  // late abort after the loop settled never counts as unhandled.
+  interrupted.catch(() => {});
+  try {
+    while (true) {
+      const next = await Promise.race([reader.read(), interrupted]);
+      if (next.done === true) return;
+      yield next.value;
+    }
+  } finally {
+    void Promise.resolve(reader.cancel()).catch(() => {});
+    reader.releaseLock();
   }
 }
 

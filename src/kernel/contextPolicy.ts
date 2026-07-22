@@ -47,9 +47,12 @@ export class EvidenceContextPolicy implements ContextPolicyPort {
       && isToolDecision(chunks[newestDecisionIndex]!.entries[0]!)
       ? newestDecisionIndex
       : -1;
+    const delegatedOverflowIndex = findLastIndex(chunks, (chunk) =>
+      chunk.entries.some(isDelegatedOverflowDigest));
     const requiredIndices = new Set(taskIndices);
     if (newestUserIndex >= 0) requiredIndices.add(newestUserIndex);
     if (freshToolIndex >= 0) requiredIndices.add(freshToolIndex);
+    if (delegatedOverflowIndex >= 0) requiredIndices.add(delegatedOverflowIndex);
     const requiredEntries = [...requiredIndices]
       .sort((left, right) => left - right)
       .flatMap((index) => chunks[index]!.entries);
@@ -177,4 +180,10 @@ function isControlObservation(entry: TranscriptEntry | undefined, tool: string):
   if (entry?.role !== "observation" || entry.content === null || Array.isArray(entry.content)
     || typeof entry.content !== "object") return false;
   return entry.content.tool === tool;
+}
+
+function isDelegatedOverflowDigest(entry: TranscriptEntry): boolean {
+  return entry.role === "history"
+    && typeof entry.content === "string"
+    && entry.content.startsWith("[Vanguard delegated overflow digest]");
 }

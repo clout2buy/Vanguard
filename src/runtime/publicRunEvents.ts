@@ -1,6 +1,7 @@
 import type { JsonValue, RunEvent } from "../kernel/contracts.js";
 import { normalizeDecision } from "../kernel/contracts.js";
 import type { StreamObserver } from "../inference/httpModel.js";
+import { normalizeUsage } from "../inference/usageLedger.js";
 
 export const PUBLIC_EVENT_PREFIX = "@@VANGUARD_EVENT@@";
 
@@ -21,6 +22,8 @@ export interface PublicRunEvent {
   readonly scorecardFile?: string;
   /** Runtime-owned workspace lifecycle state; never inferred by clients. */
   readonly materialized?: boolean;
+  /** Runtime-measured execution cost of the exact tool call, when known. */
+  readonly durationMs?: number;
 }
 
 export class PublicRunEventPresenter {
@@ -93,6 +96,9 @@ export class PublicRunEventPresenter {
       }
       const tool = stringValue(data.tool) ?? pending?.name ?? "tool";
       const detail = resultDetail(data, pending?.detail);
+      const durationMs = typeof data.durationMs === "number" && Number.isFinite(data.durationMs)
+        ? Math.max(0, Math.round(data.durationMs))
+        : undefined;
       return [{
         type: event.type === "tool.completed" ? "tool.completed" : "tool.failed",
         agentId,
@@ -101,6 +107,7 @@ export class PublicRunEventPresenter {
         title: tool,
         tool,
         ...(detail === undefined ? {} : { detail }),
+        ...(durationMs === undefined ? {} : { durationMs }),
       }];
     }
 
@@ -244,6 +251,8 @@ export function createStreamLifecyclePresenter(
 ): StreamObserver {
   let buffer = "";
   let timer: NodeJS.Timeout | undefined;
+  let thinkingBuffer = "";
+  let thinkingTimer: NodeJS.Timeout | undefined;
   const send = (type: string, extra: { message?: string; detail?: string } = {}): void => {
     emit({ type, agentId: "main", status: "info", title: "Agent", ...extra });
   };
@@ -258,9 +267,22 @@ export function createStreamLifecyclePresenter(
     buffer = "";
     send("agent.delta", { message: text });
   };
+  const clearThinkingTimer = (): void => {
+    if (thinkingTimer !== undefined) clearTimeout(thinkingTimer);
+    thinkingTimer = undefined;
+  };
+  const flushThinking = (): void => {
+    clearThinkingTimer();
+    if (thinkingBuffer.length === 0) return;
+    const text = thinkingBuffer;
+    thinkingBuffer = "";
+    send("agent.thinking", { message: text });
+  };
   const discard = (): void => {
     clearTimer();
     buffer = "";
+    clearThinkingTimer();
+    thinkingBuffer = "";
   };
   return {
     started(attempt: number): void {
@@ -279,17 +301,40 @@ export function createStreamLifecyclePresenter(
         timer.unref?.();
       }
     },
+    // Thinking is display-only progress: coalesced like visible deltas, but
+    // never flushed at commit — an unfinished fragment has no reply to join.
+    thinking(text: string): void {
+      markActivity();
+      thinkingBuffer += text;
+      if (thinkingBuffer.length >= 400) {
+        flushThinking();
+        return;
+      }
+      if (thinkingTimer === undefined) {
+        thinkingTimer = setTimeout(flushThinking, coalesceMs);
+        thinkingTimer.unref?.();
+      }
+    },
     reset(): void {
       discard();
       send("agent.stream_reset");
     },
     committed(): void {
+      clearThinkingTimer();
+      thinkingBuffer = "";
       flush();
       send("agent.stream_committed");
     },
     failed(reason: string): void {
       discard();
       send("agent.stream_failed", { detail: reason.slice(0, 220) });
+    },
+    // Provider-reported prompt size, surfaced so a UI can draw a live
+    // context gauge. detail carries the total input-token count as text.
+    usage(value): void {
+      const normalized = normalizeUsage(value);
+      if (normalized === undefined || normalized.inputTokens <= 0) return;
+      send("agent.usage", { detail: String(normalized.inputTokens) });
     },
   };
 }
@@ -302,8 +347,11 @@ function decisionMessage(
   if (decision.kind === "ask_user") return boundedText(decision.question);
   if (decision.kind === "execute") return boundedText(`Starting: ${decision.contract.objective}`);
   if (decision.kind === "complete") return boundedText(decision.answer);
-  const continuation = objectValue(data.continuation);
-  return boundedText(contentText(continuation.content));
+  // Chat-completions/Anthropic continuations are one assistant message object;
+  // the OpenAI Responses continuation is the raw output-item array itself.
+  const continuation = data.continuation;
+  const record = objectValue(continuation);
+  return boundedText(contentText(record.content) ?? contentText(continuation));
 }
 
 function contentText(content: JsonValue | undefined): string | undefined {
@@ -311,7 +359,19 @@ function contentText(content: JsonValue | undefined): string | undefined {
   if (!Array.isArray(content)) return undefined;
   const text = content.flatMap((item) => {
     const block = objectValue(item);
-    return block.type === "text" && typeof block.text === "string" ? [block.text] : [];
+    // Chat-completions and Anthropic wires use `text` blocks; the OpenAI
+    // Responses wire uses `output_text` blocks nested inside `message` items.
+    // Missing the latter meant tool-call turns never emitted agent.message,
+    // so the TUI's provisional stream buffer never cleared and every later
+    // stream start printed a phantom "(stream reset — retrying)" note.
+    if ((block.type === "text" || block.type === "output_text") && typeof block.text === "string") {
+      return [block.text];
+    }
+    if (block.type === "message" && Array.isArray(block.content)) {
+      const nested = contentText(block.content as JsonValue);
+      return nested === undefined ? [] : [nested];
+    }
+    return [];
   }).join("\n");
   return text.length === 0 ? undefined : text;
 }
@@ -336,7 +396,15 @@ function resultDetail(data: Record<string, JsonValue>, priorDetail: string | und
   const error = stringValue(data.error) ?? stringValue(output.error);
   if (error !== undefined) return boundedText(error, 220);
   const exitCode = typeof output.exitCode === "number" ? output.exitCode : undefined;
-  if (exitCode !== undefined) return `exit ${exitCode}`;
+  if (exitCode !== undefined) {
+    // A failed process puts its reason on stderr; surface a bounded,
+    // single-line tail so the failure line says why, not just that it exited.
+    const stderr = data.ok === false ? stringValue(output.stderr)?.replace(/\s+/gu, " ").trim() : undefined;
+    if (stderr !== undefined && stderr.length > 0) {
+      return boundedText(`exit ${exitCode} · ${stderr.slice(-160)}`, 240);
+    }
+    return `exit ${exitCode}`;
+  }
   const path = stringValue(output.path);
   if (path !== undefined) {
     const replacements = typeof output.replacements === "number" ? ` · ${output.replacements} replacement(s)` : "";

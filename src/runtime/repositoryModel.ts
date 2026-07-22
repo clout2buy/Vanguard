@@ -2,6 +2,7 @@ import type { Dirent } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
+import { objectInput, optionalStringField } from "./input.js";
 import type { WorkspaceBoundary } from "./workspace.js";
 
 export type SupportTier = "deep" | "generic";
@@ -200,8 +201,14 @@ export class RepositoryMapTool implements ToolPort {
   readonly name = "repository.map";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Return a structured map of the repository: languages and their support tier, build systems, entry points, test topology, generated directories, and git presence. Use this first on an unfamiliar project instead of listing directories by hand.",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    description: "Return a structured map of the repository or one workspace-relative directory: languages and their support tier, build systems, entry points, test topology, generated directories, and git presence. Use this first on an unfamiliar project instead of listing directories by hand.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Optional workspace-relative directory. Omit it, or use '.' or an empty string, for the repository root." },
+      },
+      additionalProperties: false,
+    },
     effect: "observe",
   };
 
@@ -210,15 +217,26 @@ export class RepositoryMapTool implements ToolPort {
     private readonly options: { readonly includeInstructions?: boolean } = {},
   ) {}
 
-  async execute(_input: JsonValue, _context: ToolContext): Promise<ToolResult> {
+  async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
+    const fields = objectInput(input);
+    for (const field of Object.keys(fields)) {
+      if (field !== "path") throw new Error(`Unknown field '${field}' for ${this.name}.`);
+    }
+    const requestedPath = optionalStringField(fields, "path") ?? ".";
+    const relativePath = requestedPath.trim().length === 0 ? "." : requestedPath;
+    const root = relativePath === "." ? this.workspace.root : await this.workspace.existing(relativePath);
+    if (!(await stat(root)).isDirectory()) {
+      return { ok: false, output: { error: "Path is not a directory.", path: relativePath } };
+    }
     const includeInstructions = this.options.includeInstructions !== false;
-    const model = await buildRepositoryModel(this.workspace.root, { includeInstructionFiles: includeInstructions });
+    const model = await buildRepositoryModel(root, { includeInstructionFiles: includeInstructions });
     const instructions = includeInstructions
-      ? await readRepositoryInstructions(this.workspace.root, model.instructionFiles)
+      ? await readRepositoryInstructions(root, model.instructionFiles)
       : [];
     return {
       ok: true,
       output: {
+        path: relativePath,
         ...(model as unknown as Record<string, JsonValue>),
         instructions,
       },

@@ -8,6 +8,7 @@ import {
   AgentKernel,
   CommandVerifier,
   HttpModelAdapter,
+  InferenceError,
   MemoryJournal,
   ProcessTool,
   ReadFileTool,
@@ -107,25 +108,107 @@ test("native HTTP agent inspects, patches, tests, and earns verification", async
   }
 });
 
-test("an oversized irreducible task fails before any inference request", async () => {
+test("an oversized irreducible task is projected instead of failing context selection", async () => {
   let modelCalls = 0;
+  const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: {
       async decide() {
         modelCalls += 1;
-        return { kind: "respond" as const, message: "must not be called" };
+        return { kind: "complete" as const, answer: "projected safely" };
       },
     },
     tools: [],
     verifiers: [],
-    journal: new MemoryJournal(),
+    journal,
     options: { maxSteps: 2, maxContextBytes: 500 },
   });
 
   const outcome = await kernel.run(`oversized-task:${"x".repeat(2_000)}`);
-  assert.equal(outcome.status, "failed");
-  assert.equal(modelCalls, 0, "context authority must fail closed before reaching a provider");
-  assert.match(outcome.status === "failed" ? outcome.reason : "", /Context failure/);
+  assert.equal(outcome.status, "completed");
+  assert.equal(modelCalls, 1);
+  assert.equal(journal.events.some((event) => event.type === "context.compacted"
+    && typeof event.data === "object" && event.data !== null && !Array.isArray(event.data)
+    && event.data.operation === "overflow_delegation"), true);
+});
+
+test("a fresh tool result larger than the main window is delegated in bounded chunks", async () => {
+  let mainCalls = 0;
+  let delegateCalls = 0;
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: {
+      async decide(request) {
+        if (request.task.includes("context-overflow delegate")) {
+          delegateCalls += 1;
+          return { kind: "respond" as const, message: "The read succeeded; inspect src/huge.ts in smaller ranges." };
+        }
+        mainCalls += 1;
+        return mainCalls === 1
+          ? { kind: "tools" as const, calls: [{ id: "huge", name: "workspace.huge", input: null }] }
+          : { kind: "complete" as const, answer: "Handled the delegated evidence." };
+      },
+    },
+    tools: [{
+      name: "workspace.huge",
+      definition: {
+        name: "workspace.huge",
+        description: "Return a deliberately oversized observation.",
+        inputSchema: { type: "null" },
+        effect: "observe" as const,
+      },
+      async execute() {
+        return { ok: true, output: { path: "src/huge.ts", contents: `EVIDENCE:${"x".repeat(30_000)}` } };
+      },
+    }],
+    verifiers: [],
+    journal,
+    options: { maxSteps: 4, maxContextBytes: 10_000 },
+  });
+
+  const outcome = await kernel.run("Inspect the oversized evidence and finish.");
+  assert.equal(outcome.status, "completed", outcome.status === "failed" ? outcome.reason : undefined);
+  assert.equal(mainCalls, 2);
+  assert.equal(delegateCalls > 1, true, "the source should be split across isolated delegate calls");
+  const delegation = journal.events.find((event) => event.type === "context.compacted"
+    && typeof event.data === "object" && event.data !== null && !Array.isArray(event.data)
+    && event.data.operation === "overflow_delegation");
+  assert.ok(delegation !== undefined);
+  assert.equal(typeof delegation.data === "object" && delegation.data !== null && !Array.isArray(delegation.data)
+    ? Number(delegation.data.chunks) > 1 : false, true);
+});
+
+test("a provider context rejection teaches the kernel a smaller effective window and retries", async () => {
+  let mainCalls = 0;
+  let delegateCalls = 0;
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: {
+      async decide(request) {
+        if (request.task.includes("context-overflow delegate")) {
+          delegateCalls += 1;
+          return { kind: "respond" as const, message: "Keep the exact objective and finish." };
+        }
+        mainCalls += 1;
+        if (mainCalls === 1) {
+          throw new InferenceError("context_length", "maximum context length exceeded", 413, false);
+        }
+        return { kind: "complete" as const, answer: "Adapted to the discovered provider window." };
+      },
+    },
+    tools: [],
+    verifiers: [],
+    journal,
+    options: { maxSteps: 2, maxContextBytes: 20_000 },
+  });
+
+  const outcome = await kernel.run("Complete after adapting the provider window.");
+  assert.equal(outcome.status, "completed", outcome.status === "failed" ? outcome.reason : undefined);
+  assert.equal(mainCalls, 2);
+  assert.equal(delegateCalls, 1);
+  assert.equal(journal.events.some((event) => event.type === "context.compacted"
+    && typeof event.data === "object" && event.data !== null && !Array.isArray(event.data)
+    && event.data.operation === "provider_window_adaptation"), true);
 });
 
 test("oversized dynamic working state fails before inference and is snapshotted once", async () => {

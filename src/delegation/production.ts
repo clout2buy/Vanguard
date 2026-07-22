@@ -22,8 +22,9 @@ const MAX_EVENT_LINE_BYTES = 64 * 1024;
 const FORCE_CANCEL_AFTER_MS = 2_000;
 
 export interface DelegateChildConfiguration {
-  readonly provider: "openai" | "anthropic" | "deepseek" | "ollama" | "http";
+  readonly provider: "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "http";
   readonly model: string;
+  readonly auth?: "api-key" | "oauth";
   readonly endpoint?: string;
   readonly verification: CommandSpec;
   readonly publicCheck?: CommandSpec;
@@ -189,6 +190,8 @@ export class CliDelegateRunner implements DelegateRunnerPort {
       "--task", request.task,
       "--provider", configuration.provider,
       "--model", configuration.model,
+      "--auth", configuration.auth ?? "api-key",
+      "--agent-profile", request.profile ?? "coder",
       "--verify-command", configuration.verification.command,
       "--max-steps", String(request.maxSteps),
       "--max-duration-ms", String(configuration.maxDurationMs),

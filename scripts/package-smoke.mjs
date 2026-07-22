@@ -43,6 +43,8 @@ try {
     "dist/src/cli.js",
     "dist/src/index.js",
     "dist/src/inference/providerProfiles.js",
+    "LICENSE",
+    "docs/EMBEDDING.md",
     "docs/ACCEPTANCE.md",
     "docs/ARCHITECTURE.md",
     "docs/ARES_INTEGRATION.md",
@@ -69,6 +71,13 @@ try {
     "gauntlet/fixtures/repair-cart/src/cart.mjs",
   ]) {
     assert.equal(names.has(required), true, `packed artifact is missing ${required}`);
+  }
+  // Closed-source posture: compiled artifacts only — no TypeScript sources,
+  // no source maps mapping the build back to them.
+  for (const name of names) {
+    assert.doesNotMatch(name, /\.map$/u, `packed artifact leaks a source map: ${name}`);
+    assert.doesNotMatch(name, /^src\//u, `packed artifact leaks source: ${name}`);
+    assert.equal(name.endsWith(".ts") && !name.endsWith(".d.ts"), false, `packed artifact leaks source: ${name}`);
   }
   const tarball = path.join(packed, entry.filename);
   await writeFile(path.join(consumer, "package.json"), JSON.stringify({ private: true, type: "module" }), "utf8");
@@ -155,7 +164,12 @@ try {
   run(process.execPath, ["--input-type=module", "--eval", [
     `const tui = await import(${JSON.stringify(tuiUrl)});`,
     'const welcome = tui.renderWelcomeForTest("C:\\\\portable project", "fixture-model");',
-    'if (!welcome.includes("VANGUARD") || !welcome.includes("fixture-model")) throw new Error("packed TUI unavailable");',
+    // Assert the packed TUI renders, not how it styles its wordmark: the banner
+    // letter-spaces and per-letter colors "V A N G U A R D", so a substring
+    // match on the raw string pins a cosmetic choice and fails on restyling.
+    'const plain = welcome.replace(/\\x1b\\[[0-9;]*m/g, "");',
+    'const wordmark = plain.replace(/\\s+/g, "");',
+    'if (!wordmark.includes("VANGUARD") || !plain.includes("fixture-model")) throw new Error("packed TUI unavailable: " + JSON.stringify(plain.slice(0, 200)));',
   ].join("\n")], consumer);
   const installed = JSON.parse(await readFile(path.join(consumer, "node_modules", "vanguard", "package.json"), "utf8"));
   assert.match(installed.engines.node, />=20/u);

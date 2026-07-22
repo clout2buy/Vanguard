@@ -50,8 +50,18 @@ const EMPTY: NormalizedUsage = {
  * shapes (Chat Completions, Anthropic Messages, OpenAI Responses) into one
  * schema. Feeds the scorecard's usage and estimated-cost fields.
  */
+export interface CacheEfficiency {
+  /** Calls whose usage payload carried recognizable token counts. */
+  readonly calls: number;
+  /** Fraction of all input tokens served from the provider's cache, 0..1. */
+  readonly hitRate: number;
+  /** Cache hit rate of the most recent call alone, 0..1. */
+  readonly lastCallHitRate: number;
+}
+
 export class UsageLedger {
   #total: NormalizedUsage = EMPTY;
+  #lastCall: NormalizedUsage | undefined;
   readonly #prices: Readonly<Record<string, ModelPrice>>;
   readonly #latenciesMs: number[] = [];
 
@@ -72,6 +82,7 @@ export class UsageLedger {
   record(usage: JsonValue): void {
     const normalized = normalizeUsage(usage);
     if (normalized === undefined) return;
+    this.#lastCall = normalized;
     this.#total = {
       inputTokens: this.#total.inputTokens + normalized.inputTokens,
       cachedInputTokens: this.#total.cachedInputTokens + normalized.cachedInputTokens,
@@ -87,6 +98,23 @@ export class UsageLedger {
 
   usage(): NormalizedUsage {
     return this.#total;
+  }
+
+  /**
+   * How much of the input stream providers served from cache. A hit rate near
+   * zero on a long run means the request prefix is unstable and every step is
+   * paying full-price prefill; near one means the epoch prefix is holding.
+   */
+  cacheEfficiency(): CacheEfficiency {
+    const rate = (usage: NormalizedUsage | undefined): number =>
+      usage === undefined || usage.inputTokens <= 0
+        ? 0
+        : Math.min(1, usage.cachedInputTokens / usage.inputTokens);
+    return {
+      calls: this.#total.calls,
+      hitRate: rate(this.#total),
+      lastCallHitRate: rate(this.#lastCall),
+    };
   }
 
   latencyMs(): { calls: number; totalMs: number; meanMs: number } {

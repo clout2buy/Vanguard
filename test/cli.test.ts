@@ -95,7 +95,7 @@ test("compiled CLI repairs an isolated copy and writes a scorecard", async () =>
     };
     isolatedRoot = path.dirname(scorecard.workspaceRoot);
     assert.equal(scorecard.outcome.status, "completed");
-    assert.equal(scorecard.outcome.verification?.length, 2);
+    assert.equal(scorecard.outcome.verification?.length, 3, "the model-independent render gate also records a not-applicable result");
     assert.deepEqual(scorecard.patch.changedFiles, ["answer.mjs"]);
     assert.equal(scorecard.patch.filesModified, 1);
     assert.equal(scorecard.grade.executionQuality.cleanFirstPass, true);

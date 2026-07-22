@@ -13,6 +13,7 @@ import {
 } from "../runtime/session.js";
 import { CliVanguardRunner } from "./cliRunner.js";
 import { sanitizePublicEvent } from "./security.js";
+import { isCleanGitRepository } from "../runtime/gitTree.js";
 import { extensionRuntimeState, resolveExtensions } from "../extensions/config.js";
 import type { JsonValue } from "../kernel/contracts.js";
 import { resolveSecurityPolicy, type SecurityProfile } from "../security/policy.js";
@@ -68,9 +69,12 @@ interface ManagedSession {
 
 interface StoredCliOptions {
   readonly workspace: string;
+  readonly inPlace?: boolean;
   readonly task: string;
   readonly provider: VanguardSessionConfig["provider"];
   readonly model: string;
+  readonly auth?: VanguardSessionConfig["auth"];
+  readonly executionEvidence?: VanguardSessionConfig["executionEvidence"];
   readonly endpoint?: string;
   readonly verification: CommandSpec;
   readonly adaptiveVerification?: boolean;
@@ -78,6 +82,8 @@ interface StoredCliOptions {
   readonly maxSteps: number;
   readonly maxDurationMs: number;
   readonly commandTimeoutMs: number;
+  readonly commandIdleTimeoutMs?: number;
+  readonly reasoningEffort?: "low" | "medium" | "high" | "max";
   readonly maxContextBytes: number;
   readonly maxFailedVerificationAttempts: number;
   readonly protectedPaths: readonly string[];
@@ -189,6 +195,12 @@ export class VanguardEngine {
         "Idempotent create requires VanguardEngineOptions.createOperationStore.",
       );
     }
+    if (operationIdSha256 !== undefined && snapshot.direct === true) {
+      throw new VanguardEngineError(
+        "invalid_config",
+        "Idempotent create binds the session to a source fingerprint, which direct mode never computes. Create the direct session without operationId.",
+      );
+    }
     // Reserve synchronously before workspace/config discovery yields. Parallel
     // direct API callers therefore cannot all allocate sessions past the
     // bounded in-memory capacity. Retries for one deterministic operation
@@ -219,7 +231,19 @@ export class VanguardEngine {
     config: VanguardSessionConfig,
     runConfiguration: StoredRunConfiguration,
   ): Promise<VanguardSessionStatus> {
-    const session = await createSessionShell(config.workspace);
+    // With no explicit mode, a clean git work tree already provides review,
+    // undo, and a drift baseline — run direct instead of paying the copy and
+    // fingerprint tax. Explicit inPlace/direct config always wins; idempotent
+    // creates never reach here (they bind a source fingerprint).
+    const autoDirect = config.inPlace !== true && config.direct !== true
+      && await isCleanGitRepository(config.workspace);
+    if (autoDirect) {
+      this.#logger("clean git repository detected — session runs direct (no copy, no baseline)");
+    }
+    const session = await createSessionShell(config.workspace, {
+      inPlace: config.inPlace === true || config.direct === true || autoDirect,
+      direct: config.direct === true || autoDirect,
+    });
     const root = path.dirname(session.metadataFile);
     try {
       this.#assertOpen();
@@ -310,7 +334,7 @@ export class VanguardEngine {
         configSha256: claim.configSha256,
         sourceFingerprint: claim.sourceFingerprint,
       });
-    });
+    }, { inPlace: effective.options.inPlace === true });
     this.#assertOpen();
     if (session.id !== claim.sessionId || path.resolve(path.dirname(session.metadataFile)) !== path.resolve(sessionRoot)) {
       throw new VanguardEngineError("create_operation_corrupt", "The durable session does not match its create claim.");
@@ -1070,10 +1094,13 @@ function storedOptions(
   });
   return {
     workspace: config.workspace,
+    ...(config.inPlace === undefined ? {} : { inPlace: config.inPlace }),
     task: "",
     provider: config.provider,
     model: config.model,
     verification,
+    ...(config.auth === undefined ? {} : { auth: config.auth }),
+    ...(config.executionEvidence === undefined ? {} : { executionEvidence: config.executionEvidence }),
     ...(config.endpoint === undefined ? {} : { endpoint: config.endpoint }),
     ...(config.adaptiveVerification === undefined ? {} : { adaptiveVerification: config.adaptiveVerification }),
     allowedCommands: [...(config.allowedCommands ?? [])],
@@ -1089,6 +1116,9 @@ function storedOptions(
     maxSteps: positiveInteger(config.maxSteps ?? 60, "maxSteps", 100_000),
     maxDurationMs: positiveInteger(config.maxDurationMs ?? 7_200_000, "maxDurationMs", 7 * 24 * 60 * 60 * 1_000),
     commandTimeoutMs: positiveInteger(config.commandTimeoutMs ?? 1_800_000, "commandTimeoutMs", 24 * 60 * 60 * 1_000),
+    ...(config.commandIdleTimeoutMs === undefined
+      ? {}
+      : { commandIdleTimeoutMs: positiveInteger(config.commandIdleTimeoutMs, "commandIdleTimeoutMs", 24 * 60 * 60 * 1_000) }),
     maxContextBytes: positiveInteger(config.maxContextBytes ?? 2_000_000, "maxContextBytes", 100_000_000),
     maxFailedVerificationAttempts: positiveInteger(
       config.maxFailedVerificationAttempts ?? 3,
@@ -1103,7 +1133,8 @@ function storedOptions(
 function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
   const raw = ownDataRecord(config, "Session config");
   const allowed = new Set([
-    "adaptiveVerification", "allowedCommands", "commandTimeoutMs", "editableRoots", "endpoint",
+    "adaptiveVerification", "allowedCommands", "auth", "commandIdleTimeoutMs", "commandTimeoutMs", "direct", "editableRoots", "endpoint", "inPlace",
+    "executionEvidence",
     "exposeRawProcess", "maxContextBytes", "maxDurationMs", "maxFailedVerificationAttempts",
     "maxSteps", "model", "protectedPaths", "provider", "publicCheck", "restrictProcess",
     "securityProfile", "verification", "verifierEvidence", "workspace",
@@ -1112,11 +1143,22 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
     if (!allowed.has(key)) throw new VanguardEngineError("invalid_config", `Unsupported session config field '${key}'.`);
   }
   const workspace = boundedString(raw.workspace, "workspace", 32_768, true);
-  if (!(["openai", "anthropic", "deepseek", "http"] as const).includes(raw.provider as never)) {
+  if (!(["openai", "anthropic", "deepseek", "kimi", "ollama", "http"] as const).includes(raw.provider as never)) {
     throw new VanguardEngineError("invalid_config", "provider is unsupported.");
   }
   const provider = raw.provider as VanguardSessionConfig["provider"];
   const model = boundedString(raw.model, "model", 4_096, true);
+  if (raw.auth !== undefined && raw.auth !== "api-key" && raw.auth !== "oauth") {
+    throw new VanguardEngineError("invalid_config", "auth must be 'api-key' or 'oauth'.");
+  }
+  if (raw.auth === "oauth" && provider !== "openai" && provider !== "anthropic" && provider !== "kimi") {
+    throw new VanguardEngineError("invalid_config", "auth 'oauth' is supported only for the openai, anthropic, and kimi providers.");
+  }
+  if (raw.executionEvidence !== undefined && raw.executionEvidence !== "independent" && raw.executionEvidence !== "syntax") {
+    throw new VanguardEngineError("invalid_config", "executionEvidence must be 'independent' or 'syntax'.");
+  }
+  const executionEvidence = raw.executionEvidence as VanguardSessionConfig["executionEvidence"];
+  const auth = raw.auth as VanguardSessionConfig["auth"];
   if (provider === "http" && (raw.endpoint === undefined || raw.endpoint === "")) {
     throw new VanguardEngineError("invalid_config", "The http provider requires endpoint.");
   }
@@ -1131,6 +1173,8 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
   const editableRoots = cloneStringArray(raw.editableRoots, "editableRoots");
   for (const [field, value] of [
     ["adaptiveVerification", raw.adaptiveVerification],
+    ["inPlace", raw.inPlace],
+    ["direct", raw.direct],
     ["restrictProcess", raw.restrictProcess],
     ["exposeRawProcess", raw.exposeRawProcess],
   ] as const) {
@@ -1155,6 +1199,7 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
     ["maxSteps", raw.maxSteps, 100_000],
     ["maxDurationMs", raw.maxDurationMs, 7 * 24 * 60 * 60 * 1_000],
     ["commandTimeoutMs", raw.commandTimeoutMs, 24 * 60 * 60 * 1_000],
+    ["commandIdleTimeoutMs", raw.commandIdleTimeoutMs, 24 * 60 * 60 * 1_000],
     ["maxContextBytes", raw.maxContextBytes, 100_000_000],
     ["maxFailedVerificationAttempts", raw.maxFailedVerificationAttempts, 100],
   ] as const) {
@@ -1164,6 +1209,10 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
     workspace,
     provider,
     model,
+    ...(raw.inPlace === undefined ? {} : { inPlace: raw.inPlace as boolean }),
+    ...(raw.direct === undefined ? {} : { direct: raw.direct as boolean }),
+    ...(auth === undefined ? {} : { auth }),
+    ...(executionEvidence === undefined ? {} : { executionEvidence }),
     ...(endpoint === undefined ? {} : { endpoint }),
     ...(verification === undefined ? {} : { verification }),
     ...(publicCheck === undefined ? {} : { publicCheck }),
@@ -1178,6 +1227,7 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
     ...(raw.maxSteps === undefined ? {} : { maxSteps: raw.maxSteps as number }),
     ...(raw.maxDurationMs === undefined ? {} : { maxDurationMs: raw.maxDurationMs as number }),
     ...(raw.commandTimeoutMs === undefined ? {} : { commandTimeoutMs: raw.commandTimeoutMs as number }),
+    ...(raw.commandIdleTimeoutMs === undefined ? {} : { commandIdleTimeoutMs: raw.commandIdleTimeoutMs as number }),
     ...(raw.maxContextBytes === undefined ? {} : { maxContextBytes: raw.maxContextBytes as number }),
     ...(raw.maxFailedVerificationAttempts === undefined
       ? {}
@@ -1314,8 +1364,11 @@ function requiredStoredRunConfiguration(value: unknown): StoredRunConfiguration 
   const options = value.options;
   if (typeof options.workspace !== "string" || !path.isAbsolute(options.workspace)
     || typeof options.task !== "string"
-    || !(["openai", "anthropic", "deepseek", "http"] as const).includes(options.provider as never)
+    || !(["openai", "anthropic", "deepseek", "kimi", "ollama", "http"] as const).includes(options.provider as never)
     || typeof options.model !== "string" || options.model.length === 0
+    || (options.inPlace !== undefined && typeof options.inPlace !== "boolean")
+    || (options.auth !== undefined && options.auth !== "api-key" && options.auth !== "oauth")
+    || (options.executionEvidence !== undefined && options.executionEvidence !== "independent" && options.executionEvidence !== "syntax")
     || !isCommandSpec(options.verification)
     || !isStringArray(options.allowedCommands)
     || !isStringArray(options.protectedPaths)
@@ -1327,6 +1380,7 @@ function requiredStoredRunConfiguration(value: unknown): StoredRunConfiguration 
     || !isBoundedInteger(options.maxSteps, 100_000)
     || !isBoundedInteger(options.maxDurationMs, 7 * 24 * 60 * 60 * 1_000)
     || !isBoundedInteger(options.commandTimeoutMs, 24 * 60 * 60 * 1_000)
+    || (options.commandIdleTimeoutMs !== undefined && !isBoundedInteger(options.commandIdleTimeoutMs, 24 * 60 * 60 * 1_000))
     || !isBoundedInteger(options.maxContextBytes, 100_000_000)
     || !isBoundedInteger(options.maxFailedVerificationAttempts, 100)
     || (options.endpoint !== undefined && typeof options.endpoint !== "string")

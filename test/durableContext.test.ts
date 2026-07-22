@@ -77,6 +77,34 @@ test("the cacheable task prefix stays stable while bounded digest generations re
     `digest generation at ${turns} must reconstruct byte-identically`);
 });
 
+test("post-overflow selections extend a frozen byte-identical prefix between rare collapses", () => {
+  // Provider caches (Anthropic, OpenAI-compatible, Ollama KV) match on the
+  // longest byte-identical prefix of the previous request. After the budget
+  // first trips, each step's selection must extend the previous one verbatim,
+  // with full re-selection (a cache miss) only at rare epoch collapses.
+  const policy = new StickyContextPolicy();
+  const budget = 30_000;
+  let previous: string[] | undefined;
+  let steps = 0;
+  let collapses = 0;
+  for (let turns = 150; turns <= 250; turns += 1) {
+    const selected = policy.select("long-horizon task", syntheticJournal(turns), budget);
+    assert.ok(Buffer.byteLength(JSON.stringify(selected)) <= budget,
+      `selection at ${turns} turns exceeded the byte budget`);
+    const serialized = selected.map((entry) => JSON.stringify(entry));
+    if (previous !== undefined) {
+      steps += 1;
+      const extendsPrevious = previous.length <= serialized.length
+        && previous.every((entry, index) => serialized[index] === entry);
+      if (!extendsPrevious) collapses += 1;
+    }
+    previous = serialized;
+  }
+  assert.ok(collapses >= 1, "appended growth must eventually force an epoch collapse");
+  assert.ok(collapses <= Math.ceil(steps / 10),
+    `expected rare collapses but ${collapses} of ${steps} steps re-selected history`);
+});
+
 test("thousands of huge events can never overflow the selected byte budget", () => {
   const policy = new StickyContextPolicy();
   const userHeavy: TranscriptEntry[] = [{ role: "task", content: "t" }];
@@ -479,4 +507,29 @@ test("cost estimation reproduces a fixture and stays null for unknown models", (
   const unknown = new UsageLedger("some-unlisted-model");
   unknown.record({ prompt_tokens: 100, completion_tokens: 100 });
   assert.equal(unknown.estimatedCost(), null, "unknown models must not fabricate a cost");
+});
+
+test("context overflow digests every other source before touching the working-state spine", async () => {
+  const { ModelContextOverflowDelegate } = await import("../src/index.js");
+  const delegate = new ModelContextOverflowDelegate({
+    async decide() { return { kind: "respond", message: "compressed digest" }; },
+  });
+  const freshTool: TranscriptEntry[] = [
+    { role: "decision", content: { kind: "tools", calls: [{ id: "c1", name: "workspace.read", input: {} }] } },
+    { role: "observation", content: { callId: "c1", tool: "workspace.read", ok: true, output: { contents: "y".repeat(24_000) } } },
+  ];
+  const workingState = { checkpoint: "z".repeat(26_000) } as JsonValue;
+  const projection = await delegate.project({
+    task: "keep the spine",
+    transcript: [{ role: "task", content: "keep the spine" }, ...freshTool],
+    workingState,
+    maxBytes: 60_000,
+    signal: new AbortController().signal,
+  });
+  // The plan/checkpoint spine survives byte-exact; the bulky tool exchange is
+  // what gets delegated, even though the working state was the larger source.
+  assert.deepEqual(projection.workingState, workingState);
+  assert.ok(projection.delegations.length > 0, "overflow must have delegated something");
+  assert.ok(projection.delegations.every((record) => record.kind !== "working_state"),
+    "working state must only be digested as a last resort");
 });

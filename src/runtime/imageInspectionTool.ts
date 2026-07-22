@@ -1,5 +1,6 @@
 import { inflateSync } from "node:zlib";
 import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
 import { objectInput, optionalStringField, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
@@ -26,8 +27,8 @@ export class ImageInspectionTool implements ToolPort {
     inputSchema: {
       type: "object",
       properties: {
-        path: { type: "string", description: "Workspace-relative BMP or PNG path." },
-        comparePath: { type: "string", description: "Optional workspace-relative image to compare pixel-by-pixel." },
+        path: { type: "string", description: "Workspace-relative BMP or PNG path; an absolute path inside the workspace is also accepted." },
+        comparePath: { type: "string", description: "Optional image to compare pixel-by-pixel; workspace-relative or absolute inside the workspace." },
       },
       required: ["path"],
       additionalProperties: false,
@@ -54,11 +55,25 @@ export class ImageInspectionTool implements ToolPort {
   }
 
   async #read(relativePath: string): Promise<DecodedImage> {
-    const file = await this.workspace.existing(relativePath);
+    const file = await this.workspace.existing(this.#workspacePath(relativePath));
     const metadata = await stat(file);
     if (!metadata.isFile()) throw new Error("Image path is not a file.");
     if (metadata.size > MAX_IMAGE_BYTES) throw new Error(`Image exceeds ${MAX_IMAGE_BYTES} byte inspection limit.`);
     return decodeImage(await readFile(file));
+  }
+
+  /**
+   * WorkspaceBoundary.lexical demands workspace-relative paths, but models
+   * keep passing absolute ones. Relativize an absolute path against the
+   * workspace root; a result that still escapes is rejected plainly.
+   */
+  #workspacePath(inputPath: string): string {
+    if (!path.isAbsolute(inputPath)) return inputPath;
+    const relative = path.relative(this.workspace.root, inputPath);
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error(`Image path is outside the workspace: ${inputPath}`);
+    }
+    return relative;
   }
 }
 

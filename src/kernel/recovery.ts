@@ -234,6 +234,19 @@ export function classifyFailure(error: unknown, context: FailureClassificationCo
     return { ...base, code: "cancelled", source: context.source, disposition: "cancelled", retryable: false };
   }
   if (context.source === "provider") {
+    // Hitting the output ceiling is deterministic, not a glitch: the same
+    // request truncates at the same place every time, so retrying it burns the
+    // budget and ends in the same failure. It is the response that must change
+    // — a smaller write, or a higher ceiling — so surface it instead.
+    if (lower.includes("truncated at max_tokens")) {
+      return {
+        ...base,
+        code: "provider_protocol_invalid",
+        source: "provider",
+        disposition: "deterministic",
+        retryable: false,
+      };
+    }
     // A provider can return a syntactically valid HTTP response whose model
     // decision is not decodable (for example malformed function arguments).
     // Retrying the inference decision is safe because no decoded decision has

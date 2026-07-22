@@ -14,7 +14,8 @@ if (files.length === 0) {
 
 const child = spawn(process.execPath, ["--test", `--test-concurrency=${testConcurrency}`, ...files], {
   cwd: root,
-  env: process.env,
+  // Warmups spawn real browser processes; tests must stay hermetic.
+  env: { ...process.env, VANGUARD_NO_PREWARM: "1" },
   stdio: "inherit",
   windowsHide: true,
 });

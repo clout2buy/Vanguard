@@ -8,7 +8,16 @@ manifest.
 
 ## Parent-owned lifecycle
 
-The model can use five runtime tools:
+The model can use the durable lifecycle tools plus two Kimi-style orchestration surfaces:
+
+- `delegate.agent` launches one isolated `coder`, `explore`, or `plan` child,
+  either in the foreground with a bounded wait or in the background. `explore`
+  and `plan` are runtime-enforced read-only profiles, not prompt conventions.
+- `delegate.swarm` substitutes 2-6 distinct values into a `{{item}}` prompt
+  template and schedules the resulting children together. Scheduler concurrency,
+  depth, time, child-count, and aggregate-step caps remain authoritative.
+
+The lower-level lifecycle tools remain available:
 
 - `delegate.start` queues a self-contained task with one or more editable
   workspace-relative scopes and a reserved step budget. It returns immediately.

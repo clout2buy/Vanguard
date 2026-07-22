@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { normalizeDecision, type ContextPolicyPort, type TranscriptEntry } from "./contracts.js";
 import { summarizeHistoricalToolExchange } from "./historySummary.js";
+import { estimateTokensFast, tokenCeilingForBytes } from "./tokenEstimate.js";
 
 /** Raised instead of silently sending a request larger than the sealed budget. */
 export class ContextBudgetExceededError extends Error {
@@ -23,8 +24,29 @@ export class ContextBudgetExceededError extends Error {
  * cumulative hash and structural outcomes.
  * This permits occasional explicit cache-boundary resets while guaranteeing
  * that the serialized transcript never exceeds the runtime's byte budget.
+ *
+ * Provider caches (Anthropic prompt caching, OpenAI/DeepSeek prefix caching,
+ * Ollama's KV cache) all match on the longest byte-identical prefix of the
+ * previous request. Re-selecting history every step rewrites the digest near
+ * the front of the prompt and forfeits that cache on every subsequent call.
+ * So overflow is handled in epochs: one collapse down to a low-water mark
+ * freezes the selected prefix byte-for-byte, later steps only append verbatim
+ * new chunks after it, and the next collapse happens only when appended
+ * growth exhausts the budget again. Losing the epoch (rewritten history, a
+ * changed budget, process restart) merely costs one extra collapse.
  */
+const EPOCH_LOW_WATER_RATIO = 0.6;
+
+interface ContextEpoch {
+  readonly budget: number;
+  readonly consumedChunks: number;
+  readonly prefixHash: string;
+  readonly frozen: readonly TranscriptEntry[];
+}
+
 export class StickyContextPolicy implements ContextPolicyPort {
+  #epoch: ContextEpoch | undefined;
+
   select(
     task: string,
     transcript: readonly TranscriptEntry[],
@@ -41,8 +63,54 @@ export class StickyContextPolicy implements ContextPolicyPort {
       || task.length === 0
       ? transcript
       : [{ role: "task", content: task }, ...transcript];
-    if (serializedBytes([...anchoredTranscript, ...reservedTail]) <= maxBytes) return anchoredTranscript;
     const chunks = causalChunks(anchoredTranscript);
+
+    if (this.#epoch !== undefined) {
+      const epoch = this.#epoch;
+      if (epoch.budget !== maxBytes
+        || chunks.length < epoch.consumedChunks
+        || hashChunks(chunks.slice(0, epoch.consumedChunks)) !== epoch.prefixHash) {
+        // History was rewritten or the budget changed; this epoch's frozen
+        // prefix no longer describes reality and must never be replayed.
+        this.#epoch = undefined;
+      } else {
+        const suffix = chunks.slice(epoch.consumedChunks).flatMap((chunk) => [...chunk.entries]);
+        const candidate = [...epoch.frozen, ...suffix];
+        if (fitsBudget(candidate, reservedTail, maxBytes)) return candidate;
+        // Appended growth exhausted the epoch: collapse into a new one below.
+        this.#epoch = undefined;
+      }
+    }
+
+    if (serializedBytes([...anchoredTranscript, ...reservedTail]) <= maxBytes) return anchoredTranscript;
+
+    // Collapse to the low-water mark so the frozen prefix has append headroom;
+    // if even that is impossible, fall back to the full budget.
+    const lowWater = Math.max(2, Math.floor(maxBytes * EPOCH_LOW_WATER_RATIO));
+    let result: readonly TranscriptEntry[];
+    try {
+      result = this.#selectWithinBudget(task, anchoredTranscript, chunks, lowWater, reservedTail);
+    } catch (error) {
+      if (!(error instanceof ContextBudgetExceededError)) throw error;
+      result = this.#selectWithinBudget(task, anchoredTranscript, chunks, maxBytes, reservedTail);
+    }
+    this.#epoch = {
+      budget: maxBytes,
+      consumedChunks: chunks.length,
+      prefixHash: hashChunks(chunks),
+      frozen: result,
+    };
+    return result;
+  }
+
+  #selectWithinBudget(
+    task: string,
+    anchoredTranscript: readonly TranscriptEntry[],
+    chunks: readonly ContextChunk[],
+    maxBytes: number,
+    reservedTail: readonly TranscriptEntry[],
+  ): readonly TranscriptEntry[] {
+    if (serializedBytes([...anchoredTranscript, ...reservedTail]) <= maxBytes) return anchoredTranscript;
 
     const taskIndices = chunks
       .map((chunk, index) => chunk.entries.some((entry) => entry.role === "task") ? index : -1)
@@ -59,6 +127,8 @@ export class StickyContextPolicy implements ContextPolicyPort {
       && isToolDecision(chunks[newestDecisionIndex]!.entries[0])
       ? newestDecisionIndex
       : -1;
+    const delegatedOverflowIndex = findLastIndex(chunks, (chunk) =>
+      chunk.entries.some(isDelegatedOverflowDigest));
 
     // A restored or legacy transcript can lack a task entry. Synthesize the
     // durable anchor from the kernel-owned task in that case.
@@ -68,6 +138,7 @@ export class StickyContextPolicy implements ContextPolicyPort {
     const requiredIndices = new Set<number>(taskIndices);
     if (newestUserIndex >= 0) requiredIndices.add(newestUserIndex);
     if (freshToolIndex >= 0) requiredIndices.add(freshToolIndex);
+    if (delegatedOverflowIndex >= 0) requiredIndices.add(delegatedOverflowIndex);
     const irreducible = assembleRequired(chunks, taskIndices, taskEntries, requiredIndices);
     const irreducibleBytes = serializedBytes([...irreducible, ...reservedTail]);
     if (irreducibleBytes > maxBytes) {
@@ -118,11 +189,20 @@ export class StickyContextPolicy implements ContextPolicyPort {
       return result;
     };
 
+    // The shed decision is token-aware: providers truncate by tokens, not
+    // bytes, and dense content can overflow the window while fitting the byte
+    // budget. The final hard error below remains byte-based; tokens only ever
+    // shed earlier, never allow more.
+    const withinBudget = (entries: readonly TranscriptEntry[]): boolean => {
+      const serialized = JSON.stringify(entries);
+      return Buffer.byteLength(serialized) <= maxBytes
+        && estimateTokensFast(serialized) <= tokenCeilingForBytes(maxBytes);
+    };
     let result = assemble();
     // Shed optional preserved history oldest-first until the hard budget is
     // satisfied. This is deterministic and never splits a causal chunk.
     for (const index of optionalCritical) {
-      if (serializedBytes([...result, ...reservedTail]) <= maxBytes) break;
+      if (withinBudget([...result, ...reservedTail])) break;
       selected.delete(index);
       result = assemble();
     }
@@ -131,7 +211,7 @@ export class StickyContextPolicy implements ContextPolicyPort {
       .filter((index) => !requiredIndices.has(index))
       .sort((left, right) => left - right);
     for (const index of removableRecent) {
-      if (serializedBytes([...result, ...reservedTail]) <= maxBytes) break;
+      if (withinBudget([...result, ...reservedTail])) break;
       selected.delete(index);
       result = assemble();
     }
@@ -276,6 +356,24 @@ function serializedBytes(entries: readonly TranscriptEntry[]): number {
   return Buffer.byteLength(JSON.stringify(entries));
 }
 
+/** Byte- and token-aware fit check used for both epochs and fresh selection. */
+function fitsBudget(
+  entries: readonly TranscriptEntry[],
+  reservedTail: readonly TranscriptEntry[],
+  maxBytes: number,
+): boolean {
+  const serialized = JSON.stringify([...entries, ...reservedTail]);
+  return Buffer.byteLength(serialized) <= maxBytes
+    && estimateTokensFast(serialized) <= tokenCeilingForBytes(maxBytes);
+}
+
+/** Identity of the transcript chunks an epoch's frozen prefix represents. */
+function hashChunks(chunks: readonly ContextChunk[]): string {
+  const hash = createHash("sha256");
+  for (const chunk of chunks) hash.update(JSON.stringify(chunk.entries)).update("\n");
+  return hash.digest("hex");
+}
+
 function findLastIndex<T>(values: readonly T[], predicate: (value: T) => boolean): number {
   for (let index = values.length - 1; index >= 0; index -= 1) {
     if (predicate(values[index]!)) return index;
@@ -301,4 +399,10 @@ function isControlObservation(entry: TranscriptEntry | undefined, tool: string):
   if (entry?.role !== "observation" || entry.content === null || Array.isArray(entry.content)
     || typeof entry.content !== "object") return false;
   return entry.content.tool === tool;
+}
+
+function isDelegatedOverflowDigest(entry: TranscriptEntry): boolean {
+  return entry.role === "history"
+    && typeof entry.content === "string"
+    && entry.content.startsWith("[Vanguard delegated overflow digest]");
 }

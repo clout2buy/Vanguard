@@ -31,24 +31,35 @@ export async function analyzePatch(sourceRoot: string, workspaceRoot: string): P
   return { changedFiles, filesAdded, filesDeleted, filesModified, beforeBytes, afterBytes, beforeLines, afterLines };
 }
 
+const FILE_READ_CONCURRENCY = 16;
+
 async function files(root: string): Promise<Map<string, Buffer>> {
   const resolved = await realpath(root); const result = new Map<string, Buffer>(); const queue = [resolved];
+  // Two-phase: enumerate serially (readdir is cheap), then read file bytes
+  // with bounded parallelism — the reads dominate on real repositories.
+  const targets: { relative: string; absolute: string }[] = [];
   while (queue.length) {
     const directory = queue.shift()!;
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const absolute = path.join(directory, entry.name);
       if (entry.isDirectory()) { if (!SESSION_EXCLUDED_DIRECTORIES.has(entry.name)) queue.push(absolute); continue; }
-      if (entry.isFile()) {
-        try {
-          result.set(path.relative(resolved, absolute).replaceAll("\\", "/"), await readFile(absolute));
-        } catch (error) {
-          // OS-locked files are invisible to the session model everywhere.
-          const code = (error as { code?: unknown } | null)?.code;
-          if (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES") throw error;
-        }
-      }
+      if (entry.isFile()) targets.push({ relative: path.relative(resolved, absolute).replaceAll("\\", "/"), absolute });
     }
   }
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(FILE_READ_CONCURRENCY, targets.length) }, async () => {
+    while (next < targets.length) {
+      const target = targets[next]!;
+      next += 1;
+      try {
+        result.set(target.relative, await readFile(target.absolute));
+      } catch (error) {
+        // OS-locked files are invisible to the session model everywhere.
+        const code = (error as { code?: unknown } | null)?.code;
+        if (code !== "EBUSY" && code !== "EPERM" && code !== "EACCES") throw error;
+      }
+    }
+  }));
   return result;
 }
 

@@ -13,6 +13,7 @@ import {
   contractCriterionIds,
   normalizeContract,
   renderContract,
+  validateJsonSchema,
 } from "../src/index.js";
 
 class CapturingModel implements ModelPort {
@@ -163,7 +164,7 @@ test("completion remains blocked until a milestone has bound executable evidence
   assert.match(JSON.stringify(journal.events), /remain unproven/);
 });
 
-test("completion blocks stale milestone proof until it is refreshed after the latest mutation", async () => {
+test("completion auto-refreshes stale proof from fresh evidence without a model turn", async () => {
   const plan = new PlanLedger();
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
@@ -173,8 +174,6 @@ test("completion blocks stale milestone proof until it is refreshed after the la
       planDecision("m1", "proven", [toolEvidence("check-0")]),
       { kind: "tools", calls: [{ id: "write", name: "workspace.write", input: {} }] },
       { kind: "tools", calls: [{ id: "check-1", name: "test", input: {} }] },
-      { kind: "complete", answer: "old plan proof" },
-      planDecision("m1", "proven", [toolEvidence("check-1")]),
       { kind: "complete", answer: "fresh plan proof" },
     ]),
     tools: [
@@ -185,8 +184,42 @@ test("completion blocks stale milestone proof until it is refreshed after the la
     verifiers: [passingVerifier], journal, plan,
   });
   const outcome = await kernel.run("refresh plan proof after code changes");
+  // No refresh turn: the runtime re-bound the stale proof to check-1 itself,
+  // so the very first completion claim after the fresh check succeeds.
   assert.equal(outcome.status === "completed" ? outcome.answer : "", "fresh plan proof");
-  assert.match(JSON.stringify(journal.events), /stale workspace evidence/);
+  const events = JSON.stringify(journal.events);
+  assert.match(events, /automatic":true/);
+  assert.doesNotMatch(events, /stale workspace evidence/);
+  assert.equal(plan.state()!.milestones[0]!.evidence[0]!.workspaceGeneration, 1);
+});
+
+test("completion still blocks stale proof when no fresh evidence exists", async () => {
+  const plan = new PlanLedger();
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new CapturingModel([
+      planDecision("m1", "active"),
+      { kind: "tools", calls: [{ id: "check-0", name: "test", input: {} }] },
+      planDecision("m1", "proven", [toolEvidence("check-0")]),
+      { kind: "tools", calls: [{ id: "write", name: "workspace.write", input: {} }] },
+      { kind: "complete", answer: "old plan proof" },
+      { kind: "tools", calls: [{ id: "check-1", name: "test", input: {} }] },
+      { kind: "complete", answer: "fresh plan proof" },
+    ]),
+    tools: [
+      mutateTool("workspace.write"),
+      executeTool("test"),
+      new PlanTool(plan, new JournalEvidenceResolver(journal)),
+    ],
+    verifiers: [passingVerifier], journal, plan,
+  });
+  const outcome = await kernel.run("stale proof needs fresh evidence first");
+  assert.equal(outcome.status === "completed" ? outcome.answer : "", "fresh plan proof");
+  const events = JSON.stringify(journal.events);
+  // The premature claim was rejected: nothing eligible existed to re-bind.
+  assert.match(events, /stale workspace evidence/);
+  // After the fresh check ran, the runtime — not the model — re-bound it.
+  assert.match(events, /automatic":true/);
   assert.equal(plan.state()!.milestones[0]!.evidence[0]!.workspaceGeneration, 1);
 });
 
@@ -494,6 +527,38 @@ test("plan revisions cannot delete or weaken existing milestones", async () => {
     summary: "rewrite criteria",
     milestones: [{ ...milestone("m1", "active") as object, acceptanceCriteria: ["weaker"] }],
   } as JsonValue, context), /cannot weaken or rewrite/);
+});
+
+test("plan schema accepts harmless provider progress notes", () => {
+  const tool = new PlanTool(new PlanLedger());
+  const input = { summary: "initial", note: "Starting implementation", milestones: [milestone("m1", "active")] } as JsonValue;
+  assert.deepEqual(validateJsonSchema(input, tool.definition.inputSchema), []);
+});
+
+test("invalid plan evidence reports the exact fresh proof handles available", async () => {
+  const journal = new MemoryJournal();
+  await journal.append({
+    sequence: 1,
+    type: "tool.completed",
+    data: {
+      evidenceId: "evidence:1:1",
+      callId: "check-1",
+      tool: "artifact.render",
+      ok: true,
+      output: { path: ".vanguard/renders/page.png" },
+      evidenceAuthority: "independent-execution",
+      workspaceGeneration: 0,
+    },
+  });
+  const resolver = new JournalEvidenceResolver(journal);
+  const tool = new PlanTool(new PlanLedger(), resolver);
+  await assert.rejects(
+    tool.execute({
+      summary: "proof recovery",
+      milestones: [milestone("m1", "proven", [runtimeEvidence("invented")])],
+    }, { task: "t", step: 1, signal: new AbortController().signal }),
+    /Fresh eligible tool proof: evidence:1:1 \(artifact\.render, independent-execution\)/u,
+  );
 });
 
 test("resume survives later call-id reuse and revalidates persisted evidence sequence and hash", async () => {
@@ -950,10 +1015,13 @@ test("expanded contracts render constraints and publish stable criterion IDs", (
     riskLevel: "medium",
     requiredVerification: ["npm test"],
     deliverables: ["patched parser"],
+    creativeDirection: "a terminal-native diagnostics voice: dense, monospaced, zero decoration",
   });
   assert.notEqual(contract, undefined);
+  assert.equal(contract!.creativeDirection, "a terminal-native diagnostics voice: dense, monospaced, zero decoration");
   const rendered = renderContract(contract!);
   assert.match(rendered, /Constraints:\n- public API stays byte-compatible/);
   assert.match(rendered, /Non-goals \(do not do these\):\n- no performance work/);
+  assert.match(rendered, /Creative direction \(commit to this identity in every element\): a terminal-native diagnostics voice/);
   assert.deepEqual(contractCriterionIds(contract!), ["success-1", "verification-1", "deliverable-1"]);
 });

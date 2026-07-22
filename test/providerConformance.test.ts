@@ -106,6 +106,7 @@ test("provider profile files round-trip the versioned model/endpoint contract", 
     const profile = await readProviderProfile(file, { PORTABLE_API_KEY: "fixture" });
     assert.equal(profile.model, "portable-model");
     assert.equal(profile.endpoint, "http://localhost:8181/v1/chat/completions");
+    assert.ok(profile.credentialProvenance.source === "environment");
     assert.equal(profile.credentialProvenance.present, true);
     assert.equal(profile.capabilities.streaming, false);
   } finally {
@@ -278,6 +279,31 @@ test("all public wire codecs preserve parallel calls and private continuation re
   assert.match(JSON.stringify(responses.encode(followup(responseDecision))), /OPENAI_PRIVATE/u);
   assert.match(JSON.stringify(anthropic.encode(followup(anthropicDecision))), /ANTHROPIC_PRIVATE/u);
   assert.match(JSON.stringify(chat.encode(followup(chatDecision))), /CHAT_PRIVATE/u);
+});
+
+test("every wire emits a stable prompt cache key that survives transcript growth", () => {
+  // Prefill (TTFT) is the dominant per-turn cost; a stable cache key pins the
+  // shared prefix to a warm backend route on every wire so the KV cache is
+  // actually reused. The key must not drift as the transcript grows, and the
+  // Anthropic wire instead carries its own cache_control breakpoints.
+  const grown: ModelRequest = {
+    ...request,
+    transcript: [
+      ...request.transcript,
+      { role: "decision", content: { kind: "tools", calls: [{ id: "a", name: "workspace.read", input: { path: "a.ts" } }] } as never },
+      { role: "observation", content: { callId: "a", tool: "workspace.read", ok: true, output: { contents: "x".repeat(4_000) } } },
+    ],
+  };
+  for (const codec of [new OpenAIResponsesCodec("m"), new OpenAIChatCompletionsCodec("m")]) {
+    const first = codec.encode({ ...request, signal: undefined } as never) as Record<string, JsonValue>;
+    const later = codec.encode({ ...grown, signal: undefined } as never) as Record<string, JsonValue>;
+    assert.equal(typeof first.prompt_cache_key, "string");
+    assert.ok((first.prompt_cache_key as string).length > 0);
+    assert.equal(first.prompt_cache_key, later.prompt_cache_key, "the cache key must be identical across turns of a session");
+  }
+  // Anthropic's mechanism is cache_control breakpoints, not a key.
+  const anthropicBody = new AnthropicMessagesCodec("m").encode({ ...request, signal: undefined } as never);
+  assert.match(JSON.stringify(anthropicBody), /cache_control/u);
 });
 
 test("streaming and usage conformance holds across Responses, Messages, and Chat Completions", async () => {
