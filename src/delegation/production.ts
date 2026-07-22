@@ -22,10 +22,12 @@ const MAX_EVENT_LINE_BYTES = 64 * 1024;
 const FORCE_CANCEL_AFTER_MS = 2_000;
 
 export interface DelegateChildConfiguration {
-  readonly provider: "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "http";
+  readonly provider: "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "openai-compatible" | "http";
   readonly model: string;
   readonly auth?: "api-key" | "oauth";
   readonly endpoint?: string;
+  /** Env variable naming the key for an openai-compatible endpoint; children inherit the env itself. */
+  readonly credentialVariable?: string;
   readonly verification: CommandSpec;
   readonly publicCheck?: CommandSpec;
   readonly protectedPaths?: readonly string[];
@@ -210,6 +212,7 @@ export class CliDelegateRunner implements DelegateRunnerPort {
       "--verifier-evidence", "summary",
     ];
     if (configuration.endpoint !== undefined) args.push("--endpoint", configuration.endpoint);
+    if (configuration.credentialVariable !== undefined) args.push("--credential-variable", configuration.credentialVariable);
     for (const argument of configuration.verification.args) args.push("--verify-arg", argument);
     if (configuration.publicCheck !== undefined) {
       args.push("--check-command", configuration.publicCheck.command);
@@ -362,8 +365,8 @@ function assertPositive(value: number, name: string): void {
 }
 
 function validateEndpoint(configuration: DelegateChildConfiguration): void {
-  if (configuration.provider === "http" && configuration.endpoint === undefined) {
-    throw new Error("The delegated HTTP provider requires an endpoint.");
+  if ((configuration.provider === "http" || configuration.provider === "openai-compatible") && configuration.endpoint === undefined) {
+    throw new Error(`The delegated ${configuration.provider} provider requires an endpoint.`);
   }
   if (configuration.endpoint === undefined) return;
   const endpoint = new URL(configuration.endpoint);

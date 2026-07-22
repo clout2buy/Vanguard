@@ -20,7 +20,7 @@ export const VANGUARD_IDEMPOTENT_CREATE_CAPABILITY = "sessions.create.idempotent
 export const VANGUARD_WORKER_FENCING_CAPABILITY = "sessions.workerFenced" as const;
 export const VANGUARD_EXECUTION_TREE_FENCING_CAPABILITY = "sessions.executionTreeFenced" as const;
 
-export type VanguardProvider = "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "http";
+export type VanguardProvider = "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "openai-compatible" | "http";
 
 export interface VanguardSessionConfig {
   readonly workspace: string;
@@ -46,6 +46,12 @@ export interface VanguardSessionConfig {
    */
   readonly executionEvidence?: "independent" | "syntax";
   readonly endpoint?: string;
+  /**
+   * Environment variable naming the API key for an `openai-compatible`
+   * endpoint (OpenRouter, gateways, self-hosted servers). Required for that
+   * provider; the config carries only the variable name, never the value.
+   */
+  readonly credentialVariable?: string;
   readonly verification?: CommandSpec;
   readonly publicCheck?: CommandSpec;
   readonly adaptiveVerification?: boolean;

@@ -76,6 +76,7 @@ interface StoredCliOptions {
   readonly auth?: VanguardSessionConfig["auth"];
   readonly executionEvidence?: VanguardSessionConfig["executionEvidence"];
   readonly endpoint?: string;
+  readonly credentialVariable?: string;
   readonly verification: CommandSpec;
   readonly adaptiveVerification?: boolean;
   readonly allowedCommands: readonly string[];
@@ -1110,6 +1111,7 @@ function storedOptions(
     ...(config.auth === undefined ? {} : { auth: config.auth }),
     ...(config.executionEvidence === undefined ? {} : { executionEvidence: config.executionEvidence }),
     ...(config.endpoint === undefined ? {} : { endpoint: config.endpoint }),
+    ...(config.credentialVariable === undefined ? {} : { credentialVariable: config.credentialVariable }),
     ...(config.adaptiveVerification === undefined ? {} : { adaptiveVerification: config.adaptiveVerification }),
     allowedCommands: [...(config.allowedCommands ?? [])],
     protectedPaths: [...(config.protectedPaths ?? [])],
@@ -1141,7 +1143,7 @@ function storedOptions(
 function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
   const raw = ownDataRecord(config, "Session config");
   const allowed = new Set([
-    "adaptiveVerification", "allowedCommands", "auth", "commandIdleTimeoutMs", "commandTimeoutMs", "direct", "editableRoots", "endpoint", "inPlace",
+    "adaptiveVerification", "allowedCommands", "auth", "commandIdleTimeoutMs", "commandTimeoutMs", "credentialVariable", "direct", "editableRoots", "endpoint", "inPlace",
     "executionEvidence",
     "exposeRawProcess", "maxContextBytes", "maxDurationMs", "maxFailedVerificationAttempts",
     "maxSteps", "model", "protectedPaths", "provider", "publicCheck", "restrictProcess",
@@ -1151,7 +1153,7 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
     if (!allowed.has(key)) throw new VanguardEngineError("invalid_config", `Unsupported session config field '${key}'.`);
   }
   const workspace = boundedString(raw.workspace, "workspace", 32_768, true);
-  if (!(["openai", "anthropic", "deepseek", "kimi", "ollama", "http"] as const).includes(raw.provider as never)) {
+  if (!(["openai", "anthropic", "deepseek", "kimi", "ollama", "openai-compatible", "http"] as const).includes(raw.provider as never)) {
     throw new VanguardEngineError("invalid_config", "provider is unsupported.");
   }
   const provider = raw.provider as VanguardSessionConfig["provider"];
@@ -1167,10 +1169,28 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
   }
   const executionEvidence = raw.executionEvidence as VanguardSessionConfig["executionEvidence"];
   const auth = raw.auth as VanguardSessionConfig["auth"];
-  if (provider === "http" && (raw.endpoint === undefined || raw.endpoint === "")) {
-    throw new VanguardEngineError("invalid_config", "The http provider requires endpoint.");
+  if ((provider === "http" || provider === "openai-compatible") && (raw.endpoint === undefined || raw.endpoint === "")) {
+    throw new VanguardEngineError("invalid_config", `The ${provider} provider requires endpoint.`);
   }
   const endpoint = raw.endpoint === undefined ? undefined : boundedString(raw.endpoint, "endpoint", 16_384, false);
+  if (provider === "openai-compatible" && raw.credentialVariable === undefined) {
+    throw new VanguardEngineError(
+      "invalid_config",
+      "The openai-compatible provider requires credentialVariable, an environment-variable name like OPENROUTER_API_KEY.",
+    );
+  }
+  if (raw.credentialVariable !== undefined) {
+    if (typeof raw.credentialVariable !== "string" || !/^[A-Z][A-Z0-9_]{0,127}$/.test(raw.credentialVariable)) {
+      throw new VanguardEngineError("invalid_config", "credentialVariable must be an environment-variable name like OPENROUTER_API_KEY.");
+    }
+    if (raw.auth === "oauth") {
+      throw new VanguardEngineError("invalid_config", "credentialVariable cannot be combined with oauth auth.");
+    }
+    if (provider === "http") {
+      throw new VanguardEngineError("invalid_config", "credentialVariable is not supported for the http provider.");
+    }
+  }
+  const credentialVariable = raw.credentialVariable as string | undefined;
   if (raw.securityProfile !== undefined && raw.securityProfile !== "workspace" && raw.securityProfile !== "guarded") {
     throw new VanguardEngineError("invalid_config", "securityProfile must be 'workspace' or 'guarded'.");
   }
@@ -1222,6 +1242,7 @@ function snapshotConfig(config: VanguardSessionConfig): VanguardSessionConfig {
     ...(auth === undefined ? {} : { auth }),
     ...(executionEvidence === undefined ? {} : { executionEvidence }),
     ...(endpoint === undefined ? {} : { endpoint }),
+    ...(credentialVariable === undefined ? {} : { credentialVariable }),
     ...(verification === undefined ? {} : { verification }),
     ...(publicCheck === undefined ? {} : { publicCheck }),
     ...(raw.adaptiveVerification === undefined ? {} : { adaptiveVerification: raw.adaptiveVerification as boolean }),
@@ -1372,7 +1393,8 @@ function requiredStoredRunConfiguration(value: unknown): StoredRunConfiguration 
   const options = value.options;
   if (typeof options.workspace !== "string" || !path.isAbsolute(options.workspace)
     || typeof options.task !== "string"
-    || !(["openai", "anthropic", "deepseek", "kimi", "ollama", "http"] as const).includes(options.provider as never)
+    || !(["openai", "anthropic", "deepseek", "kimi", "ollama", "openai-compatible", "http"] as const).includes(options.provider as never)
+    || (options.credentialVariable !== undefined && typeof options.credentialVariable !== "string")
     || typeof options.model !== "string" || options.model.length === 0
     || (options.inPlace !== undefined && typeof options.inPlace !== "boolean")
     || (options.auth !== undefined && options.auth !== "api-key" && options.auth !== "oauth")

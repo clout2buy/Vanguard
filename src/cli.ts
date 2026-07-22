@@ -104,7 +104,9 @@ import {
 interface CliOptions {
   readonly workspace: string;
   readonly task: string;
-  readonly provider: "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "http";
+  readonly provider: "openai" | "anthropic" | "deepseek" | "kimi" | "ollama" | "openai-compatible" | "http";
+  /** Environment variable naming the API key for an openai-compatible endpoint. */
+  readonly credentialVariable?: string;
   readonly model: string;
   /** Credential source. Defaults to the provider's API-key environment variable. */
   readonly auth?: "api-key" | "oauth";
@@ -756,6 +758,7 @@ async function buildExecutionRuntime(
       model: options.model,
       ...(options.auth === undefined ? {} : { auth: options.auth }),
       ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+      ...(options.credentialVariable === undefined ? {} : { credentialVariable: options.credentialVariable }),
       verification: options.verification,
       ...(options.publicCheck === undefined ? {} : { publicCheck: options.publicCheck }),
       protectedPaths: options.protectedPaths,
@@ -1139,6 +1142,22 @@ function createModel(options: CliOptions, streamObserver?: StreamObserver) {
       ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
     }, common);
   }
+  if (options.credentialVariable !== undefined && options.provider !== "http") {
+    // A named credential variable routes any provider through the configured
+    // profile: the key env var is overridden (a gateway token instead of a
+    // first-party key) without touching the provider's default variable.
+    return createConfiguredProviderModel({
+      version: VANGUARD_PROVIDER_CONFIG_VERSION,
+      provider: options.provider,
+      model: options.model,
+      credential: { source: "environment", variable: options.credentialVariable },
+      ...(options.provider === "openai-compatible" ? { wire: "openai-chat-completions" as const } : {}),
+      ...(options.provider === "anthropic" ? { apiVersion: "2023-06-01" } : {}),
+      ...(options.provider === "kimi" ? { reasoning: kimiReasoning(options) } : {}),
+      ...(options.provider === "openai" ? { reasoning: { effort: openaiReasoningEffort(options) } } : {}),
+      ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
+    }, common);
+  }
   if (options.provider === "openai") return createConfiguredProviderModel({
     version: VANGUARD_PROVIDER_CONFIG_VERSION,
     provider: "openai",
@@ -1156,6 +1175,9 @@ function createModel(options: CliOptions, streamObserver?: StreamObserver) {
     ...(options.endpoint === undefined ? {} : { endpoint: options.endpoint }),
   }, common);
   if (options.provider === "ollama") return createOllamaModel({ ...common, ...(options.endpoint ? { endpoint: options.endpoint } : {}) });
+  if (options.provider === "openai-compatible") {
+    throw new Error("--credential-variable is required for the openai-compatible provider.");
+  }
   if (options.endpoint === undefined) throw new Error("--endpoint is required for the http provider.");
   return new HttpModelAdapter({ endpoint: options.endpoint, timeoutMs: common.timeoutMs, maxAttempts: common.maxAttempts });
 }
@@ -1265,8 +1287,18 @@ async function parseOptions(
   const task = await resolveTaskInput(values, requireTask);
   const provider = required(values, "--provider");
   if (provider !== "openai" && provider !== "anthropic" && provider !== "deepseek" && provider !== "kimi" && provider !== "ollama"
-    && provider !== "http") {
-    throw new Error("--provider must be openai, anthropic, deepseek, kimi, ollama, or http.");
+    && provider !== "openai-compatible" && provider !== "http") {
+    throw new Error("--provider must be openai, anthropic, deepseek, kimi, ollama, openai-compatible, or http.");
+  }
+  const credentialVariable = single(values, "--credential-variable");
+  if (provider === "openai-compatible" && credentialVariable === undefined) {
+    throw new Error("--provider openai-compatible requires --credential-variable, an environment-variable name like OPENROUTER_API_KEY.");
+  }
+  if (credentialVariable !== undefined) {
+    if (!/^[A-Z][A-Z0-9_]{0,127}$/.test(credentialVariable)) {
+      throw new Error("--credential-variable must be an environment-variable name like OPENROUTER_API_KEY.");
+    }
+    if (provider === "http") throw new Error("--credential-variable is not supported for --provider http.");
   }
   const authRaw = single(values, "--auth");
   if (authRaw !== undefined && authRaw !== "api-key" && authRaw !== "oauth") {
@@ -1367,6 +1399,7 @@ async function parseOptions(
     maxContextBytes,
     maxFailedVerificationAttempts,
     ...(single(values, "--endpoint") === undefined ? {} : { endpoint: single(values, "--endpoint")! }),
+    ...(credentialVariable === undefined ? {} : { credentialVariable }),
     extensions: extensionRuntimeState(resolvedExtensions),
     ...(resolvedExtensions.instructions.length === 0 ? {} : { extensionInstructions: resolvedExtensions.instructions }),
   };
