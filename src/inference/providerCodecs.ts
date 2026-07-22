@@ -942,7 +942,14 @@ export class OpenAIChatCompletionsCodec implements ModelWireCodec {
         max_completion_tokens: this.kimi.maxCompletionTokens,
         thinking: {
           type: this.kimi.thinking,
-          ...(this.kimi.thinking === "enabled" && this.kimi.effort !== undefined ? { effort: this.kimi.effort } : {}),
+          // Kimi's endpoint accepts effort low/high/max and 400s on "medium"
+          // ("Invalid request Error", nothing more): medium is the provider
+          // default and must be expressed by omitting the field entirely.
+          ...(this.kimi.thinking === "enabled"
+            && this.kimi.effort !== undefined
+            && this.kimi.effort !== "medium"
+            ? { effort: this.kimi.effort }
+            : {}),
           ...(this.kimi.thinking === "enabled" ? { keep: "all" } : {}),
         },
       }),

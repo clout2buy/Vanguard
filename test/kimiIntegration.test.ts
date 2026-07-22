@@ -83,6 +83,32 @@ test("Kimi provider uses managed subscription endpoint and native thinking paylo
   }), /only for Kimi/u);
 });
 
+test("Kimi medium effort is expressed by omission, never on the wire", () => {
+  // Kimi's endpoint 400s on effort "medium" ("Invalid request Error"):
+  // its valid_efforts are low/high/max and medium is the implicit default.
+  const profile = resolveProviderProfile({
+    version: 1,
+    provider: "kimi",
+    model: "kimi-for-coding",
+    credential: { source: "oauth", provider: "kimi" },
+    reasoning: { thinking: "enabled", effort: "medium" },
+  });
+  const codec = new OpenAIChatCompletionsCodec("kimi-for-coding", profile.capabilities, "deepseek", {
+    maxCompletionTokens: profile.maxOutputTokens,
+    thinking: "enabled",
+    effort: "medium",
+  });
+  const encoded = codec.encode({
+    task: "inspect",
+    mode: "execution",
+    transcript: [],
+    tools: [],
+    remainingSteps: 5,
+    workingState: null,
+  }) as Record<string, unknown>;
+  assert.deepEqual(encoded.thinking, { type: "enabled", keep: "all" });
+});
+
 test("Kimi model discovery parses reasoning capabilities from the signed-in account", async () => {
   const previous = process.env.VANGUARD_KIMI_OAUTH_TOKEN;
   process.env.VANGUARD_KIMI_OAUTH_TOKEN = "test-token";

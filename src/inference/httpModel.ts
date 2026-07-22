@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { JsonValue, ModelDecision, ModelPort, ModelRequest } from "../kernel/contracts.js";
 import { normalizeDecision } from "../kernel/contracts.js";
 import { classifyFailure } from "../kernel/recovery.js";
@@ -170,6 +171,9 @@ export class HttpModelAdapter implements ModelPort {
     const body = JSON.stringify(streaming
       ? this.#codec.encodeStreaming!(serializable)
       : this.#codec.encode(serializable));
+    // Diagnostic wire capture: request bodies only, never headers or
+    // credentials. VANGUARD_WIRE_CAPTURE names the directory to write into.
+    captureWireBody(this.options.endpoint, body);
     let headers: Readonly<Record<string, string>>;
     try {
       // Resolve credentials once per decision. A credential-provider failure is
@@ -714,6 +718,27 @@ export function sanitizeDiagnostic(
     if (sensitive.length > 0) sanitized = sanitized.replaceAll(sensitive, "[REDACTED]");
   }
   return sanitized.length <= maximumLength ? sanitized : `${sanitized.slice(0, maximumLength)}…`;
+}
+
+/**
+ * Diagnostic-only capture of outgoing request bodies (no headers, so no
+ * credentials can land on disk). Enabled by pointing VANGUARD_WIRE_CAPTURE at
+ * a directory; failures are swallowed because capture must never affect a run.
+ */
+let wireCaptureSequence = 0;
+function captureWireBody(endpoint: string, body: string): void {
+  const directory = process.env.VANGUARD_WIRE_CAPTURE;
+  if (directory === undefined || directory === "") return;
+  wireCaptureSequence += 1;
+  const name = `wire-${String(wireCaptureSequence).padStart(3, "0")}-${Date.now()}.json`;
+  void import("node:fs/promises").then(async (fs) => {
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(
+      path.join(directory, name),
+      JSON.stringify({ endpoint, body: JSON.parse(body) }, null, 2),
+      "utf8",
+    );
+  }).catch(() => undefined);
 }
 
 function sensitiveHeaderValues(headers: Readonly<Record<string, string>>): string[] {
