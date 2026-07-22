@@ -1066,11 +1066,19 @@ function normalizedPath(value: string): string {
 
 async function resolveRunConfiguration(config: VanguardSessionConfig): Promise<StoredRunConfiguration> {
   const verificationWasDetected = config.verification === undefined;
-  const verification = config.verification ?? await detectProjectVerification(config.workspace);
+  // Blank or unrecognized projects have nothing to detect. When the caller
+  // opted into adaptive verification, fall back to the packaged adaptive
+  // trusted verifier (the same one the TUI uses), which requires the agent to
+  // establish a deterministic build/test contract before completion.
+  const verification = config.verification
+    ?? await detectProjectVerification(config.workspace)
+    ?? (config.adaptiveVerification === true
+      ? { command: "node", args: [path.join(import.meta.dirname, "..", "autoVerify.js"), "--mode", "tests"] }
+      : undefined);
   if (verification === undefined) {
     throw new VanguardEngineError(
       "verification_not_found",
-      "Could not detect project verification; provide a sealed verification command.",
+      "Could not detect project verification; provide a sealed verification command, or set adaptiveVerification.",
     );
   }
   const resolvedExtensions = await resolveExtensions({ workspaceRoot: config.workspace });
