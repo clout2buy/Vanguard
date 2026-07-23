@@ -223,7 +223,7 @@ const ASK_CONTROL_DEFINITION: ToolDefinition = {
 
 const EXECUTE_CONTROL_DEFINITION: ToolDefinition = {
   name: CONTROL_TOOL_NAMES.execute,
-  description: "Begin contracted engineering execution for an actionable coding request. State the objective in the user's terms, concrete success criteria, and — for non-trivial work — constraints, non-goals, and assumptions, so long work cannot drift. Never call this for ambiguous requests, greetings, or questions; a blank workspace is not authorization to build something.",
+  description: "Begin contracted engineering execution for an actionable request — this unlocks the full mutation toolset (write, edit, delete, run commands). State the objective in the user's terms, concrete success criteria, and — for non-trivial work — constraints, non-goals, and assumptions, so long work cannot drift. Small concrete requests (create a folder, tweak one file) are actionable: contract them immediately with minimal ceremony rather than declining. Never call this for ambiguous requests, greetings, or questions; a blank workspace is not authorization to build something unasked.",
   inputSchema: {
     type: "object",
     properties: {
