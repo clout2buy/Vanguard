@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, readFile, rm, stat } from "node:fs/promises";
+import { access, readFile, rm, stat, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -304,7 +304,20 @@ export class HeadlessRenderTool implements ToolPort {
         };
       }
       const screenshot = await readFile(screenshotAbsolute);
-      const inlined = inline && screenshot.byteLength <= MAX_INLINE_IMAGE_BYTES;
+      // Over-budget screenshots are DOWNSCALED, never omitted: a judge that
+      // cannot see the pixels fails verification for a size reason the model
+      // then grinds against forever. The full-resolution PNG stays on disk;
+      // the inline copy is the same pixels captured smaller.
+      let inlineImage: Buffer = screenshot;
+      let inlineScale = 1;
+      if (inline && screenshot.byteLength > MAX_INLINE_IMAGE_BYTES) {
+        const shrunk = await this.#downscaleScreenshot(browser, screenshotAbsolute, width, height, profileDirectory);
+        if (shrunk !== undefined) {
+          inlineImage = shrunk.bytes;
+          inlineScale = shrunk.scale;
+        }
+      }
+      const inlined = inline && inlineImage.byteLength <= MAX_INLINE_IMAGE_BYTES;
       return {
         ok: true,
         output: {
@@ -317,10 +330,16 @@ export class HeadlessRenderTool implements ToolPort {
           sha256: createHash("sha256").update(screenshot).digest("hex"),
           runtimeInspection: "settled DOM; no active loading status or visible failure alert",
           ...(inlined
-            ? { image: { mediaType: "image/png", base64: screenshot.toString("base64") } }
+            ? {
+              image: {
+                mediaType: "image/png",
+                base64: inlineImage.toString("base64"),
+                ...(inlineScale === 1 ? {} : { note: `downscaled to ${Math.round(inlineScale * 100)}% for the inline budget; the full-resolution PNG is at the recorded path` }),
+              },
+            }
             : {
               imageOmitted: inline
-                ? `screenshot is ${screenshot.byteLength} bytes, over the ${MAX_INLINE_IMAGE_BYTES}-byte inline budget; judge via inspect_image or render a smaller viewport`
+                ? `screenshot is ${screenshot.byteLength} bytes and could not be downscaled under the ${MAX_INLINE_IMAGE_BYTES}-byte inline budget; judge via inspect_image`
                 : "inline attachment was disabled for this call",
             }),
           note: "This PNG is the real rendered page. Judge the deliverable from it, never from the source text.",
@@ -329,6 +348,56 @@ export class HeadlessRenderTool implements ToolPort {
     } finally {
       await rm(profileDirectory, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Re-captures an oversized screenshot at reduced scale using the same
+   * Chromium: a wrapper page displays the PNG at scale and is screenshotted
+   * at the scaled viewport. Tries progressively smaller scales until the
+   * result fits the inline budget; undefined when none fits or capture fails.
+   */
+  async #downscaleScreenshot(
+    browser: string,
+    screenshotAbsolute: string,
+    width: number,
+    height: number,
+    profileParent: string,
+  ): Promise<{ bytes: Buffer; scale: number } | undefined> {
+    for (const scale of [0.55, 0.4, 0.3]) {
+      const scaledWidth = Math.max(MIN_VIEWPORT, Math.round(width * scale));
+      const scaledHeight = Math.max(MIN_VIEWPORT, Math.round(height * scale));
+      const wrapper = path.join(profileParent, `downscale-${Math.round(scale * 100)}.html`);
+      const output = path.join(profileParent, `downscale-${Math.round(scale * 100)}.png`);
+      try {
+        await writeFile(wrapper, [
+          "<!doctype html><html><head><style>",
+          "html,body{margin:0;padding:0;background:#fff;overflow:hidden}",
+          `img{display:block;width:${scaledWidth}px;height:${scaledHeight}px}`,
+          "</style></head><body>",
+          `<img src="${pathToFileURL(screenshotAbsolute).href}">`,
+          "</body></html>",
+        ].join(""), "utf8");
+        const result = await this.runner.run(browser, [
+          "--headless=new",
+          "--no-first-run",
+          "--no-default-browser-check",
+          "--disable-extensions",
+          "--hide-scrollbars",
+          "--mute-audio",
+          "--force-device-scale-factor=1",
+          `--user-data-dir=${path.join(profileParent, `downscale-profile-${Math.round(scale * 100)}`)}`,
+          `--window-size=${scaledWidth},${scaledHeight}`,
+          `--screenshot=${output}`,
+          pathToFileURL(wrapper).href,
+        ], Math.min(this.timeoutMs, 30_000));
+        if (result.exitCode !== 0 || !(await isNonEmptyFile(output))) continue;
+        const bytes = await readFile(output);
+        if (bytes.byteLength <= MAX_INLINE_IMAGE_BYTES) return { bytes, scale };
+      } catch {
+        // downscale is best-effort; the caller falls back to honest omission
+      }
+    }
+    return undefined;
   }
 }
 

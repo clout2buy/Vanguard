@@ -83,7 +83,7 @@ test("render_artifact never inlines a capture over the byte budget", async () =>
     const output = result.output as Record<string, unknown>;
     assert.equal(output.image, undefined, "an oversized capture must not dominate the context budget");
     assert.match(String(output.imageOmitted), /inline budget/u);
-    assert.match(String(output.imageOmitted), /smaller viewport/u);
+    assert.match(String(output.imageOmitted), /could not be downscaled/u);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

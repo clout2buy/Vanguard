@@ -459,7 +459,8 @@ test("working state is injected as inert assistant-side data, never into the sta
     workingState: { plan: { revision: 3 }, checkpoint: { summary: "phase two" } },
   }) as { messages: { role: string; content: JsonValue }[] };
   const taskMessage = encoded.messages[1];
-  assert.equal(taskMessage?.content, "t", "the task message must not carry working state");
+  // The runtime's anchor framing is expected; working state is not.
+  assert.match(String(taskMessage?.content), /^\[Vanguard task anchor[^\]]*\]\nt$/u, "the task message must not carry working state");
   const tail = encoded.messages.at(-1);
   assert.equal(tail?.role, "assistant");
   assert.match(String(tail?.content), /Vanguard inert runtime-state data/);
