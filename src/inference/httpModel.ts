@@ -62,6 +62,13 @@ export interface StreamObserver {
   delta(text: string): void;
   /** Live reasoning/thinking progress. Display-only; never part of the reply. */
   thinking?(text: string): void;
+  /**
+   * Any stream bytes arrived — including tool-call argument tokens, which
+   * produce no delta/thinking callbacks. This is the liveness signal: a model
+   * generating a large tool input is silent on every other channel for
+   * minutes, and watchdogs must not read that silence as a hang.
+   */
+  activity?(): void;
   /** Discard all provisional text; the response is being retried. */
   reset?(): void;
   /** The decision decoded successfully; provisional text is now final. */
@@ -262,7 +269,13 @@ export class HttpModelAdapter implements ModelPort {
               response,
               accumulator,
               AbortSignal.any([attemptSignal, stall.signal]),
-              armStallWatchdog,
+              () => {
+                armStallWatchdog();
+                // Liveness for observers: tool-argument tokens produce no
+                // delta/thinking callbacks, but bytes flowing means the model
+                // is alive and generating.
+                observer?.activity?.();
+              },
             );
           } catch (error) {
             reportPartialUsage(accumulator, observer);

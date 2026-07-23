@@ -422,6 +422,10 @@ export class AgentKernel {
     const scaledRecovery: RecoveryConfiguration = {
       maxGlobalRetries: Math.max(8, Math.ceil(this.#options.maxSteps / 15)),
       maxRetriesPerClass: Math.max(3, Math.ceil(this.#options.maxSteps / 60)),
+      // A 429 means "wait", not "broken". Provider overload windows run for
+      // minutes, so rate limiting gets a far longer leash than genuine faults
+      // instead of sharing the small per-class pot and failing whole runs.
+      classRetryOverrides: { provider_rate_limited: Math.max(10, Math.ceil(this.#options.maxSteps / 20)) },
       ...this.#recoveryConfiguration,
     };
     const recovery = new RecoveryController(
@@ -1380,10 +1384,10 @@ export class AgentKernel {
         );
       }
       // Plan-free mutation is a bounded small-change lane: up to
-      // SMALL_CHANGE_MUTATION_BUDGET genuinely narrow exact-text replacements,
-      // one per batch. Creates, deletes, overwrites, large replacements,
-      // multi-mutation batches, and anything past the budget require a
-      // durable plan.
+      // SMALL_CHANGE_MUTATION_BUDGET genuinely narrow mutations (small
+      // exact-text replacements or small new-file creations), one per batch.
+      // Deletes, overwrites, large changes, multi-mutation batches, and
+      // anything past the budget require a durable plan.
       if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
         && this.#plan!.isEmpty()
         && (context.completedMutations() >= SMALL_CHANGE_MUTATION_BUDGET
@@ -1391,7 +1395,7 @@ export class AgentKernel {
           || !isNarrowPlanFreeMutation(call))) {
         return this.#terminalObservation(
           call,
-          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow exact-text replacements, one per step. Materialize a non-empty engineering plan with update_plan before changing the workspace further.`,
+          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow mutations (small exact-text edits, or small new files written without expectedSha256), one per step. Materialize a non-empty engineering plan with update_plan before changing the workspace further.`,
           "policy",
           context.recovery,
           context.signal,
@@ -2401,8 +2405,9 @@ function hasTopLevelHistoricalElisionMarker(input: JsonValue): boolean {
 }
 
 /**
- * The plan-free small-change lane: this many narrow exact-text replacements
- * may proceed without a durable plan, and a passing verify_syntax satisfies
+ * The plan-free small-change lane: this many narrow mutations (small
+ * exact-text replacements or small new-file creations) may proceed without a
+ * durable plan, and a passing verify_syntax satisfies
  * the pre-claim execution-evidence gate while inside it. Sealed completion
  * verification is unaffected.
  */
@@ -2421,14 +2426,28 @@ function mutationTargetPath(input: JsonValue): string | undefined {
 }
 
 function isNarrowPlanFreeMutation(call: ToolCall): boolean {
-  if (call.name !== "edit_file" || call.input === null || Array.isArray(call.input)
-    || typeof call.input !== "object") return false;
-  const before = call.input.before;
-  const after = call.input.after;
-  const target = call.input.path;
-  if (typeof target !== "string" || target.length === 0
-    || typeof before !== "string" || before.length === 0 || typeof after !== "string") return false;
-  return Buffer.byteLength(before) + Buffer.byteLength(after) <= 16_384;
+  if (call.input === null || Array.isArray(call.input) || typeof call.input !== "object") return false;
+  if (call.name === "edit_file") {
+    const before = call.input.before;
+    const after = call.input.after;
+    const target = call.input.path;
+    if (typeof target !== "string" || target.length === 0
+      || typeof before !== "string" || before.length === 0 || typeof after !== "string") return false;
+    return Buffer.byteLength(before) + Buffer.byteLength(after) <= 16_384;
+  }
+  if (call.name === "write_file") {
+    // A sha-less write can only CREATE a file — WriteFileTool refuses to
+    // overwrite existing content without expectedSha256 — so small new files
+    // ride the plan-free lane instead of demanding plan ceremony for
+    // "create a note.txt" class requests.
+    const target = call.input.path;
+    const contents = call.input.contents;
+    const sha = call.input.expectedSha256;
+    if (typeof target !== "string" || target.length === 0 || typeof contents !== "string") return false;
+    if (sha !== undefined && sha !== null) return false;
+    return Buffer.byteLength(contents) <= 16_384;
+  }
+  return false;
 }
 
 function objectKeySorter(_key: string, value: unknown): unknown {

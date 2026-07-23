@@ -367,31 +367,43 @@ export class ListFilesTool implements ToolPort {
     const root = await this.workspace.existing(requested);
     const files: string[] = [];
     // Level-parallel BFS: directories of one depth are listed concurrently,
-    // then consumed in discovery order so limits stay deterministic.
+    // then consumed in discovery order so limits stay deterministic. Oversized
+    // trees truncate shallow-first instead of failing — a huge Desktop
+    // workspace still yields its most relevant (least nested) files.
     let level = [root];
-    while (level.length > 0) {
+    let truncated = false;
+    while (level.length > 0 && !truncated) {
       const listings = await Promise.all(level.map(async (directory) => ({
         directory,
         entries: await readdir(directory, { withFileTypes: true }),
       })));
-      let remainingInLevel = listings.length;
       const next: string[] = [];
-      for (const { directory, entries } of listings) {
-        remainingInLevel -= 1;
+      for (const { entries, directory } of listings) {
         for (const entry of entries) {
           const absolute = path.join(directory, entry.name);
           if (entry.isSymbolicLink()) continue;
           if (entry.isDirectory() && !DEFAULT_IGNORED_DIRECTORIES.has(entry.name)) next.push(absolute);
-          if (entry.isFile()) files.push(path.relative(this.workspace.root, absolute));
-          if (files.length + remainingInLevel + next.length > this.maxEntries) {
-            return { ok: false, output: { error: "Workspace listing limit exceeded.", limit: this.maxEntries } };
+          if (entry.isFile()) {
+            if (files.length >= this.maxEntries) { truncated = true; break; }
+            files.push(path.relative(this.workspace.root, absolute));
           }
         }
+        if (truncated) break;
       }
       level = next;
     }
 
     files.sort();
+    if (truncated) {
+      return {
+        ok: true,
+        output: {
+          files,
+          truncated: true,
+          note: `Listing truncated at ${this.maxEntries} files (shallowest first). Narrow with the 'path' argument or use glob/grep to reach deeper entries.`,
+        },
+      };
+    }
     return { ok: true, output: { files } };
   }
 }

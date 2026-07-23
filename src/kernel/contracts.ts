@@ -470,6 +470,13 @@ export interface UserChannelPort {
    * closes or the signal aborts, in which case the kernel pauses durably.
    */
   wait(signal: AbortSignal): Promise<string | undefined>;
+  /**
+   * Returns messages to the FRONT of the queue, preserving order. Consumers
+   * that intercept the channel for a side conversation (command approval)
+   * use this to hand non-answers back to the run instead of discarding
+   * genuine steering.
+   */
+  requeue?(messages: readonly string[]): void;
 }
 
 export interface WorkingStatePort {

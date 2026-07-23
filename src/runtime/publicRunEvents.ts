@@ -284,10 +284,21 @@ export function createStreamLifecyclePresenter(
     clearThinkingTimer();
     thinkingBuffer = "";
   };
+  let lastHeartbeatAt = 0;
   return {
     started(attempt: number): void {
       markActivity();
       send("agent.stream_started", { detail: `attempt ${attempt}` });
+    },
+    // Bytes are flowing — often tool-argument tokens, which produce no other
+    // callback for minutes on a large write. The throttled heartbeat keeps
+    // host-side hang watchdogs honest: silence means dead air, not big work.
+    activity(): void {
+      markActivity();
+      const now = Date.now();
+      if (now - lastHeartbeatAt < 15_000) return;
+      lastHeartbeatAt = now;
+      send("agent.heartbeat", { detail: "model is generating" });
     },
     delta(text: string): void {
       markActivity();

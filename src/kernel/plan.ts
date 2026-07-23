@@ -211,6 +211,19 @@ function planInvalidationApprovalText(milestoneId: string, supersededBy: string)
   return `${PLAN_INVALIDATION_APPROVAL_PREFIX}${JSON.stringify({ milestoneId, supersededBy })}`;
 }
 
+/**
+ * Maps a cited criterion onto the contract's canonical ID when the citation is
+ * an obvious near-miss (case/whitespace drift, or a "criterion N"-style spelling
+ * of a known family). Anything genuinely unknown passes through unchanged so
+ * validation can reject it with the valid-ID list.
+ */
+function canonicalCriterion(cited: string, required: readonly string[]): string {
+  if (required.includes(cited)) return cited;
+  const folded = cited.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  const relaxed = required.find((id) => id === folded);
+  return relaxed ?? cited;
+}
+
 export function contractCriterionIds(contract: TaskContract): readonly string[] {
   return [
     ...contract.successCriteria.map((_criterion, index) => `success-${index + 1}`),
@@ -437,6 +450,10 @@ export class PlanLedger implements PlanStatusPort {
   }
 
   async update(summary: string, milestones: readonly PlanMilestone[]): Promise<PlanState> {
+    milestones = milestones.map((milestone) => ({
+      ...milestone,
+      covers: milestone.covers.map((criterion) => canonicalCriterion(criterion, this.#requiredCriteria)),
+    }));
     const revision = (this.#state?.revision ?? 0) + 1;
     const history = [
       ...(this.#state?.history ?? []),
@@ -485,7 +502,7 @@ export class PlanTool implements ToolPort {
                 title: { type: "string" },
                 acceptanceCriteria: { type: "array", items: { type: "string" } },
                 dependsOn: { type: "array", items: { type: "string" } },
-                covers: { type: "array", items: { type: "string" } },
+                covers: { type: "array", items: { type: "string" }, description: "Contract criterion IDs this milestone covers (e.g. success-1, verification-1, deliverable-1) — IDs only, never paths or free text." },
                 status: { type: "string", enum: [...MILESTONE_STATUSES] },
                 evidence: { type: "array", items: evidenceSchema() },
                 scope: { type: "array", items: { type: "string" }, description: "Workspace-relative paths, directory prefixes, or globs this milestone owns. Once any milestone declares scope, mutating a path outside every declared scope is rejected as plan drift; claim new paths by adding a milestone. Declare scope on every milestone or on none." },
@@ -666,7 +683,9 @@ function validatePlanState(state: PlanState): void {
     if (ids.has(milestone.id)) throw new Error(`Milestone id '${milestone.id}' is duplicated.`);
     ids.add(milestone.id);
     for (const criterion of milestone.covers) {
-      if (!required.has(criterion)) throw new Error(`Milestone '${milestone.id}' covers unknown criterion '${criterion}'.`);
+      if (!required.has(criterion)) {
+        throw new Error(`Milestone '${milestone.id}' covers unknown criterion '${criterion}'. 'covers' takes contract criterion IDs, not paths or free text${required.size === 0 ? "" : ` — valid IDs: ${[...required].join(", ")}`}.`);
+      }
       if (milestone.status !== "invalidated") activelyCovered.add(criterion);
     }
     if (milestone.status === "proven") {

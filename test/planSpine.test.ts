@@ -121,23 +121,50 @@ test("the plan-free lane allows three narrow replacements; the fourth is refused
   const outcome = await kernel.run("planned work");
   assert.equal(outcome.status, "completed");
   assert.equal(mutations, 4);
-  assert.match(JSON.stringify(journal.events), /Plan-free changes are limited to 3 narrow exact-text replacements/);
+  assert.match(JSON.stringify(journal.events), /Plan-free changes are limited to 3 narrow mutations/);
 });
 
-test("write/delete and multi-mutation batches cannot exploit the plan-free exception", async () => {
+test("small sha-less new-file writes ride the plan-free lane", async () => {
   let mutations = 0;
   const plan = new PlanLedger();
   const journal = new MemoryJournal();
   const kernel = new AgentKernel({
     model: new CapturingModel([
-      { kind: "tools", calls: [{ id: "write", name: "write_file", input: { path: "x", contents: "x" } }] },
+      { kind: "tools", calls: [{ id: "w1", name: "write_file", input: { path: "note.txt", contents: "hello" } }] },
+      { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
+      { kind: "complete", answer: "created" },
+    ]),
+    tools: [mutateTool("write_file", () => { mutations += 1; }), executeTool("test"), new PlanTool(plan)],
+    verifiers: [passingVerifier], journal, plan,
+  });
+  const outcome = await kernel.run("create a note");
+  assert.equal(outcome.status, "completed");
+  assert.equal(mutations, 1);
+});
+
+test("overwrites, deletes, large writes, and multi-mutation batches cannot exploit the plan-free exception", async () => {
+  let mutations = 0;
+  const plan = new PlanLedger();
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new CapturingModel([
+      // Overwrite intent (expectedSha256 present) stays plan-gated.
+      { kind: "tools", calls: [{ id: "write", name: "write_file", input: { path: "x", contents: "x", expectedSha256: "abc" } }] },
+      // A giant new file is not a "small change".
+      { kind: "tools", calls: [{ id: "big", name: "write_file", input: { path: "y", contents: "y".repeat(17_000) } }] },
+      { kind: "tools", calls: [{ id: "del", name: "delete_file", input: { path: "x" } }] },
       { kind: "tools", calls: [
         { id: "r1", name: "edit_file", input: replaceInput("1") },
         { id: "r2", name: "edit_file", input: replaceInput("2") },
       ] },
       { kind: "complete", answer: "no changes" },
     ]),
-    tools: [mutateTool("write_file", () => { mutations += 1; }), mutateTool("edit_file", () => { mutations += 1; }), new PlanTool(plan)],
+    tools: [
+      mutateTool("write_file", () => { mutations += 1; }),
+      mutateTool("delete_file", () => { mutations += 1; }),
+      mutateTool("edit_file", () => { mutations += 1; }),
+      new PlanTool(plan),
+    ],
     verifiers: [passingVerifier], journal, plan,
   });
   const outcome = await kernel.run("guard mutations");

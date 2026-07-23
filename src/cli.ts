@@ -546,15 +546,23 @@ function commandApprover(userChannel: UserChannelPort) {
         message: line,
       });
     };
+    // Anything already queued predates the question and cannot be its answer —
+    // but it IS genuine steering, so it is held and handed back to the run
+    // after the decision instead of being discarded.
+    const deferred: string[] = [...userChannel.drain()];
+    const finish = (decision: "once" | "always" | "deny"): "once" | "always" | "deny" => {
+      userChannel.requeue?.(deferred);
+      return decision;
+    };
     ask("Approval needed");
-    // Anything already queued predates the question and cannot be its answer.
-    userChannel.drain();
     for (;;) {
       const answer = await userChannel.wait(signal);
       // A closed channel or an aborted run is not consent.
-      if (answer === undefined) return "deny";
+      if (answer === undefined) return finish("deny");
       const decision = parseApproval(answer);
-      if (decision !== undefined) return decision;
+      if (decision !== undefined) return finish(decision);
+      // Not an answer — real steering that raced the question. Defer it.
+      deferred.push(answer);
       ask("Approval needed — answer 1, 2, or 3");
     }
   };
@@ -1235,6 +1243,15 @@ class StdinUserChannel implements UserChannelPort {
 
   drain(): readonly string[] {
     return this.#queue.splice(0);
+  }
+
+  requeue(messages: readonly string[]): void {
+    if (messages.length === 0) return;
+    this.#queue.unshift(...messages);
+    while (this.#queue.length > 0 && this.#waiters.length > 0) {
+      const waiter = this.#waiters.shift()!;
+      waiter(this.#queue.shift());
+    }
   }
 
   wait(signal: AbortSignal): Promise<string | undefined> {
