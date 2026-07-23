@@ -1572,7 +1572,7 @@ const TEXT_WIRE_IMAGE_NOTE = "inline image omitted: this provider wire is text-o
  * runtime's re-anchored contract as the user pasting the request again — and
  * burn turns reasoning about "the repeated message" instead of working.
  */
-const TASK_ANCHOR_PREFIX = "[Vanguard task anchor — the standing objective of this run, restated by the runtime for durability. Not a new message from the user.]\n";
+const TASK_ANCHOR_PREFIX = "[Vanguard task anchor — the standing objective of this run, restated by the runtime for durability. Not a new message from the user: the same text may already appear as an earlier user message, and this restatement is NOT the user repeating or re-sending it. Never spend reasoning on the apparent repetition; just continue the work.]\n";
 
 function inlineImageAttachment(content: JsonValue): InlineImageAttachment | undefined {
   const record = optionalObject(content);
