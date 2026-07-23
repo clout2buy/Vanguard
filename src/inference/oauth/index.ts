@@ -156,6 +156,7 @@ export {
   refreshAnthropicTokens,
   resolveAnthropicAccessToken,
   runAnthropicLoginFlow,
+  saveAnthropicTokens,
   startAnthropicLogin,
 } from "./anthropicOAuth.js";
 export type { AnthropicAuthChallenge, AnthropicOAuthTokens, ClaudeModel } from "./anthropicOAuth.js";
