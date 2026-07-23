@@ -22,6 +22,7 @@ import {
   RecoveryController,
   analyzeTrajectory,
   classifyFailure,
+  recoveryBaselineEvents,
 } from "../src/index.js";
 
 class FakeClock implements RecoveryClock {
@@ -594,6 +595,24 @@ test("repeated deterministic failures emit replan guidance before the circuit br
   assert.equal(journal.events.some((event) => event.type === "recovery.replan_required"), true);
   assert.equal(journal.events.some((event) => event.type === "tool.failed"
     && JSON.stringify(event.data).includes("replan_and_checkpoint")), true);
+});
+
+test("a run.failed the owner has answered refills retry budgets; a crash resume does not", () => {
+  const retryDecided: RunEvent = {
+    sequence: 1,
+    type: "recovery.decided",
+    data: {
+      retry: true,
+      failure: { version: 1, code: "provider_rate_limited", source: "provider", disposition: "transient", retryable: true, message: "busy" },
+    },
+  };
+  const failed: RunEvent = { sequence: 2, type: "run.failed", data: { reason: "rate limited" } };
+  const fresh: RunEvent = { sequence: 3, type: "model.decided", data: { kind: "complete", answer: "x" } };
+  // Terminal failure seen by the owner → only events after it count.
+  assert.deepEqual(recoveryBaselineEvents([retryDecided, failed, fresh]), [fresh]);
+  // Crash mid-advance (no terminal event) → the full journal still counts.
+  assert.deepEqual(recoveryBaselineEvents([retryDecided, fresh]), [retryDecided, fresh]);
+  assert.deepEqual(recoveryBaselineEvents([]), []);
 });
 
 test("trajectory metrics expose recovery counts, delays, exhaustion, and failure classes", () => {

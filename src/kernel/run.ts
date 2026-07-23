@@ -429,7 +429,7 @@ export class AgentKernel {
       ...this.#recoveryConfiguration,
     };
     const recovery = new RecoveryController(
-      logicalPriorEvents,
+      recoveryBaselineEvents(logicalPriorEvents),
       (type, data) => this.#record(type, data),
       scaledRecovery,
     );
@@ -2402,6 +2402,21 @@ function hasTopLevelHistoricalElisionMarker(input: JsonValue): boolean {
     && typeof input === "object"
     && !Array.isArray(input)
     && Object.prototype.hasOwnProperty.call(input, "vanguardElided");
+}
+
+/**
+ * The retry-budget baseline for a fresh advance: everything after the last
+ * terminal failure. A run.failed the owner has already seen — and answered
+ * with a new message — is an informed retry, so exhausted transient budgets
+ * refill instead of failing the resumed run on its first hiccup. A crash
+ * restart mid-advance has no trailing terminal event, so its journal still
+ * counts in full and a hot provider/tool loop cannot launder its budget.
+ */
+export function recoveryBaselineEvents(events: readonly RunEvent[]): readonly RunEvent[] {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]?.type === "run.failed") return events.slice(index + 1);
+  }
+  return events;
 }
 
 /**
