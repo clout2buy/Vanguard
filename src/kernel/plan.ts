@@ -596,6 +596,18 @@ export class PlanTool implements ToolPort {
       const reference = await this.evidenceResolver?.resolve(claim);
       if (reference === undefined) {
         const eligible = await this.evidenceResolver?.eligibleToolEvidence?.();
+        // The citation grammar is the single highest-friction surface in
+        // field journals — every provider fumbles it. When the proof the
+        // model is reaching for is UNAMBIGUOUS (exactly one fresh eligible
+        // observation), bind it: the rigor lives in the proof existing, not
+        // in the model spelling its id correctly.
+        if (claim.kind === "tool" && eligible !== undefined && eligible.length === 1) {
+          const substitute = await this.evidenceResolver?.resolve({ kind: "tool", evidenceId: eligible[0]!.evidenceId });
+          if (substitute !== undefined) {
+            resolved.push(substitute);
+            continue;
+          }
+        }
         const recovery = eligible === undefined || eligible.length === 0
           ? "No fresh eligible tool proof exists yet; keep the milestone active and run a successful independent execution or review before retrying."
           : `Fresh eligible tool proof: ${eligible.map((item) => `${item.evidenceId} (${item.tool}, ${item.evidenceAuthority})`).join(", ")}.`;

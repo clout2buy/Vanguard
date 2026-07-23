@@ -1591,3 +1591,32 @@ test("a fresh user message re-arms an exhausted verification budget; a bare resu
   assert.equal(outcome.status, "completed");
   assert.equal(outcome.status === "completed" ? outcome.answer : "", "reworked per your note");
 });
+
+test("identical successful observations are capped within one workspace generation", async () => {
+  let executions = 0;
+  const render: ToolPort = {
+    name: "render_artifact",
+    definition: trustedExecutionDefinition("render_artifact"),
+    async execute() { executions += 1; return { ok: true, output: `pixels ${executions}` }; },
+  };
+  const same = (id: string): ModelDecision => ({
+    kind: "tools",
+    calls: [{ id, name: "render_artifact", input: { path: "index.html", width: 320 } }],
+  });
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new ScriptedModel([
+      same("one"), same("two"), same("three"),
+      same("blocked"),
+      { kind: "complete", answer: "acted on evidence" },
+    ]),
+    tools: [render],
+    verifiers: [passingVerifier],
+    journal,
+  });
+  const outcome = await kernel.run("verify a page render");
+  assert.equal(outcome.status, "completed");
+  assert.equal(executions, 3, "the fourth identical observation must not execute");
+  assert.equal(journal.events.some((event) => event.type === "tool.failed"
+    && JSON.stringify(event.data).includes("repeating it gathers nothing new")), true);
+});

@@ -169,7 +169,9 @@ async function fingerprintCount(interval: number): Promise<number> {
     model: new CapturingModel([
       ...Array.from({ length: 6 }, (_, index): ModelDecision => ({
         kind: "tools",
-        calls: [{ id: `r${index}`, name: "read_file", input: {} }],
+        // Distinct targets: identical observations are now capped per
+        // workspace generation, and this test is about fingerprint pacing.
+        calls: [{ id: `r${index}`, name: "read_file", input: { path: `file-${index}.ts` } }],
       })),
       { kind: "complete", answer: "done" },
     ]),

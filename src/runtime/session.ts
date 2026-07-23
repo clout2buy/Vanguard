@@ -13,6 +13,22 @@ import {
   type TreeSnapshot,
 } from "./treeSnapshot.js";
 
+/**
+ * Where session containers live. The OS temp directory was the original home,
+ * and it silently destroyed "durable" journals on every disk cleanup — a
+ * resumable session store must survive reboots. Overridable for tests and
+ * portable runtimes via VANGUARD_SESSIONS_DIR.
+ */
+async function sessionContainer(): Promise<string> {
+  const configured = process.env.VANGUARD_SESSIONS_DIR;
+  const home = os.homedir();
+  const parent = configured !== undefined && configured !== ""
+    ? configured
+    : home === "" ? os.tmpdir() : path.join(home, ".vanguard", "sessions");
+  await mkdir(parent, { recursive: true });
+  return mkdtemp(path.join(parent, "vanguard-session-"));
+}
+
 export interface SessionLineage {
   readonly parentSessionId: string;
   readonly parentCheckpointId: string;
@@ -83,7 +99,7 @@ export async function createSessionShell(source: string, options: CreateSessionO
   const sourceRoot = await realpath(path.resolve(source));
   if (!(await stat(sourceRoot)).isDirectory()) throw new Error("Workspace must be a directory.");
   const direct = options.direct === true;
-  const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-session-"));
+  const container = await sessionContainer();
   const workspaceRoot = path.join(container, "workspace");
   const id = path.basename(container);
   const session: CodingSession = {
@@ -277,7 +293,7 @@ export async function createForkedCodingSession(
   checkpointWorkspace: string,
   lineage: SessionLineage,
 ): Promise<CodingSession> {
-  const container = await mkdtemp(path.join(os.tmpdir(), "vanguard-session-"));
+  const container = await sessionContainer();
   const workspaceRoot = path.join(container, "workspace");
   const baselineFile = path.join(container, "baseline.json");
   const metadataFile = path.join(container, "session.json");

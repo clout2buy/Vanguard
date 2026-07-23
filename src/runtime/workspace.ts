@@ -10,8 +10,16 @@ export class WorkspaceBoundary {
   }
 
   lexical(relativePath: string): string {
-    if (relativePath.length === 0 || path.isAbsolute(relativePath)) {
-      throw new Error("Workspace paths must be non-empty and relative.");
+    if (relativePath.length === 0) {
+      throw new Error("Workspace paths must be non-empty.");
+    }
+    if (path.isAbsolute(relativePath)) {
+      // Models routinely echo the absolute spelling of an in-workspace path
+      // (Desktop workspaces especially). A contained absolute is the same
+      // file — accept it; anything outside the boundary still throws.
+      const absolute = path.resolve(relativePath);
+      this.#assertContained(absolute);
+      return absolute;
     }
     const candidate = path.resolve(this.root, relativePath);
     this.#assertContained(candidate);
@@ -45,6 +53,19 @@ export class WorkspaceBoundary {
     this.#assertContained(resolvedAncestor);
     await mkdir(path.dirname(candidate), { recursive: true });
     return candidate;
+  }
+
+  /**
+   * The workspace-relative spelling of a requested path. Contained absolutes
+   * relativize so version ledgers and policy checks key one spelling per
+   * file; relative requests pass through untouched.
+   */
+  relativize(requested: string): string {
+    if (requested.length === 0 || !path.isAbsolute(requested)) return requested;
+    const absolute = path.resolve(requested);
+    this.#assertContained(absolute);
+    const relative = path.relative(this.root, absolute);
+    return relative === "" ? "." : relative;
   }
 
   #assertContained(candidate: string): void {

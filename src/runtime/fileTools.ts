@@ -71,7 +71,7 @@ export class ReadFileTool implements ToolPort {
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
     rejectUnknownFields(fields, ["path", "cursor", "range", "maxBytes"], this.name);
-    const relativePath = stringField(fields, "path");
+    const relativePath = this.workspace.relativize(stringField(fields, "path"));
     const cursor = optionalReadCursor(fields);
     const requestedRange = optionalReadRange(fields);
     const pageBytes = optionalIntegerField(fields, "maxBytes") ?? DEFAULT_READ_PAGE_BYTES;
@@ -167,7 +167,7 @@ export class WriteFileTool implements ToolPort {
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
-    const relativePath = stringField(fields, "path");
+    const relativePath = this.workspace.relativize(stringField(fields, "path"));
     const policyDenial = this.mutationPolicy?.check(relativePath);
     if (policyDenial !== undefined) return policyDenial;
     const contents = stringField(fields, "contents");
@@ -251,7 +251,7 @@ export class ReplaceTextTool implements ToolPort {
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
-    const relativePath = stringField(fields, "path");
+    const relativePath = this.workspace.relativize(stringField(fields, "path"));
     const policyDenial = this.mutationPolicy?.check(relativePath);
     if (policyDenial !== undefined) return policyDenial;
     const suppliedSha256 = fields.expectedSha256;
@@ -325,7 +325,7 @@ export class DeleteFileTool implements ToolPort {
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
-    const relativePath = stringField(fields, "path");
+    const relativePath = this.workspace.relativize(stringField(fields, "path"));
     const policyDenial = this.mutationPolicy?.check(relativePath);
     if (policyDenial !== undefined) return policyDenial;
     const suppliedSha256 = fields.expectedSha256;
@@ -363,7 +363,7 @@ export class ListFilesTool implements ToolPort {
 
   async execute(input: JsonValue, _context: ToolContext): Promise<ToolResult> {
     const fields = objectInput(input);
-    const requested = optionalWorkspacePath(fields);
+    const requested = this.workspace.relativize(optionalWorkspacePath(fields));
     const root = await this.workspace.existing(requested);
     const files: string[] = [];
     // Level-parallel BFS: directories of one depth are listed concurrently,
@@ -450,7 +450,7 @@ export class SearchTextTool implements ToolPort {
     const fields = objectInput(input);
     rejectUnknownFields(fields, ["query", "path", "caseSensitive", "regex", "filePattern", "context"], this.name);
     const query = stringField(fields, "query");
-    const requested = optionalWorkspacePath(fields);
+    const requested = this.workspace.relativize(optionalWorkspacePath(fields));
     const caseSensitive = optionalBooleanField(fields, "caseSensitive") ?? true;
     const useRegex = optionalBooleanField(fields, "regex") ?? false;
     const contextLines = optionalIntegerField(fields, "context") ?? 0;
@@ -616,7 +616,7 @@ export class GlobTool implements ToolPort {
     const fields = objectInput(input);
     rejectUnknownFields(fields, ["pattern", "path"], this.name);
     const pattern = stringField(fields, "pattern");
-    const requested = optionalWorkspacePath(fields);
+    const requested = this.workspace.relativize(optionalWorkspacePath(fields));
     let matches: (relative: string) => boolean;
     try {
       matches = compileGlob(pattern);

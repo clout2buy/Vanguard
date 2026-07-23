@@ -25,12 +25,21 @@ import { nodePermissionFlag } from "../src/runtime/nodePackageManager.js";
 
 const context = { task: "test", step: 1, signal: new AbortController().signal };
 
-test("workspace rejects absolute paths and traversal", async () => {
+test("workspace rejects traversal and escaping absolutes; contained absolutes relativize", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "vanguard-boundary-"));
   try {
     const workspace = new WorkspaceBoundary(root);
     assert.throws(() => workspace.lexical("../outside.txt"), /escapes workspace/);
-    assert.throws(() => workspace.lexical(path.resolve(root, "absolute.txt")), /relative/);
+    assert.throws(() => workspace.lexical(""), /non-empty/);
+    // A contained absolute names the same file the relative spelling does —
+    // models echo absolutes constantly, so the boundary accepts them.
+    const contained = path.resolve(workspace.root, "absolute.txt");
+    assert.equal(workspace.lexical(contained), contained);
+    assert.equal(workspace.relativize(contained), "absolute.txt");
+    assert.equal(workspace.relativize(path.resolve(workspace.root, "sub", "file.txt")), path.join("sub", "file.txt"));
+    const escaping = path.resolve(workspace.root, "..", "outside.txt");
+    assert.throws(() => workspace.lexical(escaping), /escapes workspace/);
+    assert.throws(() => workspace.relativize(escaping), /escapes workspace/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

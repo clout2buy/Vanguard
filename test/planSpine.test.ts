@@ -578,13 +578,37 @@ test("invalid plan evidence reports the exact fresh proof handles available", as
     },
   });
   const resolver = new JournalEvidenceResolver(journal);
+  // Exactly one fresh eligible proof exists, so an invented citation is
+  // unambiguous — the runtime binds it instead of bouncing the milestone.
   const tool = new PlanTool(new PlanLedger(), resolver);
+  const outcome = await tool.execute({
+    summary: "proof recovery",
+    milestones: [milestone("m1", "proven", [runtimeEvidence("invented")])],
+  }, { task: "t", step: 1, signal: new AbortController().signal });
+  assert.equal(outcome.ok, true);
+
+  // With MORE than one eligible proof the citation is ambiguous — the error
+  // lists every handle so the model can cite precisely.
+  await journal.append({
+    sequence: 2,
+    type: "tool.completed",
+    data: {
+      evidenceId: "evidence:2:1",
+      callId: "check-2",
+      tool: "run_command",
+      ok: true,
+      output: "passed",
+      evidenceAuthority: "independent-execution",
+      workspaceGeneration: 0,
+    },
+  });
+  const ambiguous = new PlanTool(new PlanLedger(), new JournalEvidenceResolver(journal));
   await assert.rejects(
-    tool.execute({
+    ambiguous.execute({
       summary: "proof recovery",
       milestones: [milestone("m1", "proven", [runtimeEvidence("invented")])],
     }, { task: "t", step: 1, signal: new AbortController().signal }),
-    /Fresh eligible tool proof: evidence:1:1 \(render_artifact, independent-execution\)/u,
+    /evidence:1:1 \(render_artifact, independent-execution\)[\s\S]*evidence:2:1 \(run_command, independent-execution\)|evidence:2:1 \(run_command, independent-execution\)[\s\S]*evidence:1:1 \(render_artifact, independent-execution\)/u,
   );
 });
 

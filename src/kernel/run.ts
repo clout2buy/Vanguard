@@ -390,6 +390,10 @@ export class AgentKernel {
     const restored = restoreSession(logicalPriorEvents, this.#tools);
     const transcript = [...restored.transcript];
     const actionFailures = restored.actionFailures;
+    // Successful identical observations per workspace generation (the key
+    // embeds the generation, so entries from prior generations simply go
+    // stale). Rebuilt empty on resume — repeats must be observed live.
+    const observationRepeats = new Map<string, number>();
     let mode = restored.mode;
     let task = restored.task;
     let failedVerificationAttempts = restored.failedVerificationAttempts;
@@ -653,6 +657,7 @@ export class AgentKernel {
       transcript.push({ role: "user", content: input.userMessage });
       await this.#record("user.message", { text: input.userMessage });
       resetObservationStagnation(observationStagnation);
+      observationRepeats.clear();
       pendingQuestion = undefined;
     }
 
@@ -705,6 +710,7 @@ export class AgentKernel {
         transcript.push({ role: "user", content: steering });
         consecutiveNarrations = 0;
         resetObservationStagnation(observationStagnation);
+        observationRepeats.clear();
         // Steering can redirect the whole approach; failure streaks from the
         // pre-steering strategy would punish the new one.
         executionThrash.streaks.clear();
@@ -991,6 +997,7 @@ export class AgentKernel {
             await this.#record("user.message", { text: answer });
             transcript.push({ role: "user", content: answer });
             resetObservationStagnation(observationStagnation);
+            observationRepeats.clear();
             continue;
           }
           if (signal.aborted) return this.#fail("Run aborted.", step);
@@ -1175,6 +1182,9 @@ export class AgentKernel {
         // reconnaissance epoch until actual progress (mutation, a successful
         // non-observe action, or user steering) occurs.
         openVerifierRecoveryEpoch(observationStagnation);
+        // Fresh verifier feedback legitimately warrants re-observing targets
+        // already seen this generation.
+        observationRepeats.clear();
 
         failedVerificationAttempts += 1;
         if (failedVerificationAttempts >= this.#options.maxFailedVerificationAttempts) {
@@ -1220,6 +1230,7 @@ export class AgentKernel {
         completedMutations: () => completedMutations,
         workspaceGeneration: () => workspaceGeneration,
         workspaceBaseline: () => lastWorkspaceFingerprint,
+        observationRepeats,
         onWorkspaceObserved: (fingerprint) => acceptWorkspaceObservation(fingerprint, "tool-batch"),
         onMutate: () => {
           completedMutations += 1;
@@ -1299,6 +1310,7 @@ export class AgentKernel {
       completedMutations: () => number;
       workspaceGeneration: () => number;
       workspaceBaseline: () => string | undefined;
+      observationRepeats: Map<string, number>;
       onWorkspaceObserved: (fingerprint: string) => Promise<void>;
       onMutate: () => void;
       onExecute: () => void;
@@ -1419,6 +1431,32 @@ export class AgentKernel {
             evidenceId,
           );
         }
+      }
+
+      // Identical evidence-gathering against an unchanged workspace cannot
+      // yield new information, yet field journals show verify-render loops
+      // repeating one render_artifact call 18 times. The circuit breaker only
+      // counts FAILURES, and evidence-authority tools bypass the memo cache
+      // by design — so identical observe/execute/review calls get their own
+      // generation-scoped attempt limit. Mutations bump the generation and
+      // naturally reset it.
+      const repeatGuarded = tool.definition.effect === "observe"
+        || tool.definition.effect === "execute"
+        || tool.definition.effect === "review";
+      if (repeatGuarded) {
+        const repeatKey = `${context.workspaceGeneration()}:${call.name}:${fingerprint}`;
+        const seen = context.observationRepeats.get(repeatKey) ?? 0;
+        if (seen >= IDENTICAL_OBSERVATION_LIMIT) {
+          return this.#terminalObservation(
+            call,
+            `'${call.name}' already ran this exact call ${seen} times with no workspace change in between — repeating it gathers nothing new. Act on the evidence already collected, change the workspace, or change the call.`,
+            "policy",
+            context.recovery,
+            context.signal,
+            evidenceId,
+          );
+        }
+        context.observationRepeats.set(repeatKey, seen + 1);
       }
 
       const source = tool.definition.effect === "execute" ? "process" : "tool";
@@ -2427,6 +2465,14 @@ export function recoveryBaselineEvents(events: readonly RunEvent[]): readonly Ru
  * verification is unaffected.
  */
 export const SMALL_CHANGE_MUTATION_BUDGET = 3;
+
+/**
+ * How many times one identical observation may execute within a single
+ * workspace generation before the kernel refuses it. Nothing changed, so the
+ * result cannot differ — re-observing is pure loop fuel (field journals show
+ * one render_artifact call repeated 18 times).
+ */
+export const IDENTICAL_OBSERVATION_LIMIT = 3;
 
 function syntaxCheckPassed(output: JsonValue | undefined): boolean {
   if (output === null || output === undefined || typeof output !== "object" || Array.isArray(output)) return false;

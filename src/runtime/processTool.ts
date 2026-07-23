@@ -293,7 +293,7 @@ async function runProcess(
             error: termination === "aborted"
               ? "Process aborted."
               : termination === "idle"
-                ? `Process produced no output for ${Math.round((idleTimeoutMs ?? 0) / 1_000)}s and was terminated as hung.`
+                ? `Process produced no output for ${Math.round((idleTimeoutMs ?? 0) / 1_000)}s and was terminated as hung. Long-running or interactive processes (servers, watchers, REPLs) cannot run here — do not relaunch this command; verify with a one-shot check that exits on its own instead.`
                 : "Process timed out.",
             ...(termination === "timed_out" ? { timeoutMs } : {}),
             ...(termination === "idle" && idleTimeoutMs !== undefined ? {
