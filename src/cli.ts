@@ -10,9 +10,12 @@ import { detectProjectVerification, type CommandSpec } from "./runtime/projectVe
 import { SESSION_EXCLUDED_DIRECTORIES, TreeSnapshotCache, snapshotTree } from "./runtime/treeSnapshot.js";
 import { isCleanGitRepository } from "./runtime/gitTree.js";
 import {
+  AdaptiveCommandVerifier,
   AgentKernel,
   CheckpointTool,
   CommandVerifier,
+  adaptiveVerifyMode,
+  isAdaptiveVerifyCommand,
   CreativeDirectionVerifier,
   RenderableArtifactVerifier,
   DeleteFileTool,
@@ -617,7 +620,11 @@ async function buildExecutionRuntime(
     options.publicCheck,
   );
   const verifiers: VerifierPort[] = [
-    new CommandVerifier("required command", verifierProcessTool, options.verification, options.verifierEvidence),
+    // The reserved builtin runs in-process with captured output; everything
+    // else is a sealed external command exactly as before.
+    isAdaptiveVerifyCommand(options.verification)
+      ? new AdaptiveCommandVerifier("adaptive verification", session.workspaceRoot, adaptiveVerifyMode(options.verification))
+      : new CommandVerifier("required command", verifierProcessTool, options.verification, options.verifierEvidence),
   ];
   if (options.protectedPaths.length > 0 || options.editableRoots.length > 0) {
     verifiers.push(new WorkspaceIntegrityVerifier({

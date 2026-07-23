@@ -3,6 +3,7 @@ import { open, readFile, realpath, rm, stat, writeFile } from "node:fs/promises"
 import path from "node:path";
 import { FileJournal } from "../kernel/fileJournal.js";
 import { detectProjectVerification, type CommandSpec } from "../runtime/projectVerification.js";
+import { ADAPTIVE_VERIFY_COMMAND } from "../runtime/automaticVerification.js";
 import { PublicRunEventPresenter, type PublicRunEvent } from "../runtime/publicRunEvents.js";
 import {
   createSessionShell,
@@ -1068,13 +1069,14 @@ function normalizedPath(value: string): string {
 async function resolveRunConfiguration(config: VanguardSessionConfig): Promise<StoredRunConfiguration> {
   const verificationWasDetected = config.verification === undefined;
   // Blank or unrecognized projects have nothing to detect. When the caller
-  // opted into adaptive verification, fall back to the packaged adaptive
-  // trusted verifier (the same one the TUI uses), which requires the agent to
-  // establish a deterministic build/test contract before completion.
+  // opted into adaptive verification, fall back to the builtin in-process
+  // adaptive verifier, which requires the agent to establish a deterministic
+  // build/test contract before completion. The builtin works in every host,
+  // including ones that bundle Vanguard into a single file.
   const verification = config.verification
     ?? await detectProjectVerification(config.workspace)
     ?? (config.adaptiveVerification === true
-      ? { command: "node", args: [path.join(import.meta.dirname, "..", "autoVerify.js"), "--mode", "tests"] }
+      ? { command: ADAPTIVE_VERIFY_COMMAND, args: ["--mode", "tests"] }
       : undefined);
   if (verification === undefined) {
     throw new VanguardEngineError(
