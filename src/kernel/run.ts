@@ -955,6 +955,18 @@ export class AgentKernel {
         if (consecutiveNarrations >= this.#options.maxConsecutiveNarrations) {
           return this.#fail("Execution stalled in narration without tool actions.", step);
         }
+        // When every milestone is already proven, narration is pure drift —
+        // the work is done and the run is waiting on complete_task. Field
+        // journals show models spending whole rounds re-describing finished
+        // work; say so on the FIRST reply instead of the last warning.
+        if (consecutiveNarrations === 1 && this.#hasPlanTool && !this.#plan!.isEmpty()
+          && [...this.#plan!.unproven()].length === 0) {
+          const note = "[Vanguard runtime] Every plan milestone is proven and no new user request is pending — the reply above does not advance anything. "
+            + "Claim completion with complete_task now (verification will confirm), or take a concrete tool action if something genuinely remains.";
+          await this.#record("runtime.note", { text: note, kind: "proven-plan-narration" });
+          transcript.push({ role: "runtime", content: note });
+          continue;
+        }
         // One reply before the stall guard fires, shove instead of shooting:
         // most narration spirals are a model warming up on prose, and a hard
         // runtime demand for an action converts them into a working run.

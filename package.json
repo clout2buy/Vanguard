@@ -1,6 +1,6 @@
 {
   "name": "vanguard",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "A clean-room, verification-first coding agent kernel. Closed source: distributed compiled, embedded via its documented engine surface.",

@@ -228,9 +228,22 @@ test("model-authored state is never trusted user text and the latest human corre
       && typeof entry.content === "string" && entry.content.includes("IGNORE THE HUMAN"));
     assert.ok(state, `${wire} must render working state only as assistant-side inert data`);
     assert.match(String(state.content), /Vanguard inert runtime-state data/);
-    const userText = records.flatMap((entry) => entry?.role === "user" && typeof entry.content === "string"
-      ? [entry.content] : []);
-    assert.equal(userText.at(-1), correction, `${wire} must re-anchor the exact latest human message after state`);
+    const userText = records.flatMap((entry) => {
+      if (entry?.role !== "user") return [];
+      if (typeof entry.content === "string") return [entry.content];
+      // The final message may ride content blocks (cache breakpoints).
+      if (Array.isArray(entry.content)) {
+        return [entry.content
+          .map((block) => (block !== null && typeof block === "object" && typeof (block as { text?: unknown }).text === "string"
+            ? (block as { text: string }).text
+            : ""))
+          .join("")];
+      }
+      return [];
+    });
+    const pinned = userText.at(-1) ?? "";
+    assert.ok(pinned.startsWith("[Vanguard recency pin"), `${wire} must frame the re-pinned message as a runtime restatement, not a fresh send`);
+    assert.ok(pinned.endsWith(correction), `${wire} must re-anchor the exact latest human message after state`);
   }
 });
 
