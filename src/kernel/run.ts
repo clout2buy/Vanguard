@@ -1337,6 +1337,8 @@ export class AgentKernel {
     const allObserve = calls.every((call) => this.#tools.get(call.name)?.definition.effect === "observe");
     const effectOf = (call: ToolCall) => this.#tools.get(call.name)?.definition.effect;
     const mutationCalls = calls.filter((call) => this.#tools.get(call.name)?.definition.effect === "mutate");
+    // Plan-free budget baseline for this batch — see the lane gate below.
+    const mutationsBeforeBatch = context.completedMutations();
     // Effect declarations control scheduling and UX, never side-effect trust.
     // Every implementation, including an allegedly read-only extension, is
     // bracketed by the canonical workspace fingerprint.
@@ -1409,17 +1411,19 @@ export class AgentKernel {
       }
       // Plan-free mutation is a bounded small-change lane: up to
       // SMALL_CHANGE_MUTATION_BUDGET genuinely narrow mutations (small
-      // exact-text replacements or small new-file creations), one per batch.
-      // Deletes, overwrites, large changes, multi-mutation batches, and
-      // anything past the budget require a durable plan.
+      // exact-text replacements or small new-file creations), which may share
+      // one batch — several small files in one pass is the normal senior-dev
+      // move, not an exploit. Deletes, overwrites, large changes, and
+      // anything past the TOTAL budget require a durable plan. The budget
+      // baseline is captured at batch admission so a mutation completing
+      // mid-batch cannot retroactively block its siblings.
       if (context.mode === "execution" && this.#hasPlanTool && tool.definition.effect === "mutate"
         && this.#plan!.isEmpty()
-        && (context.completedMutations() >= SMALL_CHANGE_MUTATION_BUDGET
-          || mutationCalls.length !== 1
-          || !isNarrowPlanFreeMutation(call))) {
+        && (mutationsBeforeBatch + mutationCalls.length > SMALL_CHANGE_MUTATION_BUDGET
+          || !mutationCalls.every((mutation) => isNarrowPlanFreeMutation(mutation)))) {
         return this.#terminalObservation(
           call,
-          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow mutations (small exact-text edits, or small new files written without expectedSha256), one per step. Materialize a non-empty engineering plan with update_plan before changing the workspace further.`,
+          `Plan-free changes are limited to ${SMALL_CHANGE_MUTATION_BUDGET} narrow mutations in total (small exact-text edits, or small new files written without expectedSha256); a single batch may carry several as long as the total fits. Materialize a non-empty engineering plan with update_plan before changing the workspace further.`,
           "policy",
           context.recovery,
           context.signal,

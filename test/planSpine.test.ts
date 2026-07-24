@@ -142,7 +142,34 @@ test("small sha-less new-file writes ride the plan-free lane", async () => {
   assert.equal(mutations, 1);
 });
 
-test("overwrites, deletes, large writes, and multi-mutation batches cannot exploit the plan-free exception", async () => {
+test("a batch of narrow plan-free mutations lands in one pass within the budget", async () => {
+  let mutations = 0;
+  const plan = new PlanLedger();
+  const journal = new MemoryJournal();
+  const kernel = new AgentKernel({
+    model: new CapturingModel([
+      { kind: "tools", calls: [
+        { id: "w1", name: "write_file", input: { path: "a.txt", contents: "a" } },
+        { id: "w2", name: "write_file", input: { path: "b.txt", contents: "b" } },
+        { id: "e1", name: "edit_file", input: replaceInput("1") },
+      ] },
+      { kind: "tools", calls: [{ id: "t", name: "test", input: {} }] },
+      { kind: "complete", answer: "batched" },
+    ]),
+    tools: [
+      mutateTool("write_file", () => { mutations += 1; }),
+      mutateTool("edit_file", () => { mutations += 1; }),
+      executeTool("test"),
+      new PlanTool(plan),
+    ],
+    verifiers: [passingVerifier], journal, plan,
+  });
+  const outcome = await kernel.run("three small files in one pass");
+  assert.equal(outcome.status, "completed");
+  assert.equal(mutations, 3);
+});
+
+test("overwrites, deletes, large writes, oversized or tainted batches cannot exploit the plan-free exception", async () => {
   let mutations = 0;
   const plan = new PlanLedger();
   const journal = new MemoryJournal();
@@ -153,9 +180,17 @@ test("overwrites, deletes, large writes, and multi-mutation batches cannot explo
       // A giant new file is not a "small change".
       { kind: "tools", calls: [{ id: "big", name: "write_file", input: { path: "y", contents: "y".repeat(17_000) } }] },
       { kind: "tools", calls: [{ id: "del", name: "delete_file", input: { path: "x" } }] },
+      // One non-narrow member taints the whole batch.
       { kind: "tools", calls: [
         { id: "r1", name: "edit_file", input: replaceInput("1") },
-        { id: "r2", name: "edit_file", input: replaceInput("2") },
+        { id: "r2", name: "write_file", input: { path: "z", contents: "z".repeat(17_000) } },
+      ] },
+      // A batch that alone exceeds the total budget is refused whole.
+      { kind: "tools", calls: [
+        { id: "b1", name: "edit_file", input: replaceInput("1") },
+        { id: "b2", name: "edit_file", input: replaceInput("2") },
+        { id: "b3", name: "edit_file", input: replaceInput("3") },
+        { id: "b4", name: "edit_file", input: replaceInput("4") },
       ] },
       { kind: "complete", answer: "no changes" },
     ]),
