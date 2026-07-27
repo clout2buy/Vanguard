@@ -1,7 +1,9 @@
 # Ares integration and Phase 14 beta
 
-Status: **integration package implemented; activation blocked pending an
-execution-tree-fenced runner; external beta not yet executed**.
+Status: **integrated and in live use inside Ares**. (Historical note: the
+initial package shipped with activation blocked pending an execution-tree-
+fenced runner; that gate has since been satisfied and real sessions run
+through this adapter.)
 
 Vanguard remains an additive, opt-in engine. This adapter does not import Ares,
 edit Ares, or replace its legacy core. It consumes only the public

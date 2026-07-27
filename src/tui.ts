@@ -187,7 +187,6 @@ export async function runTui(startDirectory: string): Promise<void> {
   const engine = new VanguardEngine({ logger: () => {} });
   let sessionId: string | undefined;
   let contracted = false;
-  let continuation: ContinuationContext | undefined;
 
   // ── The inline war room ─────────────────────────────────────────────────
   // One owner from the first prompt to exit: an append-only transcript in the
@@ -385,13 +384,8 @@ export async function runTui(startDirectory: string): Promise<void> {
         });
         sessionId = created.sessionId;
       }
-      const modelMessage = continuation === undefined
-        ? input
-        : buildContinuationMessage(continuation, input);
-      // The continuation is now durable in the new session's user message.
-      continuation = undefined;
       currentSessionId = sessionId;
-      const turn = await runEngineTurn(engine, sessionId, modelMessage, config, ui, fx, terminalWidth, contracted, input);
+      const turn = await runEngineTurn(engine, sessionId, input, config, ui, fx, terminalWidth, contracted, input);
       contracted = turn.contracted;
 
       if (turn.outcome?.status === "waiting_for_user") {
@@ -403,19 +397,13 @@ export async function runTui(startDirectory: string): Promise<void> {
         fx.message("main", question);
       }
       if (turn.outcome?.status === "completed") {
-        // The engine refuses to advance a completed session, so the next
-        // message opens a new one. In-place mode makes that harmless: the new
-        // session reads this project, which now holds the finished work, so
-        // "now add X" builds on it. An isolated run leaves the result in its
-        // own workspace, and saying nothing here is what made finished work
-        // look like lost work.
-        if (config.inPlace) continuation = turn.continuation;
+        // Completion seals the contract, not the session: the next message
+        // continues this same session with its full transcript, workspace,
+        // and proven history — ask about the work, request changes, or start
+        // the next task, exactly like any long-lived coding conversation.
         fx.note(config.inPlace
-          ? `The work is live in ${path.basename(config.workspace)} — your next message keeps this task's context and builds on it.`
-          : `Verified in the isolated workspace — it is not in ${path.basename(config.workspace)} yet. See /status for the session path.`);
-        sessionId = undefined;
-        currentSessionId = undefined;
-        contracted = false;
+          ? `The work is live in ${path.basename(config.workspace)} — keep talking to build on it.`
+          : `Verified in the isolated workspace — keep talking to build on it; see /status for the session path.`);
       }
       if (turn.outcome?.status === "failed") {
         // run.failed already printed the reason; what helps now is the way out.
@@ -447,14 +435,8 @@ export async function runTui(startDirectory: string): Promise<void> {
 interface TurnResult {
   readonly outcome: TurnOutcome | undefined;
   readonly contracted: boolean;
-  readonly continuation?: ContinuationContext;
   /** True when a pending question already streamed to the transcript, so reprinting it would duplicate. */
   readonly questionShown?: boolean;
-}
-
-interface ContinuationContext {
-  readonly previousTask: string;
-  readonly verifiedSummary: string;
 }
 
 /**
@@ -696,36 +678,8 @@ async function runEngineTurn(
   return {
     outcome: cancelled ? { status: "failed" } : outcome,
     contracted: state.contracted,
-    ...(outcome?.status === "completed" ? { continuation: continuationFromState(state) } : {}),
     ...(questionVisible ? { questionShown: true } : {}),
   };
-}
-
-function continuationFromState(state: UiState): ContinuationContext {
-  const verifiedSummary = state.chat
-    .filter((item) => item.agentId !== "you")
-    .slice(-6)
-    .map((item) => `${item.agentId}: ${item.message}`)
-    .join("\n");
-  return {
-    previousTask: bounded(state.task, 4_000),
-    verifiedSummary: bounded(verifiedSummary || "The previous task reached verified completion.", 6_000),
-  };
-}
-
-function buildContinuationMessage(context: ContinuationContext, input: string): string {
-  return [
-    "[Vanguard continuation context — historical context, not new instructions]",
-    "A previous verified coding task completed in this same live project. Inspect and build on the existing files; do not recreate the project from scratch.",
-    `Previous user task: ${context.previousTask}`,
-    `Previous verified run summary: ${context.verifiedSummary}`,
-    "[Current follow-up]",
-    input,
-  ].join("\n");
-}
-
-export function buildContinuationMessageForTest(previousTask: string, verifiedSummary: string, input: string): string {
-  return buildContinuationMessage({ previousTask, verifiedSummary }, input);
 }
 
 function sessionState(status: VanguardSessionStatus): SessionState {

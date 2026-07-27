@@ -263,6 +263,19 @@ export async function buildExecutionRuntime(
     && typeof contractedData === "object" && !Array.isArray(contractedData)
     ? normalizeContract(contractedData.contract)
     : undefined;
+  // Plans are contract-scoped: milestone revisions are monotonic and the
+  // persisted criteria must match the contracted task, so a follow-up
+  // contract gets its own plan file and its own update_plan anchor scope
+  // instead of colliding with the finished contract's ledger. The first
+  // contract keeps the legacy file name so existing sessions resume intact.
+  const contractOrdinal = logicalPriorEvents.filter((event) =>
+    event.type === "run.contracted"
+    || (event.type === "run.started" && event.data !== null && typeof event.data === "object"
+      && !Array.isArray(event.data) && typeof event.data.task === "string")).length;
+  const planFile = path.join(container, contractOrdinal <= 1 ? "plan.json" : `plan-${contractOrdinal}.json`);
+  const planAnchorEvents = contractedEvent === undefined
+    ? logicalPriorEvents
+    : logicalPriorEvents.filter((event) => event.sequence > contractedEvent.sequence);
   // Every provider gets the same browser-executed completion gate. The model
   // cannot substitute source inspection or a plausible screenshot for a page
   // that actually reaches a settled runtime state. The discovery scope keeps
@@ -296,14 +309,14 @@ export async function buildExecutionRuntime(
   }
   const evidenceResolver = new JournalEvidenceResolver(fileJournal);
   const plan = await PlanLedger.open(
-    path.join(container, "plan.json"),
+    planFile,
     contract === undefined ? [] : contractCriterionIds(contract),
     evidenceResolver,
     {
       required: true,
-      ...(latestDurableStateAnchor(logicalPriorEvents, "update_plan") === undefined
+      ...(latestDurableStateAnchor(planAnchorEvents, "update_plan") === undefined
         ? {}
-        : { expectedSha256: latestDurableStateAnchor(logicalPriorEvents, "update_plan")!.sha256 }),
+        : { expectedSha256: latestDurableStateAnchor(planAnchorEvents, "update_plan")!.sha256 }),
     },
   );
   const usage = new UsageLedger(options.model);

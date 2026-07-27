@@ -543,10 +543,35 @@ export class AgentKernel {
       lastWorkspaceFingerprint = fingerprint;
     };
 
-    if (restored.poisonedReason !== undefined) {
+    // Lost containment fences execution evidence forever, not the human's
+    // ability to talk to the session: a bare resume still fails closed, but a
+    // fresh user message reopens the journal-intact conversation below with
+    // execute_task withheld (see executionFenced).
+    const executionFenced = restored.poisonedReason !== undefined;
+    if (executionFenced && input.userMessage === undefined) {
       return { status: "failed", reason: restored.poisonedReason, steps: restored.completedSteps };
     }
-    if (restored.completed) throw new Error("Cannot resume a completed Vanguard run.");
+    if (restored.completed && input.userMessage === undefined) {
+      // Fail closed on a bare resume: a finished contract has nothing to
+      // continue. Fresh human input reopens the session as a conversation.
+      throw new Error("This run already completed; advance with a follow-up user message to continue.");
+    }
+    let contractStartStep = restored.contractStartStep;
+    if (restored.failedTerminal !== undefined && input.userMessage !== undefined) {
+      // Fresh human input after a journaled failure grants a fresh step
+      // epoch, so a step-exhausted run acts on the message instead of
+      // instantly re-failing on the spent budget. An ordinary failure keeps
+      // its contract and mode — the message steers the retry. A poisoned
+      // failure instead reopens as a conversation with execution fenced:
+      // the contract can never be trusted again, but the human can still
+      // talk to the session. Bare resumes keep historical retry semantics.
+      contractStartStep = restored.completedSteps;
+      if (executionFenced) {
+        mode = "conversation";
+        mutationNeedsExecutionEvidence = false;
+        mutationNeedsReview = false;
+      }
+    }
 
     // Accepting a conversation contract is a two-event transaction:
     // model.decided(execute), then run.contracted. A process can disappear in
@@ -554,7 +579,7 @@ export class AgentKernel {
     // no external side effect, so finish the transaction exactly once instead
     // of asking the provider to decide again. A later run.contracted event
     // clears pendingContract during restoration, making ordinary resumes inert.
-    if (restored.pendingContract !== undefined) {
+    if (restored.pendingContract !== undefined && !executionFenced) {
       if (input.task !== undefined) throw new Error("A task can only start a fresh session; resume without one.");
       const contract = restored.pendingContract;
       task = this.#taskAddendum === undefined
@@ -653,6 +678,16 @@ export class AgentKernel {
       await this.#record("run.resumed", { completedSteps: restored.completedSteps });
     }
 
+    if (executionFenced && !restored.fenceNoticeRecorded) {
+      // Journaled exactly once so every later restore replays the same
+      // explanation instead of re-stamping it on each reopened advance.
+      const fenceNote = "[Vanguard runtime] Execution is permanently fenced in this session: "
+        + `${restored.poisonedReason} An unmonitored process may still be able to alter the workspace, `
+        + "so no further execution or verification evidence can be trusted here. Continue the conversation "
+        + "and inspect state with read-only tools; direct any new hands-on work to a fresh session.";
+      await this.#record("runtime.note", { text: fenceNote, kind: "execution-fenced" });
+      transcript.push({ role: "runtime", content: fenceNote });
+    }
     if (input.userMessage !== undefined) {
       transcript.push({ role: "user", content: input.userMessage });
       await this.#record("user.message", { text: input.userMessage });
@@ -691,7 +726,12 @@ export class AgentKernel {
     // floor persists: re-initializing it per step re-pays up to three rejected
     // round-trips plus three model-driven overflow projections on every step.
     let effectiveContextBytes = this.#options.maxContextBytes;
-    for (let step = restored.completedSteps + 1; step <= this.#options.maxSteps; step += 1) {
+    // The step budget is a per-contract runaway bound, not a session lifetime:
+    // each accepted contract opens a fresh epoch at its own start step, so a
+    // follow-up task never inherits a prior task's spent budget. Single-shot
+    // runs are unchanged (their epoch starts at step zero).
+    const stepBudgetCeiling = contractStartStep + this.#options.maxSteps;
+    for (let step = restored.completedSteps + 1; step <= stepBudgetCeiling; step += 1) {
       if (signal.aborted) {
         return this.#fail("Run aborted.", step - 1);
       }
@@ -852,7 +892,7 @@ export class AgentKernel {
             task: modelTask,
             mode,
             transcript: selectedTranscript,
-            tools: this.#offeredTools(mode),
+            tools: this.#offeredTools(mode, executionFenced),
             remainingSteps: this.#options.maxSteps - step + 1,
             signal,
             workingState: workingStateSnapshot,
@@ -1018,6 +1058,26 @@ export class AgentKernel {
       }
 
       if (decision.kind === "execute") {
+        if (executionFenced) {
+          // Defense in depth: the control is not offered to fenced sessions,
+          // but a provider can still hallucinate it.
+          const observation = await this.#terminalObservation(
+            { id: "task-execute", name: CONTROL_TOOL_NAMES.execute, input: decision.contract as unknown as JsonValue },
+            "Execution is permanently fenced in this session: process containment was lost, so no new contract can produce trustworthy evidence here. Tell the user to start a fresh session for new hands-on work.",
+            "policy",
+            recovery,
+            signal,
+            toolEvidenceId(modelDecisionSequence, 0),
+          );
+          transcript.push({ role: "observation", content: observation as unknown as JsonValue });
+          await this.#record("tool.failed", observation as unknown as JsonValue);
+          const count = (actionFailures.get("execute_task-fenced") ?? 0) + 1;
+          actionFailures.set("execute_task-fenced", count);
+          if (count >= this.#options.maxRepeatedAction) {
+            return this.#fail("Repeated attempts to contract execution in a fenced session.", step);
+          }
+          continue;
+        }
         if (mode === "execution") {
           const observation = await this.#terminalObservation(
             { id: "task-execute", name: CONTROL_TOOL_NAMES.execute, input: decision.contract as unknown as JsonValue },
@@ -1272,7 +1332,7 @@ export class AgentKernel {
       if (batchOutcome !== undefined) return this.#fail(batchOutcome.reason, step, batchOutcome.poisoned === true);
     }
 
-    return this.#fail("Step budget exhausted without verified completion.", this.#options.maxSteps);
+    return this.#fail("Step budget exhausted without verified completion.", stepBudgetCeiling);
   }
 
   /** Tools under their canonical names only — legacy alias entries excluded. */
@@ -1280,7 +1340,7 @@ export class AgentKernel {
     return [...this.#tools.entries()].filter(([name, tool]) => name === tool.name).map(([, tool]) => tool);
   }
 
-  #offeredTools(mode: KernelMode): ToolDefinition[] {
+  #offeredTools(mode: KernelMode, executionFenced = false): ToolDefinition[] {
     if (mode === "conversation") {
       const observers = this.#canonicalTools()
         .filter((tool) => tool.definition.effect === "observe")
@@ -1288,7 +1348,9 @@ export class AgentKernel {
       return [
         ...observers,
         ...(this.#options.interactive ? [ASK_CONTROL_DEFINITION] : []),
-        EXECUTE_CONTROL_DEFINITION,
+        // A fenced session can never contract execution again: containment
+        // was lost, so no future evidence from this session is trustworthy.
+        ...(executionFenced ? [] : [EXECUTE_CONTROL_DEFINITION]),
       ];
     }
     return [
@@ -1904,6 +1966,8 @@ interface RestoredSession {
   readonly mutationNeedsExecutionEvidence: boolean;
   readonly mutationNeedsReview: boolean;
   readonly completedSteps: number;
+  /** Steps consumed before the current contract epoch began. */
+  readonly contractStartStep: number;
   readonly sequence: number;
   readonly completed: boolean;
   readonly pendingQuestion: string | undefined;
@@ -1916,6 +1980,8 @@ interface RestoredSession {
   readonly observationStagnation: ObservationStagnationState;
   readonly executionThrash: ExecutionThrashState;
   readonly poisonedReason: string | undefined;
+  readonly failedTerminal: string | undefined;
+  readonly fenceNoticeRecorded: boolean;
   /** A durable execute decision whose matching run.contracted event was interrupted. */
   readonly pendingContract: TaskContract | undefined;
   /**
@@ -2101,6 +2167,7 @@ function restoreSession(
   let mutationNeedsExecutionEvidence = false;
   let mutationNeedsReview = false;
   let completedSteps = 0;
+  let contractStartStep = 0;
   let failedVerificationAttempts = 0;
   let failedCompletionEvidenceAttempts = 0;
   let completionClaimFailed = false;
@@ -2112,6 +2179,8 @@ function restoreSession(
   let stepsSinceReground = 0;
   let completedMutations = 0;
   let poisonedReason: string | undefined;
+  let failedTerminal: string | undefined;
+  let fenceNoticeRecorded = false;
   let pendingContract: TaskContract | undefined;
   let timeTravelResumePending = false;
 
@@ -2128,11 +2197,13 @@ function restoreSession(
       resetObservationStagnation(observationStagnation);
       executionThrash.streaks.clear();
       pendingContract = undefined;
+      failedTerminal = undefined;
       const data = recordValue(event.data);
       if (typeof data?.task === "string") {
         mode = "execution";
         task = data.task;
         expectedTask = data.task;
+        contractStartStep = completedSteps;
         transcript.push({ role: "task", content: data.task });
       }
       continue;
@@ -2141,11 +2212,16 @@ function restoreSession(
       resetObservationStagnation(observationStagnation);
       executionThrash.streaks.clear();
       pendingContract = undefined;
+      failedTerminal = undefined;
       const data = recordValue(event.data);
       if (typeof data?.task === "string") {
         mode = "execution";
         task = data.task;
         expectedTask = data.task;
+        // The step budget bounds one contract's runaway execution, not the
+        // session's lifetime: each accepted contract opens a fresh epoch.
+        contractStartStep = completedSteps;
+        completed = false;
         transcript.push({ role: "task", content: data.task });
       }
       continue;
@@ -2153,6 +2229,23 @@ function restoreSession(
     if (event.type === "user.message") {
       const data = recordValue(event.data);
       if (typeof data?.text === "string") transcript.push({ role: "user", content: data.text });
+      // Human input after a sealed completion reopens the state machine; an
+      // interrupted follow-up turn must resume without demanding the user
+      // repeat themselves. The completion record itself stays journaled.
+      completed = false;
+      if (failedTerminal !== undefined) {
+        // Replay mirror of the live failed-reopen in advance(): human input
+        // after a journaled failure grants a fresh step epoch; an ordinary
+        // failure keeps its contract and mode, while a poisoned one falls
+        // back to conversation with execution permanently fenced.
+        failedTerminal = undefined;
+        contractStartStep = completedSteps;
+        if (poisonedReason !== undefined) {
+          mode = "conversation";
+          mutationNeedsExecutionEvidence = false;
+          mutationNeedsReview = false;
+        }
+      }
       pendingQuestion = undefined;
       trailingNarrations = 0;
       resetObservationStagnation(observationStagnation);
@@ -2176,6 +2269,7 @@ function restoreSession(
         const streak = executionThrash.streaks.get(data.signature);
         if (streak !== undefined) streak.guided = true;
       }
+      if (data?.kind === "execution-fenced") fenceNoticeRecorded = true;
       stepsSinceReground = 0;
       continue;
     }
@@ -2193,11 +2287,33 @@ function restoreSession(
     }
     if (event.type === "run.completed") {
       completed = true;
+      // Verified completion ends the execution epoch, not the session. The
+      // journal keeps the full proven history; the session itself returns to
+      // conversation so a follow-up message can discuss the finished work or
+      // contract new work. Evidence obligations and claim budgets belong to
+      // the contract that just closed, so they reset with it.
+      mode = "conversation";
+      contractStartStep = completedSteps;
+      flushCompletion();
+      failedVerificationAttempts = 0;
+      failedCompletionEvidenceAttempts = 0;
+      mutationNeedsExecutionEvidence = false;
+      mutationNeedsReview = false;
+      trailingNarrations = 0;
+      resetObservationStagnation(observationStagnation);
+      executionThrash.streaks.clear();
       continue;
     }
     if (event.type === "run.failed") {
       const data = recordValue(event.data);
       if (data?.poisoned === true && typeof data.reason === "string") poisonedReason = data.reason;
+      // A bare resume of a failed run keeps its historical retry semantics:
+      // replay changes nothing, so standing guards re-fail or execution
+      // continues exactly as before. Only fresh human input reopens the
+      // session as a conversation — live in advance(), or in the
+      // user.message branch below when the reopening message itself was
+      // journaled before an interruption.
+      failedTerminal = typeof data?.reason === "string" ? data.reason : "Run failed.";
       continue;
     }
     if (event.type === "session.restored" || event.type === "session.forked") {
@@ -2207,6 +2323,7 @@ function restoreSession(
       // branch event explicitly reopens the state machine while leaving the
       // complete journal prefix auditable.
       completed = false;
+      failedTerminal = undefined;
       pendingQuestion = undefined;
       pendingCalls = [];
       pendingObservationBatch = undefined;
@@ -2378,6 +2495,7 @@ function restoreSession(
     mutationNeedsExecutionEvidence,
     mutationNeedsReview,
     completedSteps,
+    contractStartStep,
     sequence: events.reduce((maximum, event) => Math.max(maximum, event.sequence), 0),
     completed,
     pendingQuestion,
@@ -2390,6 +2508,8 @@ function restoreSession(
     executionThrash,
     observationStagnation,
     poisonedReason,
+    failedTerminal,
+    fenceNoticeRecorded,
     pendingContract,
     timeTravelResumePending,
   };

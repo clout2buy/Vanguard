@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
-  buildContinuationMessageForTest,
   flattenInlineProtocol,
   inspectTuiLifecycleForTest,
   renderFooterForTest,
@@ -252,18 +251,6 @@ test("a streamed bold span keeps its styling across a soft-wrapped row boundary"
   assert.ok(committed[0]!.endsWith("\x1b[0m"), "committed rows are reset-terminated for scrollback");
   const continuation = committed.length > 1 ? committed[1]! : tailSgr + tail;
   assert.ok(continuation.includes("\x1b[1m"), "the bold span re-opens on the continuation row");
-});
-
-test("a verified follow-up carries prior task context without pretending it is a fresh build", () => {
-  const message = buildContinuationMessageForTest(
-    "Build a working inventory screen.",
-    "main: Implemented it and the test command passed.",
-    "The save button does not work.",
-  );
-  assert.match(message, /previous verified coding task completed in this same live project/iu);
-  assert.match(message, /Build a working inventory screen/u);
-  assert.match(message, /The save button does not work/u);
-  assert.match(message, /Inspect and build on the existing files/iu);
 });
 
 test("CONVERGENCE collapses the starfield, seals the wordmark, and fades out", async () => {

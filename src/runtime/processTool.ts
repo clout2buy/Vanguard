@@ -207,7 +207,15 @@ async function runProcess(
 ): Promise<ToolResult> {
   if (signal.aborted) return { ok: false, output: { error: "Process aborted before launch." } };
   return new Promise((resolve) => {
-    const child = spawn(command, args, { cwd, shell: false, windowsHide: true, env: environment });
+    const child = spawn(command, args, {
+      cwd,
+      shell: false,
+      windowsHide: true,
+      env: environment,
+      // POSIX: lead a fresh process group so termination can address the
+      // entire tree with one signal instead of only the direct child.
+      detached: process.platform !== "win32",
+    });
     let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     let settled = false;
@@ -245,15 +253,46 @@ async function runProcess(
       signal.removeEventListener("abort", abort);
       resolve(result);
     };
+    const killTree = (killSignal: "SIGTERM" | "SIGKILL"): void => {
+      if (process.platform === "win32") {
+        // taskkill /T must run while the direct child is still alive: its
+        // PID is the only handle to the tree, and grandchildren reparent
+        // beyond reach the moment it dies. Killing only the direct child
+        // (e.g. a cmd.exe /c wrapper around an installer) leaves survivors
+        // holding the stdio pipes, `close` never fires, and unprovable
+        // closure permanently poisons the run.
+        if (child.pid !== undefined) {
+          try {
+            spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
+              shell: false,
+              windowsHide: true,
+              stdio: "ignore",
+            }).on("error", () => {
+              try { child.kill("SIGKILL"); } catch { /* The close/deadline below remains authoritative. */ }
+            });
+            return;
+          } catch { /* Fall through to the direct kill. */ }
+        }
+        try { child.kill("SIGKILL"); } catch { /* The close/deadline below remains authoritative. */ }
+        return;
+      }
+      if (child.pid !== undefined) {
+        try {
+          process.kill(-child.pid, killSignal);
+          return;
+        } catch { /* The group may already be gone; fall back to the direct child. */ }
+      }
+      try { child.kill(killSignal); } catch { /* The close/deadline below remains authoritative. */ }
+    };
     const terminate = (reason: "aborted" | "timed_out" | "idle"): void => {
       if (settled || termination !== undefined) return;
       termination = reason;
       if (timer !== undefined) clearTimeout(timer);
       if (idleTimer !== undefined) clearTimeout(idleTimer);
-      try { child.kill("SIGTERM"); } catch { /* The exact close/deadline below remains authoritative. */ }
+      killTree("SIGTERM");
       terminationEscalation = setTimeout(() => {
         if (settled) return;
-        try { child.kill("SIGKILL"); } catch { /* Report uncertainty if close still cannot be proven. */ }
+        killTree("SIGKILL");
         containmentDeadline = setTimeout(() => {
           stopCapture();
           finish({
@@ -269,7 +308,9 @@ async function runProcess(
               ...(reason === "idle" && idleTimeoutMs !== undefined ? { idleTimeoutMs } : {}),
             },
           });
-        }, 1_000);
+          // taskkill spawns a process and walks the tree; give it room on
+          // Windows before declaring closure unprovable.
+        }, process.platform === "win32" ? 2_000 : 1_000);
       }, 1_000);
     };
     const abort = (): void => terminate("aborted");

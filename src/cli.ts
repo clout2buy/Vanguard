@@ -332,10 +332,23 @@ async function advanceSessionUnlocked(
       }
     }
 
-    const runtime = await buildExecutionRuntime(session, options, fileJournal, true, userChannel);
+    let runtime = await buildExecutionRuntime(session, options, fileJournal, true, userChannel);
     disposeRuntime = runtime.dispose;
-    const outcome = await runWithBudgets(options, runtime.journalActivity, controller, (signal) =>
+    let outcome = await runWithBudgets(options, runtime.journalActivity, controller, (signal) =>
       runtime.kernel.advance(pendingMessage === undefined ? {} : { userMessage: pendingMessage }, signal, priorEvents));
+    while (outcome.status === "contracted") {
+      // A follow-up contract accepted after an earlier completion: rebuild
+      // the runtime around the new contract (fresh plan scope, contract-bound
+      // verifiers) and keep executing inside this same advance, exactly like
+      // a first contract flows straight into execution above.
+      pendingMessage = undefined;
+      priorEvents = await fileJournal.readValidated();
+      await runtime.dispose?.();
+      runtime = await buildExecutionRuntime(session, options, fileJournal, true, userChannel);
+      disposeRuntime = runtime.dispose;
+      outcome = await runWithBudgets(options, runtime.journalActivity, controller, (signal) =>
+        runtime.kernel.advance({}, signal, priorEvents));
+    }
     if (outcome.status === "completed" || outcome.status === "failed") {
       await writeScorecard({
         session, options, outcome, fileJournal, scorecardFile, journalFile, configurationFile,

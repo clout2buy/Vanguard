@@ -45,6 +45,28 @@ test("a silent never-exiting child is killed by the idle watchdog with its outpu
   });
 });
 
+test("an idle-killed wrapper cannot orphan its process tree into uncertainty", async () => {
+  // The production incident: cmd.exe /c <installer> went silent, the idle
+  // watchdog killed the wrapper, the installer survived holding the stdio
+  // pipes, and unproven closure permanently poisoned the run. Termination
+  // must kill the tree while the wrapper is still alive and prove closure.
+  await withTool({ timeoutMs: 60_000, idleTimeoutMs: 750 }, async (tool) => {
+    const result = await tool.execute({
+      command: process.execPath,
+      args: ["-e", [
+        "const { spawn } = require('node:child_process');",
+        "spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000);'], { stdio: 'inherit' });",
+        "setInterval(() => {}, 1000);",
+      ].join(" ")],
+    }, context);
+    assert.equal(result.ok, false);
+    const output = result.output as { error: string; containmentUncertain?: boolean; directChildClosed?: boolean };
+    assert.notEqual(output.containmentUncertain, true,
+      `tree termination must prove closure instead of poisoning the run: ${JSON.stringify(output)}`);
+    assert.match(output.error, /no output for \d+s/u, "the result stays an ordinary idle failure the run survives");
+  });
+});
+
 test("a chatty long-running child outlives the idle window as long as it keeps talking", async () => {
   // A generous idle window (2s) versus a fast print cadence (200ms) so heavy
   // parallel-test CPU load cannot delay a tick past the window and flake the
