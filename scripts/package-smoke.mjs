@@ -163,13 +163,13 @@ try {
   const tuiUrl = pathToFileURL(path.join(installedRoot, "dist", "src", "tui.js")).href;
   run(process.execPath, ["--input-type=module", "--eval", [
     `const tui = await import(${JSON.stringify(tuiUrl)});`,
-    'const welcome = tui.renderWelcomeForTest("C:\\\\portable project", "fixture-model");',
+    'const welcome = tui.renderLaunchHeaderForTest("C:\\\\portable project");',
     // Assert the packed TUI renders, not how it styles its wordmark: the banner
     // letter-spaces and per-letter colors "V A N G U A R D", so a substring
     // match on the raw string pins a cosmetic choice and fails on restyling.
     'const plain = welcome.replace(/\\x1b\\[[0-9;]*m/g, "");',
     'const wordmark = plain.replace(/\\s+/g, "");',
-    'if (!wordmark.includes("VANGUARD") || !plain.includes("fixture-model")) throw new Error("packed TUI unavailable: " + JSON.stringify(plain.slice(0, 200)));',
+    'if (!wordmark.includes("VANGUARD") || !plain.includes("portable project")) throw new Error("packed TUI unavailable: " + JSON.stringify(plain.slice(0, 200)));',
   ].join("\n")], consumer);
   const installed = JSON.parse(await readFile(path.join(consumer, "node_modules", "vanguard", "package.json"), "utf8"));
   assert.match(installed.engines.node, />=20/u);

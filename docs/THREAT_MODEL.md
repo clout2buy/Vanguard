@@ -28,6 +28,10 @@ developer workstation.
 - Provider payloads and child output are not public engine events. The public
   event projection is allowlisted, bounded, and redacted again at the engine
   seam.
+- Built-in web tools send only bounded GET requests with no cookies,
+  credentials, or arbitrary headers; public-target checks apply to the initial
+  URL and every redirect. Search queries and URL text still leave the machine
+  and must not contain secrets. See `WEB_ACCESS.md`.
 
 ## Named profiles
 
@@ -84,6 +88,8 @@ container or hypervisor implementation.
 ## Explicit non-claims
 
 - No profile confines the network or every language runtime by itself.
+- Web content is untrusted model input, not independent verification evidence;
+  public-target checks are not a general outbound network sandbox.
 - Secret files intentionally present inside the repository are visible to the
   coding model unless the host removes them before session creation.
 - A trusted in-process extension has host authority; untrusted extensions must
@@ -92,4 +98,3 @@ container or hypervisor implementation.
   resource isolation require an external runner.
 - Security tests establish the behavior of Vanguard's boundaries; they are not
   a third-party penetration-test certificate.
-

@@ -260,6 +260,25 @@ endpoint), and an isolation story (either integrate an OS boundary on Windows à
 Codex, or double down on the documented external-container stance and ship a
 first-class container runner).
 
+Implementation follow-up is tracked in `RECONSTRUCTION.md`. The first closure
+phase adds bounded `search_web` and `fetch_url` observation tools; the table
+above remains the pre-reconstruction survey snapshot.
+
+### Closure status (engine 0.2.6)
+
+| # | Gap | Status |
+|---|---|---|
+| 1 | No web access | **Closed.** `search_web` + `fetch_url` as observe-effect tools in the conversation, execution, and scout toolsets, behind a default-deny `PublicNetworkTargetPolicy` (per-hop redirect revalidation, DNS-resolved private/loopback refusal, default ports only, streaming byte caps). See `WEB_ACCESS.md`. |
+| 2 | No long-running processes | **Designed, not built** — `MANAGED_PROCESSES.md`. Engine 0.2.5 fixed the containment half (provable tree kill) after the incident this gap predicted. |
+| 3a | No custom commands | **Closed.** `.vanguard/commands/*.md` prompt templates with `$ARGUMENTS`/`$1..$9`, workspace shadowing user, listed in `/help`. |
+| 3b | Hooks cannot see a tool call | **Closed.** `before-tool`/`after-tool` receive `{ when, tool, input, ok?, output? }` on stdin, and a fail-closed `before-tool` hook denies that single call instead of ending the run. |
+| 3c | `CustomToolRegistry` unreachable | **Resolved as documented boundary.** `tools[]` is an embedder surface — the CLI cannot import implementations by design; MCP is the CLI's route to external tools. See `EXTENSIONS.md`. |
+| 4 | MCP partial (stdio/tools-only) | Open. |
+| 5 | No git tooling as tools | Open. |
+| 6 | No OS sandbox | Open — needs a design doc, as above. |
+| 7 | UX-layer gaps | Partially closed: the fixed six slash commands are now extensible; `@`-mentions and attachments remain open. |
+| 8 | Code intel breadth | Open. |
+
 ---
 
 ## 5. Sources & confidence

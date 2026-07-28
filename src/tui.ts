@@ -5,6 +5,8 @@ import path from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import type { CommandSpec } from "./runtime/projectVerification.js";
 import { detectProjectVerification } from "./runtime/projectVerification.js";
+import type { PromptCommand } from "./extensions/promptCommands.js";
+import { expandPromptCommand, loadPromptCommands } from "./extensions/promptCommands.js";
 import { isCleanGitRepository } from "./runtime/gitTree.js";
 import type { VerificationMode } from "./runtime/automaticVerification.js";
 import type { PublicRunEvent } from "./runtime/publicRunEvents.js";
@@ -187,6 +189,10 @@ export async function runTui(startDirectory: string): Promise<void> {
   const engine = new VanguardEngine({ logger: () => {} });
   let sessionId: string | undefined;
   let contracted = false;
+  // Markdown prompt templates become slash commands. Discovery is inert text
+  // and expansion happens here in the terminal, so a command can only produce
+  // the message the owner could have typed by hand.
+  const promptCommands = await loadPromptCommands({ workspaceRoot: config.workspace }).catch(() => []);
 
   // ── The inline war room ─────────────────────────────────────────────────
   // One owner from the first prompt to exit: an append-only transcript in the
@@ -304,6 +310,7 @@ export async function runTui(startDirectory: string): Promise<void> {
           + ` ${ansi.violet}/verify${ansi.reset}        ${ansi.dim}what completion must prove: build or tests${ansi.reset}\n`
           + ` ${ansi.violet}/status${ansi.reset}        ${ansi.dim}session, provider, and mode details${ansi.reset}\n`
           + ` ${ansi.violet}/exit${ansi.reset}          ${ansi.dim}leave Vanguard (also: exit, quit)${ansi.reset}\n`
+          + customCommandHelp(promptCommands)
           + ` ${ansi.dim}Anything else is a message: chat, ask about the repo, or request work.${ansi.reset}\n`
           + ` ${ansi.dim}While a task runs: type to steer, Enter sends, ↑↓ history, Ctrl+K commands, Ctrl+C interrupts.${ansi.reset}\n`
           + ` ${ansi.dim}Composer editing: Ctrl+A/E line ends, Ctrl+←→ word jumps, Ctrl+W deletes a word, Ctrl+U clears to start.${ansi.reset}\n`
@@ -346,7 +353,16 @@ export async function runTui(startDirectory: string): Promise<void> {
         );
         continue;
       }
-      if (input.length === 0) {
+      // A custom command expands into the message the owner meant. Only an
+      // exact known name is intercepted: an unmatched leading slash stays a
+      // normal message, so paths and regexes still send as typed.
+      let message = input;
+      const custom = matchPromptCommand(promptCommands, input);
+      if (custom !== undefined) {
+        message = expandPromptCommand(custom.command, custom.argumentText);
+        fx.note(`/${custom.command.name} · ${custom.command.scope} command`);
+      }
+      if (message.length === 0) {
         continue;
       }
       try {
@@ -385,7 +401,9 @@ export async function runTui(startDirectory: string): Promise<void> {
         sessionId = created.sessionId;
       }
       currentSessionId = sessionId;
-      const turn = await runEngineTurn(engine, sessionId, input, config, ui, fx, terminalWidth, contracted, input);
+      // The expanded template is what the model receives; the footer keeps the
+      // short thing the owner actually typed.
+      const turn = await runEngineTurn(engine, sessionId, message, config, ui, fx, terminalWidth, contracted, input);
       contracted = turn.contracted;
 
       if (turn.outcome?.status === "waiting_for_user") {
@@ -1290,6 +1308,30 @@ async function selectOrExit<T>(options: Parameters<typeof select<T>>[0]): Promis
     }
     throw error;
   }
+}
+
+/**
+ * Resolves `/name rest…` against the loaded templates. Anything that is not an
+ * exact command name is left alone so ordinary messages beginning with a slash
+ * (paths, regexes) still send verbatim.
+ */
+function matchPromptCommand(
+  commands: readonly PromptCommand[],
+  input: string,
+): { command: PromptCommand; argumentText: string } | undefined {
+  const match = /^\/([a-z][a-z0-9_-]{0,31})(?:\s+([\s\S]*))?$/u.exec(input.trim());
+  if (match === null) return undefined;
+  const command = commands.find((candidate) => candidate.name === match[1]);
+  return command === undefined ? undefined : { command, argumentText: match[2] ?? "" };
+}
+
+function customCommandHelp(commands: readonly PromptCommand[]): string {
+  if (commands.length === 0) return "";
+  return ` ${ansi.dim}Your commands (.vanguard/commands):${ansi.reset}\n`
+    + commands
+      .map((command) => ` ${ansi.violet}/${command.name.padEnd(13)}${ansi.reset} ${ansi.dim}${bounded(command.description, 80)}${ansi.reset}`)
+      .join("\n")
+    + "\n";
 }
 
 function printCommandList(fx: TranscriptFx): void {

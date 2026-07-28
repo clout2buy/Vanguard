@@ -34,6 +34,8 @@ import {
   WorkspaceIntegrityVerifier,
   WorkspaceMutationPolicy,
   WorkspaceVersionLedger,
+  WebFetchTool,
+  WebSearchTool,
   WriteFileTool,
   contractCriterionIds,
   normalizeContract,
@@ -96,6 +98,8 @@ export function buildConversationRuntime(
     new HeadlessRenderTool(source),
     new ImageInspectionTool(source),
     new CodeIntelTool(source),
+    new WebSearchTool(),
+    new WebFetchTool(),
   ];
   const kernel = new AgentKernel({
     model: createModel(options, createStreamPresenter(markActivity)),
@@ -238,9 +242,28 @@ export async function buildExecutionRuntime(
       name: tool.name,
       definition: tool.definition,
       execute: async (input, context) => {
-        await hookRunner!.run("before-tool", context.signal);
+        // Hooks see the actual call now, and a fail-closed before-tool hook
+        // denies exactly that call: the model receives a refusal it can plan
+        // around instead of the run dying on a single disallowed command.
+        const before = await hookRunner!.run("before-tool", context.signal, { tool: tool.name, input });
+        const blocking = before.find((outcome) => outcome.blocked);
+        if (blocking !== undefined) {
+          return {
+            ok: false,
+            output: {
+              error: `Blocked by the '${blocking.hook}' before-tool hook.`,
+              hook: blocking.hook,
+              ...(blocking.stderr.trim().length === 0 ? {} : { detail: blocking.stderr.trim().slice(0, 2_000) }),
+            },
+          };
+        }
         const result = await tool.execute(input, context);
-        await hookRunner!.run("after-tool", context.signal);
+        await hookRunner!.run("after-tool", context.signal, {
+          tool: tool.name,
+          input,
+          ok: result.ok,
+          ...(result.output === undefined ? {} : { output: result.output }),
+        });
         return result;
       },
     };
@@ -379,6 +402,8 @@ export async function buildExecutionRuntime(
     new ReadFileTool(workspace, 1_000_000, versions),
     new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
     new CodeIntelTool(workspace),
+    new WebSearchTool(),
+    new WebFetchTool(),
   ];
   // One checker instance serves both the model-facing tool and the runtime's
   // automatic post-mutation rung; its content-hash cache makes a model
@@ -413,6 +438,8 @@ export async function buildExecutionRuntime(
       new ScoutDelegateTool(createModel(options), executionObserveTools),
       new CodeIntelTool(workspace),
       new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
+      new WebSearchTool(),
+      new WebFetchTool(),
       ...profileTools,
     ].map(withToolHooks),
     verifiers,

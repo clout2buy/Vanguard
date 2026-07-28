@@ -119,6 +119,7 @@ export function combinedObserver(presenter: StreamObserver, usage: UsageLedger):
     started: (attempt) => presenter.started?.(attempt),
     delta: (text) => presenter.delta(text),
     thinking: (text) => presenter.thinking?.(text),
+    activity: () => presenter.activity?.(),
     reset: () => presenter.reset?.(),
     committed: () => presenter.committed?.(),
     failed: (reason) => presenter.failed?.(reason),

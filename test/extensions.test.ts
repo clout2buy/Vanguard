@@ -239,6 +239,66 @@ test("hooks use literal argv, enforce timeout/failure policy, redact, and audit 
   await assert.rejects(durable.readValidated(), /audit integrity failure/);
 });
 
+test("tool hooks see the actual call and a fail-closed one denies only that call", async () => {
+  const { workspace } = await fixture("hook-tool-context");
+  // The hook reads the call on stdin and refuses writes under /etc — a policy
+  // it could not express at all when hooks received no tool identity.
+  const gate = [
+    "let raw = '';",
+    "process.stdin.on('data', (chunk) => { raw += chunk; });",
+    "process.stdin.on('end', () => {",
+    "  const call = JSON.parse(raw);",
+    "  process.stdout.write(`${call.when} ${call.tool} ${JSON.stringify(call.input)} ok=${call.ok}`);",
+    "  process.exit(String(call.input && call.input.path).startsWith('/etc') ? 3 : 0);",
+    "});",
+  ].join("");
+  const hooks: HookDeclaration[] = [
+    { name: "gate", when: "before-tool", command: process.execPath, args: ["-e", gate], cwd: ".", timeoutMs: 5_000, failure: "fail-closed" },
+    { name: "record", when: "after-tool", command: process.execPath, args: ["-e", gate], cwd: ".", timeoutMs: 5_000, failure: "fail-open" },
+  ];
+  const audit = new MemoryAudit();
+  const policy = new ExtensionPermissionPolicy({
+    effects: [], customTools: [], mcpServers: [], hooks: ["gate", "record"], commands: [process.execPath],
+  });
+  const runner = new HookRunner(new WorkspaceBoundary(workspace), policy, hooks, audit, { PATH: process.env.PATH });
+
+  const allowed = await runner.run("before-tool", new AbortController().signal, {
+    tool: "write_file",
+    input: { path: "src/app.ts" },
+  });
+  assert.equal(allowed[0]?.passed, true);
+  assert.equal(allowed[0]?.blocked, false);
+  assert.equal(allowed[0]?.stdout, 'before-tool write_file {"path":"src/app.ts"} ok=undefined');
+
+  // A denial is a refusal of THIS call, not an exception that ends the run.
+  const denied = await runner.run("before-tool", new AbortController().signal, {
+    tool: "write_file",
+    input: { path: "/etc/passwd" },
+  });
+  assert.equal(denied[0]?.passed, false);
+  assert.equal(denied[0]?.blocked, true);
+  assert.equal(denied[0]?.exitCode, 3);
+  assert.equal(audit.events.at(-1)?.status, "failed");
+  assert.equal((audit.events.at(-1)?.detail as { tool?: string }).tool, "write_file");
+
+  // after-tool additionally learns how the call turned out.
+  const after = await runner.run("after-tool", new AbortController().signal, {
+    tool: "read_file",
+    input: { path: "README.md" },
+    ok: true,
+    output: { bytes: 12 },
+  });
+  assert.equal(after[0]?.stdout, 'after-tool read_file {"path":"README.md"} ok=true');
+
+  // Oversized arguments are declared as truncated instead of streamed whole.
+  const huge = await runner.run("before-tool", new AbortController().signal, {
+    tool: "write_file",
+    input: { path: "big.txt", contents: "x".repeat(64 * 1024) },
+  });
+  assert.match(String(huge[0]?.stdout), /"truncated":true/u);
+  assert.equal(huge[0]?.passed, true);
+});
+
 test("MCP performs handshake, allowlists tools, validates inputs, redacts secrets, and cleans up", async () => {
   const { workspace } = await fixture("mcp-ok");
   const server = await mcpServer(workspace, "normal");

@@ -73,6 +73,22 @@ export interface HookOutcome {
   readonly timedOut: boolean;
 }
 
+/**
+ * The call a tool-scoped hook is deciding about. Delivered on stdin as one
+ * JSON line so a hook can inspect the actual arguments — without it a
+ * `before-tool` hook could only ever block every call or none.
+ */
+export interface HookToolContext {
+  readonly tool: string;
+  readonly input: JsonValue;
+  /** Present only for `after-tool`: the result the tool produced. */
+  readonly ok?: boolean;
+  readonly output?: JsonValue;
+}
+
+/** Payload cap: a hook decides on arguments, it does not need whole files. */
+const MAX_HOOK_PAYLOAD_BYTES = 32 * 1024;
+
 export class HookRunner {
   readonly #redact: (text: string) => string;
   readonly #environment: NodeJS.ProcessEnv;
@@ -89,37 +105,53 @@ export class HookRunner {
     this.#environment = { ...environment };
   }
 
-  async run(when: HookWhen, signal: AbortSignal): Promise<readonly HookOutcome[]> {
+  async run(when: HookWhen, signal: AbortSignal, context?: HookToolContext): Promise<readonly HookOutcome[]> {
     const outcomes: HookOutcome[] = [];
     for (const hook of this.hooks.filter((candidate) => candidate.when === when)
       .sort((a, b) => compareOrdinal(a.name, b.name))) {
       this.policy.authorizeHook(hook.name);
       this.policy.authorizeCommand(hook.command);
-      const outcome = await this.#execute(hook, signal);
+      const outcome = await this.#execute(hook, signal, context);
       outcomes.push(outcome);
       await this.audit.record({
         type: "hook.outcome",
         name: hook.name,
         status: outcome.timedOut ? "timed-out" : outcome.passed ? "passed" : "failed",
-        detail: outcome as unknown as JsonValue,
+        detail: { ...outcome, ...(context === undefined ? {} : { tool: context.tool }) } as unknown as JsonValue,
       });
       if (!outcome.passed && hook.failure === "fail-closed") {
+        // A tool-scoped hook denies THAT call; the caller turns the blocked
+        // outcome into a refusal the model can read and route around. Only a
+        // run-scoped hook refuses the whole run — a policy on one command
+        // must not be a session-ending event.
+        if (context !== undefined) return outcomes;
         throw new Error(`Hook '${hook.name}' failed under fail-closed policy.`);
       }
     }
     return outcomes;
   }
 
-  async #execute(hook: HookDeclaration, signal: AbortSignal): Promise<HookOutcome> {
+  async #execute(hook: HookDeclaration, signal: AbortSignal, context?: HookToolContext): Promise<HookOutcome> {
     const cwd = await this.workspace.existing(hook.cwd ?? ".");
+    const payload = context === undefined ? undefined : boundedPayload(hook.when, context);
     return new Promise((resolve) => {
       const child = spawn(hook.command, [...hook.args], {
         cwd,
         shell: false,
         windowsHide: true,
-        env: safeEnvironment(this.#environment),
-        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...safeEnvironment(this.#environment),
+          VANGUARD_HOOK_WHEN: hook.when,
+          ...(context === undefined ? {} : { VANGUARD_HOOK_TOOL: context.tool }),
+        },
+        stdio: [payload === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
+      if (payload !== undefined && child.stdin !== null) {
+        // A hook that ignores stdin closes the pipe early; that EPIPE is its
+        // choice, not a failure of the call it is judging.
+        child.stdin.on("error", () => undefined);
+        child.stdin.end(payload);
+      }
       let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
       let settled = false;
@@ -144,8 +176,10 @@ export class HookRunner {
         });
       };
       const abort = (): void => { child.kill(); finish(null); };
-      child.stdout.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
-      child.stderr.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
+      // Descriptors 1 and 2 are always "pipe" above; only stdin varies with
+      // whether this hook receives a payload.
+      child.stdout?.on("data", (chunk: Buffer) => { stdout = append(stdout, chunk); });
+      child.stderr?.on("data", (chunk: Buffer) => { stderr = append(stderr, chunk); });
       child.on("error", (error) => {
         stderr = append(stderr, Buffer.from(error.message));
         finish(null);
@@ -159,6 +193,28 @@ export class HookRunner {
       signal.addEventListener("abort", abort, { once: true });
     });
   }
+}
+
+/**
+ * One JSON line describing the call. Oversized arguments are replaced by a
+ * declared truncation marker rather than silently trimmed, so a hook can tell
+ * "no path was passed" from "the payload was too big to show you".
+ */
+function boundedPayload(when: HookWhen, context: HookToolContext): string {
+  const fit = (value: JsonValue | undefined): JsonValue | undefined => {
+    if (value === undefined) return undefined;
+    const serialized = JSON.stringify(value);
+    if (serialized !== undefined && Buffer.byteLength(serialized) <= MAX_HOOK_PAYLOAD_BYTES) return value;
+    return { truncated: true, bytes: serialized === undefined ? 0 : Buffer.byteLength(serialized) };
+  };
+  const output = fit(context.output);
+  return `${JSON.stringify({
+    when,
+    tool: context.tool,
+    input: fit(context.input) ?? null,
+    ...(context.ok === undefined ? {} : { ok: context.ok }),
+    ...(output === undefined ? {} : { output }),
+  })}\n`;
 }
 
 function safeEnvironment(environment: NodeJS.ProcessEnv): NodeJS.ProcessEnv {

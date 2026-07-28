@@ -7,8 +7,11 @@ import {
   InferenceError,
   OpenAIChatCompletionsCodec,
   OpenAIResponsesCodec,
+  UsageLedger,
   createStreamLifecyclePresenter,
+  type StreamObserver,
 } from "../src/index.js";
+import { combinedObserver } from "../src/cli/scorecard.js";
 
 const encoder = new TextEncoder();
 
@@ -555,4 +558,69 @@ test("provider usage surfaces a context-size event for the UI gauge", () => {
   const gauges = emitted.filter((event) => event.type === "agent.usage");
   assert.equal(gauges.length, 1, "malformed usage must emit nothing");
   assert.equal(gauges[0]?.detail, "24100");
+});
+
+test("SSE pings before the first token reach the observer as activity", async () => {
+  // A long prefill sends only ping frames for minutes. Each one is proof the
+  // request is alive; if the observer chain drops them, host-side watchdogs
+  // read the silence as a hang and kill a healthy run.
+  const anthropicEvents = [
+    '{"type":"ping"}',
+    '{"type":"ping"}',
+    '{"type":"message_start","message":{"usage":{"input_tokens":5}}}',
+    '{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+    '{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}',
+    '{"type":"content_block_stop","index":0}',
+    '{"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+    '{"type":"message_stop"}',
+  ];
+  // One SSE frame per network chunk, exactly like a live connection.
+  let index = 0;
+  const chunked = new Response(new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index < anthropicEvents.length) {
+        controller.enqueue(encoder.encode(`data: ${anthropicEvents[index]}\n\n`));
+        index += 1;
+        return;
+      }
+      controller.close();
+    },
+  }), { status: 200, headers: { "content-type": "text/event-stream" } });
+  const events: string[] = [];
+  const adapter = new HttpModelAdapter({
+    endpoint: "http://127.0.0.1:9/ping-liveness",
+    codec: new AnthropicMessagesCodec("m"),
+    maxAttempts: 1,
+    streamObserver: {
+      delta: (text) => events.push(`delta:${text}`),
+      activity: () => events.push("activity"),
+    },
+    fetchImplementation: (async () => chunked) as typeof fetch,
+  });
+  const decision = await adapter.decide(baseRequest());
+  assert.equal(decision.kind, "respond");
+  const firstActivity = events.indexOf("activity");
+  const firstDelta = events.indexOf("delta:hi");
+  assert.notEqual(firstActivity, -1, "ping chunks must surface as observer activity");
+  assert.ok(firstActivity < firstDelta, "liveness must precede the first visible token");
+});
+
+test("presenter activity emits agent.heartbeat, throttled", () => {
+  const emitted: PublicRunEvent[] = [];
+  const presenter = createStreamLifecyclePresenter((event) => emitted.push(event));
+  presenter.activity?.();
+  presenter.activity?.();
+  const heartbeats = emitted.filter((event) => event.type === "agent.heartbeat");
+  assert.equal(heartbeats.length, 1, "back-to-back activity coalesces into one heartbeat");
+});
+
+test("combinedObserver forwards activity to the presenter (drive-mode liveness)", () => {
+  const seen: string[] = [];
+  const presenter: StreamObserver = {
+    delta: () => {},
+    activity: () => seen.push("activity"),
+  };
+  const observer = combinedObserver(presenter, new UsageLedger("m"));
+  observer.activity?.();
+  assert.deepEqual(seen, ["activity"]);
 });
