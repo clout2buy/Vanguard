@@ -145,6 +145,12 @@ export interface KernelDependencies {
   /** Detects any reviewable workspace delta caused by tools or verifiers. */
   readonly workspaceState?: WorkspaceStatePort;
   /**
+   * Stops runtime-supervised background work before sealed verification and
+   * returns what it stopped. A service still writing inside the fingerprint
+   * bracket would invalidate the very claim it was helping to prove.
+   */
+  readonly quiesce?: () => Promise<readonly string[]>;
+  /**
    * Runtime-owned parse of a freshly mutated file. When present, every
    * successful mutation is syntax-checked automatically right after its batch
    * — no model turn, and the journaled observation satisfies the same gates a
@@ -263,6 +269,7 @@ export class AgentKernel {
   readonly #contextOverflow: ModelContextOverflowDelegate;
   readonly #workingState: WorkingStatePort | undefined;
   readonly #workspaceState: WorkspaceStatePort | undefined;
+  readonly #quiesce: (() => Promise<readonly string[]>) | undefined;
   readonly #postMutationSyntaxCheck: ((relativePath: string) => Promise<{ ok: boolean; output: JsonValue }>) | undefined;
   readonly #hasReviewTool: boolean;
   readonly #hasPlanTool: boolean;
@@ -301,6 +308,7 @@ export class AgentKernel {
     this.#contextOverflow = new ModelContextOverflowDelegate(dependencies.model);
     this.#workingState = dependencies.workingState;
     this.#workspaceState = dependencies.workspaceState;
+    this.#quiesce = dependencies.quiesce;
     this.#postMutationSyntaxCheck = dependencies.postMutationSyntaxCheck;
     this.#taskAddendum = dependencies.taskAddendum;
     this.#userChannel = dependencies.userChannel;
@@ -1229,6 +1237,17 @@ export class AgentKernel {
           continue;
         }
         const verification: VerificationResult[] = [];
+        // Quiesce before sealing. A supervised service writing build output
+        // mid-verification would move the tree inside the fingerprint bracket
+        // and invalidate its own claim; stopping first is deterministic, and
+        // verification should prove the tree as it will actually be delivered.
+        const quiesced = await this.#quiesce?.();
+        if (quiesced !== undefined && quiesced.length > 0) {
+          await this.#record("runtime.note", {
+            text: `[Vanguard runtime] Stopped ${quiesced.length} supervised service(s) before verification: ${quiesced.join(", ")}. Restart one with run_service if you still need it.`,
+            kind: "verification-quiesce",
+          });
+        }
         const preVerificationGeneration = workspaceGeneration;
         const verifierWorkspaceBefore = await observeWorkspaceBoundary("pre-verification-boundary");
         if (workspaceGeneration !== preVerificationGeneration) continue;

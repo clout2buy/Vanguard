@@ -44,7 +44,20 @@ interface SearchResult {
  * for public DNS targets on the default ports; loopback, private, link-local,
  * documentation, multicast, and unspecified addresses are rejected.
  */
+/**
+ * Loopback reachability for services the runtime itself started.
+ *
+ * Supplied by the supervised-process registry, never by the model: the
+ * allowance is derived from what Vanguard actually launched, so an agent can
+ * check its own dev server without being able to ask for 127.0.0.1:22.
+ */
+export interface SupervisedLoopbackAllowance {
+  allows(hostname: string, port: number): boolean;
+}
+
 export class PublicNetworkTargetPolicy implements NetworkTargetPolicy {
+  constructor(private readonly loopback?: SupervisedLoopbackAllowance) {}
+
   async assertAllowed(url: URL): Promise<void> {
     if (url.protocol !== "https:" && url.protocol !== "http:") {
       throw new Error("Only http:// and https:// URLs are supported.");
@@ -52,6 +65,10 @@ export class PublicNetworkTargetPolicy implements NetworkTargetPolicy {
     if (url.username.length > 0 || url.password.length > 0) {
       throw new Error("URLs containing credentials are not allowed.");
     }
+    // A port a live supervised service is listening on is the one exception to
+    // default-deny, and it is granted by the registry rather than requested.
+    const requestedPort = url.port === "" ? (url.protocol === "https:" ? 443 : 80) : Number(url.port);
+    if (this.loopback?.allows(url.hostname, requestedPort) === true) return;
     if ((url.protocol === "https:" && url.port !== "" && url.port !== "443")
       || (url.protocol === "http:" && url.port !== "" && url.port !== "80")) {
       throw new Error("Only the default HTTP and HTTPS ports are allowed.");
@@ -76,7 +93,7 @@ export class WebFetchTool implements ToolPort {
   readonly name = "fetch_url";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Fetch a public HTTP(S) page as bounded model-readable text. Redirects are revalidated and private/local network targets are refused.",
+    description: "Fetch a public HTTP(S) page as bounded model-readable text, or a local port a run_service service is listening on. Redirects are revalidated and other private/local network targets are refused.",
     inputSchema: {
       type: "object",
       properties: {

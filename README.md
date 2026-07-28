@@ -88,6 +88,11 @@ container or VM isolation. See [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md).
 7. Web access is a bounded observation surface: public targets only, no browser
    credentials or cookies, redirect revalidation, and no verification authority.
    See [`docs/WEB_ACCESS.md`](docs/WEB_ACCESS.md).
+8. Long-running work is supervised, never loose: servers and watchers start
+   through `run_service` with count and lifetime bounds, are killed as a whole
+   process tree, and are swept at session end. A local port becomes reachable
+   only while a service Vanguard started is actually listening on it. See
+   [`docs/MANAGED_PROCESSES.md`](docs/MANAGED_PROCESSES.md).
 
 ## Development
 

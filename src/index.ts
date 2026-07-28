@@ -31,6 +31,8 @@ export * from "./runtime/integrityVerifier.js";
 export * from "./runtime/codeIntelTool.js";
 export * from "./runtime/evidenceTool.js";
 export * from "./runtime/skillTool.js";
+export * from "./runtime/serviceTool.js";
+export * from "./runtime/processTree.js";
 export * from "./runtime/creativeJudge.js";
 export * from "./runtime/doctor.js";
 export * from "./runtime/headlessRenderTool.js";

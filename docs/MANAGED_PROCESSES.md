@@ -1,7 +1,9 @@
 # Managed Long-Running Processes — Design
 
-Status: **design, not implemented.** Written 2026-07-27 after the incident that
-closed engine 0.2.5.
+Status: **implemented in engine 0.2.8** (`run_service`, `SupervisedProcessRegistry`).
+Written as a design 2026-07-27 after the incident that closed engine 0.2.5, and
+built the same day. The "Open questions" section below records what was decided
+and what is still deliberately unbuilt.
 
 ## Why this exists
 
@@ -169,21 +171,46 @@ registry rather than from the model's request, which keeps the default-deny
 posture intact — the model cannot ask for `127.0.0.1:22`, it can only reach a
 port Vanguard itself started.
 
-## Open questions
+## What shipped, and what did not
 
-- **PTY or pipes?** Pipes are simpler, dependency-free, and enough for servers
-  and watchers. A PTY (Codex's choice) additionally supports REPLs and
-  interactive debuggers and makes some tools emit unbuffered output — but a
-  dependency-free cross-platform PTY on Windows is a serious undertaking.
-  Recommendation: **pipes first**, with `stdin` write support as a follow-on,
-  and revisit PTY only if buffering proves to be a real obstacle in practice.
-- **Cross-turn survival.** Should a service outlive the turn that started it?
-  Yes — that is most of the value (start once, iterate many turns). It follows
-  that handles must be journaled and restored on resume, and that an interrupted
-  worker must adopt or kill orphans it finds registered. This is the hardest
-  part of the implementation and where a crash-window bug would hurt most.
-- **Does `check_project` become a service?** No. Fixed trusted checks are
-  one-shot by definition and their sealed-verifier semantics depend on it.
+**Built as designed:** the single `run_service` tool with an operation field
+(`start`/`status`/`logs`/`stop`/`list`), opaque handles, blocking readiness,
+ring-buffered logs with cursor paging and a non-silent `droppedBytes`, the
+`maxServices` and `maxLifetimeMs` bounds, tree termination reusing the 0.2.5
+ladder with `containmentUncertain` when closure cannot be proven, the
+session-end sweep, and quiesce-before-sealed-verification (option 1 — the
+fingerprint-exclusion alternative stayed rejected).
+
+**Readiness** resolves on whichever comes first: a `readyPattern` match, the
+process staying alive through a settle window, or `readyTimeoutMs` (reported as
+`ready: false` with captured output, never an exception). A process that
+**exits** during startup is returned as an ordinary failed command with its exit
+code and output, because that is what it is — port in use, missing dependency.
+
+**Loopback allowance** landed as specified and is the security-critical piece:
+`PublicNetworkTargetPolicy` takes the registry as its allowance source, and
+permits a loopback host **only** on a port a live service is actually listening
+on, discovered from the service's own output. The model cannot name a port; it
+can only reach one Vanguard started. Everything else — other private ranges,
+non-default ports, ports of stopped services — stays refused.
+
+**Decided against for now:**
+
+- **PTY.** Pipes shipped. They are dependency-free and sufficient for servers
+  and watchers, which is the whole use case. A cross-platform dependency-free
+  Windows PTY is a serious undertaking and buys REPLs and interactive
+  debuggers — revisit only if output buffering proves to be a real obstacle.
+- **`stdin` writes.** Not implemented; no current use case needs to talk to a
+  service, and adding an input channel widens the surface for nothing.
+- **Cross-turn survival across a *process restart*.** Services survive turns
+  within a worker (that is most of the value), but handles are not yet journaled
+  and re-adopted after an interrupted worker. Until they are, a restarted worker
+  starts with an empty registry — and because the OS-level tree is killed by the
+  sweep and the lifetime bound, an orphan cannot silently outlive the session.
+  Journaled handles with adoption-or-kill on resume is the remaining work here,
+  and it is where a crash-window bug would hurt most.
+- **`check_project` as a service.** No. Fixed trusted checks are one-shot by
+  definition and their sealed-verifier semantics depend on it.
 
 ## Prior art
 

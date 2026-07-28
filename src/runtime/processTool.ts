@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import type { JsonValue, ToolContext, ToolDefinition, ToolPort, ToolResult } from "../kernel/contracts.js";
+import { killProcessTree } from "./processTree.js";
 import { objectInput, optionalStringField, stringArrayField, stringField } from "./input.js";
 import { WorkspaceBoundary } from "./workspace.js";
 import { sanitizedChildEnvironment } from "../engine/security.js";
@@ -53,7 +54,7 @@ export class ProcessTool implements ToolPort {
   readonly name = "run_command";
   readonly definition: ToolDefinition = {
     name: this.name,
-    description: "Run one bounded allowlisted executable without a command shell and capture its exit state. Persistent development servers are rejected; use render_artifact for HTML evidence.",
+    description: "Run one bounded allowlisted executable without a command shell and capture its exit state. This tool is for commands that exit on their own; start a persistent development server or watcher with run_service instead.",
     inputSchema: {
       type: "object",
       properties: {
@@ -153,7 +154,9 @@ export class ProcessTool implements ToolPort {
         output: {
           error: "Persistent server commands are not valid bounded process evidence.",
           detail: persistentReason,
-          guidance: "Use render_artifact to execute and inspect an HTML/SVG deliverable, or run a bounded test command that exits on its own.",
+          // The command is not forbidden, it is in the wrong tool: a service
+          // has a supervised home now, so say where instead of only refusing.
+          guidance: "Start it with run_service (it returns a handle, streams logs, and fetch_url can then reach its port), or run a bounded command that exits on its own. render_artifact remains the way to inspect a static HTML/SVG deliverable.",
         },
       };
     }
@@ -253,37 +256,7 @@ async function runProcess(
       signal.removeEventListener("abort", abort);
       resolve(result);
     };
-    const killTree = (killSignal: "SIGTERM" | "SIGKILL"): void => {
-      if (process.platform === "win32") {
-        // taskkill /T must run while the direct child is still alive: its
-        // PID is the only handle to the tree, and grandchildren reparent
-        // beyond reach the moment it dies. Killing only the direct child
-        // (e.g. a cmd.exe /c wrapper around an installer) leaves survivors
-        // holding the stdio pipes, `close` never fires, and unprovable
-        // closure permanently poisons the run.
-        if (child.pid !== undefined) {
-          try {
-            spawn("taskkill", ["/T", "/F", "/PID", String(child.pid)], {
-              shell: false,
-              windowsHide: true,
-              stdio: "ignore",
-            }).on("error", () => {
-              try { child.kill("SIGKILL"); } catch { /* The close/deadline below remains authoritative. */ }
-            });
-            return;
-          } catch { /* Fall through to the direct kill. */ }
-        }
-        try { child.kill("SIGKILL"); } catch { /* The close/deadline below remains authoritative. */ }
-        return;
-      }
-      if (child.pid !== undefined) {
-        try {
-          process.kill(-child.pid, killSignal);
-          return;
-        } catch { /* The group may already be gone; fall back to the direct child. */ }
-      }
-      try { child.kill(killSignal); } catch { /* The close/deadline below remains authoritative. */ }
-    };
+    const killTree = (killSignal: "SIGTERM" | "SIGKILL"): void => killProcessTree(child, killSignal);
     const terminate = (reason: "aborted" | "timed_out" | "idle"): void => {
       if (settled || termination !== undefined) return;
       termination = reason;

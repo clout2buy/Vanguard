@@ -26,7 +26,7 @@ the input, not a request to imitate one competitor wholesale.
 | R1 | Web search and fetch | Read-only observations; public targets; bounded redirects, time, and bytes; no cookies or credentials | Implemented |
 | R2 | Prompt commands | Data-only templates with deterministic discovery, argument expansion, and provenance | Implemented |
 | R3 | Tool-aware hooks and custom-tool assembly | Hooks receive a bounded call envelope; vetoes are journaled; host factories remain explicit | Implemented |
-| R4 | Managed processes | No shell strings; supervised process handles, bounded logs, idle/lifetime budgets, explicit stop | Designed (`MANAGED_PROCESSES.md`) |
+| R4 | Managed processes | No shell strings; supervised process handles, bounded logs, idle/lifetime budgets, explicit stop | Implemented |
 | R5 | MCP breadth | Add resources and prompts before remote transports; preserve exact allowlists and frame caps | Planned |
 | R6 | Git workflows | First-class status/diff/branch/commit capabilities with review and confirmation boundaries | Planned |
 | R7 | Isolation | Ship a host/container runner or a native OS boundary; never relabel workspace containment as a sandbox | Design required |
@@ -125,6 +125,40 @@ This exists because the first hypothesis about long-run degradation — that
 runtime ceremony dominated the window — was measured against a real journal
 and turned out to be false (runtime notes were 0.4%). Tuning this further
 without measurement would be guessing twice.
+
+## R4 acceptance record
+
+`run_service` gives long-running processes a supervised home, closing the last
+capability gap where Vanguard stood alone against the whole field. The canonical
+coding loop now closes without a shell: start a dev server, fetch its page,
+read its logs, edit, restart.
+
+The no-shell stance is unchanged — services are argv vectors against the same
+allowlist `run_command` uses, with the same denied-argument policy. What changes
+is the leash, not the fence: silence is legal for a service (that is the point),
+because lifetime is hard-bounded, the process is *registered*, and termination
+reuses the 0.2.5 tree-kill ladder and still reports `containmentUncertain` when
+closure cannot be proven. The failure that poisoned the Godot run was an
+untracked child nobody could account for; a supervised one is the opposite.
+
+Two decisions carry the security weight:
+
+**Loopback reachability is derived, never requested.** `fetch_url` can reach
+`127.0.0.1` only on a port a live service is actually listening on, discovered
+from that service's own output and supplied to `PublicNetworkTargetPolicy` by
+the registry. The model cannot ask for `127.0.0.1:22`; it can only reach a port
+Vanguard itself started, and reachability dies with the service.
+
+**Verification quiesces first.** A service writing build output inside the
+sealed-verification fingerprint bracket would invalidate the very claim it was
+helping prove, so the completion path stops every service before sealing and
+journals that it did. The alternative — excluding service-declared output paths
+from the fingerprint — was rejected for requiring exactly the self-attestation
+the evidence economy refuses everywhere else.
+
+Coverage starts a real HTTP server, proves readiness detection, fetches its page
+through the allowance, and confirms a wrapper-with-grandchild dies as a tree with
+provable closure — the exact shape of the incident that motivated this phase.
 
 ## Release gates for every phase
 

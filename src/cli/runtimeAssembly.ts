@@ -21,6 +21,9 @@ import {
   ScoutDelegateTool,
   EvidenceReadTool,
   SkillReadTool,
+  ServiceTool,
+  SupervisedProcessRegistry,
+  PublicNetworkTargetPolicy,
   ImageInspectionTool,
   JournalEvidenceResolver,
   GlobTool,
@@ -421,7 +424,18 @@ export async function buildExecutionRuntime(
   // automatic post-mutation rung; its content-hash cache makes a model
   // re-check of an unchanged file free.
   const postMutationSyntaxChecker = new PostEditSyntaxChecker(new SyntaxCommandRunner(), workspace);
+  // Long-running processes get a supervised home instead of being refused:
+  // registered, tree-killed, and swept at session end. Its registry is also
+  // the ONLY source of loopback reachability for fetch_url, so the agent can
+  // check a server it started without the model being able to name a port.
+  const services = new SupervisedProcessRegistry(workspace, {
+    allowedCommands: agentAllowedCommands,
+    commandAliases: commandAliases(session.workspaceRoot, options.restrictProcess, mutationPolicy.writableAbsoluteRoots(session.workspaceRoot)),
+    deniedArgumentPrefixes: options.restrictProcess ? ["--allow-", "--no-permission", "--no-experimental-permission"] : [],
+    maxLifetimeMs: options.maxDurationMs,
+  });
   const profileTools = options.agentProfile === "coder" ? [
+      new ServiceTool(services),
       new RepoMemoryTool(repoMemory),
       new WriteFileTool(workspace, versions, mutationPolicy),
       new ReplaceTextTool(workspace, versions, mutationPolicy),
@@ -455,7 +469,7 @@ export async function buildExecutionRuntime(
       new CodeIntelTool(workspace),
       new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
       new WebSearchTool(),
-      new WebFetchTool(),
+      new WebFetchTool({ targetPolicy: new PublicNetworkTargetPolicy(services) }),
       ...(skillTool === undefined ? [] : [skillTool]),
       ...profileTools,
     ].map(withToolHooks),
@@ -479,6 +493,7 @@ export async function buildExecutionRuntime(
         })(),
       },
     }),
+    quiesce: () => services.stopAll(),
     postMutationSyntaxCheck: async (relativePath) => {
       const result = await postMutationSyntaxChecker.check(relativePath);
       return { ok: result.ok, output: result as unknown as JsonValue };
@@ -508,6 +523,9 @@ export async function buildExecutionRuntime(
     usage,
     delegationSnapshot: () => JSON.parse(JSON.stringify(delegation.snapshot())) as JsonValue,
     dispose: async () => {
+      // Nothing supervised outlives the session. The sweep runs first so a
+      // still-listening server cannot survive a teardown that later throws.
+      await services.stopAll().catch(() => []);
       if (hookRunner !== undefined) {
         // after-run hooks are observational at teardown; a failure is
         // reported by the hook audit journal, never by masking run results.

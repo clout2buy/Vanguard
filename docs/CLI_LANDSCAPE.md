@@ -134,8 +134,8 @@ stack, with each item's prevalence:
 | 8 | OS-level sandbox in the product | ✔ (no Windows) | ✔ (incl. native Windows) | ✘ | ✘ | ✘ (containers external) | ✘ (stated; containers external) |
 | 9 | Subagents with isolated context | ✔ | ✔ | ✔ | ✔ | ✘ deliberate (pi-via-bash) | ◐ (scout + delegation, gated off by default) |
 | 10 | MCP client | ✔ | ✔ (+server mode) | ✔ (+OAuth/DCR) | ✔ | ✘ deliberate | ◐ (stdio, tools-only) |
-| 11 | Built-in web search/fetch | ✔ | ✔ | ✔ | ✔ | via bash/ext | ✘ **(no fallback either — no shell)** |
-| 12 | Background/long-running processes (dev servers) | ✔ (bg bash, Monitor) | ✔ (unified_exec PTY) | ✔ (/pty endpoint) | ✔ (bg shell tasks) | tmux stance | ✘ **actively refused** |
+| 11 | Built-in web search/fetch | ✔ | ✔ | ✔ | ✔ | via bash/ext | ✔ (`search_web`/`fetch_url`, 0.2.6) |
+| 12 | Background/long-running processes (dev servers) | ✔ (bg bash, Monitor) | ✔ (unified_exec PTY) | ✔ (/pty endpoint) | ✔ (bg shell tasks) | tmux stance | ✔ (`run_service`, 0.2.8 — pipes not PTY) |
 | 13 | Skills (SKILL.md) | ✔ | ✔ | ✔ | ✔ (reads everyone's) | ✔ | ✔ (inlined, not progressive) |
 | 14 | Custom commands / prompt templates | ✔ | ✔ | ✔ | ◐ | ✔ | ✘ |
 | 15 | Hooks that can observe/veto specific tool calls | ✔ | ✔ | ✔ (plugin hooks) | successor | via extensions | ✘ (hooks are call-blind) |
@@ -269,7 +269,7 @@ above remains the pre-reconstruction survey snapshot.
 | # | Gap | Status |
 |---|---|---|
 | 1 | No web access | **Closed.** `search_web` + `fetch_url` as observe-effect tools in the conversation, execution, and scout toolsets, behind a default-deny `PublicNetworkTargetPolicy` (per-hop redirect revalidation, DNS-resolved private/loopback refusal, default ports only, streaming byte caps). See `WEB_ACCESS.md`. |
-| 2 | No long-running processes | **Designed, not built** — `MANAGED_PROCESSES.md`. Engine 0.2.5 fixed the containment half (provable tree kill) after the incident this gap predicted. |
+| 2 | No long-running processes | **Closed** (0.2.8). `run_service` supervises servers and watchers: blocking readiness, bounded ring-buffered logs, lifetime and count budgets, tree termination, session-end sweep, and quiesce before sealed verification. `fetch_url` reaches loopback only on a port a live service actually holds, derived from the registry rather than requested. See `MANAGED_PROCESSES.md`. |
 | 3a | No custom commands | **Closed.** `.vanguard/commands/*.md` prompt templates with `$ARGUMENTS`/`$1..$9`, workspace shadowing user, listed in `/help`. |
 | 3b | Hooks cannot see a tool call | **Closed.** `before-tool`/`after-tool` receive `{ when, tool, input, ok?, output? }` on stdin, and a fail-closed `before-tool` hook denies that single call instead of ending the run. |
 | 3c | `CustomToolRegistry` unreachable | **Resolved as documented boundary.** `tools[]` is an embedder surface — the CLI cannot import implementations by design; MCP is the CLI's route to external tools. See `EXTENSIONS.md`. |

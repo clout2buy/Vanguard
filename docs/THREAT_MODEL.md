@@ -90,6 +90,15 @@ container or hypervisor implementation.
 - No profile confines the network or every language runtime by itself.
 - Web content is untrusted model input, not independent verification evidence;
   public-target checks are not a general outbound network sandbox.
+- Supervised services (`run_service`) run project code with the agent's own
+  privileges, exactly like `run_command`, against the same allowlist. They are
+  bounded by count and lifetime, terminated as a process tree, and swept at
+  session end; a stop that cannot prove tree closure reports
+  `containmentUncertain` and fences the run rather than assuming death.
+- The loopback exception for `fetch_url` is granted by the supervised-process
+  registry, never by the model: only a port a live service is actually
+  listening on becomes reachable, and only on a loopback host. It is not a
+  general local-network allowance, and it lapses when the service stops.
 - Secret files intentionally present inside the repository are visible to the
   coding model unless the host removes them before session creation.
 - A trusted in-process extension has host authority; untrusted extensions must
