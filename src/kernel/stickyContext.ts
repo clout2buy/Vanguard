@@ -47,6 +47,13 @@ interface ContextEpoch {
 export class StickyContextPolicy implements ContextPolicyPort {
   #epoch: ContextEpoch | undefined;
 
+  /**
+   * `retrievableEvidence` is set by the runtime that also offers
+   * `read_evidence`, so compacted exchanges advertise retrieval only where the
+   * tool exists — never inviting a call the runtime cannot serve.
+   */
+  constructor(private readonly options: { readonly retrievableEvidence?: boolean } = {}) {}
+
   select(
     task: string,
     transcript: readonly TranscriptEntry[],
@@ -155,7 +162,11 @@ export class StickyContextPolicy implements ContextPolicyPort {
     for (let index = chunks.length - 1; index >= 0; index -= 1) {
       if (selected.has(index)) continue;
       const chunk = chunks[index]!;
-      const entries = compactChunk(chunk, Math.min(8_000, Math.max(1_000, Math.floor(maxBytes * 0.18))));
+      const entries = compactChunk(
+        chunk,
+        Math.min(8_000, Math.max(1_000, Math.floor(maxBytes * 0.18))),
+        this.options.retrievableEvidence === true,
+      );
       const bytes = serializedBytes(entries);
       if (recentBytes + bytes > recentBudget && recentBytes > 0) break;
       selected.add(index);
@@ -306,14 +317,14 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
   return chunks;
 }
 
-function compactChunk(chunk: ContextChunk, maxBytes: number): readonly TranscriptEntry[] {
+function compactChunk(chunk: ContextChunk, maxBytes: number, retrievable: boolean): readonly TranscriptEntry[] {
   if (serializedBytes(chunk.entries) <= maxBytes || !isToolDecision(chunk.entries[0])) {
     return chunk.entries;
   }
   // Never retain an assistant tool-call frame with rewritten arguments. Old
   // exchanges become inert runtime history so no provider can replay them or
   // mistake their contents for a human instruction.
-  return [summarizeHistoricalToolExchange(chunk.entries)];
+  return [summarizeHistoricalToolExchange(chunk.entries, { retrievable })];
 }
 
 function digestEntry(

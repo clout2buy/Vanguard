@@ -19,6 +19,8 @@ import {
   RepoMemoryStore,
   RepoMemoryTool,
   ScoutDelegateTool,
+  EvidenceReadTool,
+  SkillReadTool,
   ImageInspectionTool,
   JournalEvidenceResolver,
   GlobTool,
@@ -105,6 +107,10 @@ export function buildConversationRuntime(
     model: createModel(options, createStreamPresenter(markActivity)),
     tools: [
       ...conversationTools,
+      // Compaction drops old tool outputs from context but not from the
+      // journal; this reads them back by evidence id so a long conversation
+      // stops forgetting what it already looked at.
+      new EvidenceReadTool(fileJournal),
       // The internal delegation loop: scouts investigate on a separate model
       // context and return digests, so even pre-contract exploration cannot
       // flood the conversation with raw file contents.
@@ -112,6 +118,7 @@ export function buildConversationRuntime(
     ],
     verifiers: [],
     journal,
+    contextPolicy: new StickyContextPolicy({ retrievableEvidence: true }),
     ...(options.extensions === undefined ? {} : { workingState: { snapshot: () => ({ extensions: options.extensions! }) } }),
     taskAddendum: taskAddendum(options, mutationPolicy),
     ...(userChannel === undefined ? {} : { userChannel }),
@@ -198,6 +205,9 @@ export async function buildExecutionRuntime(
   const extensionTools: ToolPort[] = [];
   let hookRunner: HookRunner | undefined;
   let skillsAddendum = "";
+  // Read-only, so every profile gets it — the addendum advertises read_skill
+  // to all of them, and a scout must not be told to call a tool it lacks.
+  let skillTool: ToolPort | undefined;
   if (options.disableExtensions !== true) {
     // Configuration and skills are project truth, so they resolve from the
     // original source tree: session copies deliberately exclude .vanguard.
@@ -228,11 +238,13 @@ export async function buildExecutionRuntime(
     if (skillRoots.length > 0) {
       const skills = await loadWorkspaceSkills(sourceBoundary, { ...resolved.config.skills, roots: skillRoots });
       if (skills.length > 0) {
-        // Skill bodies are inlined because the agent workspace cannot read
-        // .vanguard; the loader already bounds file and corpus sizes.
-        skillsAddendum = "\n\nAvailable workspace skills (apply when relevant to the task):"
-          + skills.map((skill) =>
-            `\n### Skill: ${skill.metadata.name} — ${skill.metadata.description}\n${skill.instructions.trim()}`).join("");
+        // Progressive disclosure: the task carries names and summaries, and
+        // read_skill fetches a body on demand. Inlining every body cost the
+        // full corpus on every turn of every run, relevant or not — a fixed
+        // tax that grows with the skill library and never with its usefulness.
+        skillsAddendum = "\n\nAvailable workspace skills — read one with read_skill when it is relevant:"
+          + skills.map((skill) => `\n- ${skill.metadata.name}: ${skill.metadata.description}`).join("");
+        skillTool = new SkillReadTool(skills);
       }
     }
   }
@@ -427,12 +439,16 @@ export async function buildExecutionRuntime(
     ] : [];
   const kernel = new AgentKernel({
     model: createModel(options, observer),
-    contextPolicy: new StickyContextPolicy(),
+    contextPolicy: new StickyContextPolicy({ retrievableEvidence: true }),
     tools: [
       new ListFilesTool(workspace),
       new SearchTextTool(workspace),
       new GlobTool(workspace),
       new ReadFileTool(workspace, 1_000_000, versions),
+      // Compacted evidence stays reachable: long execution runs lose old tool
+      // outputs from context, and re-reading a file is both slower and less
+      // faithful than reading back what was actually observed at the time.
+      new EvidenceReadTool(fileJournal),
       // The internal delegation loop: reconnaissance on a separate model
       // context that returns a digest instead of raw file contents.
       new ScoutDelegateTool(createModel(options), executionObserveTools),
@@ -440,6 +456,7 @@ export async function buildExecutionRuntime(
       new RepositoryMapTool(workspace, { includeInstructions: !options.disableExtensions }),
       new WebSearchTool(),
       new WebFetchTool(),
+      ...(skillTool === undefined ? [] : [skillTool]),
       ...profileTools,
     ].map(withToolHooks),
     verifiers,

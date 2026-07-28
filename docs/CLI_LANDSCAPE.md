@@ -279,6 +279,32 @@ above remains the pre-reconstruction survey snapshot.
 | 7 | UX-layer gaps | Partially closed: the fixed six slash commands are now extensible; `@`-mentions and attachments remain open. |
 | 8 | Code intel breadth | Open. |
 
+### Beyond the survey: long-horizon endurance (engine 0.2.7)
+
+The matrix measures **breadth** — which capabilities exist. It does not measure
+**endurance**, and field use surfaced that as the sharper weakness: a session
+that handles one task well degrades across the next ten, forgetting earlier
+findings and dying on safety machinery rather than finishing.
+
+Measuring a real failed run corrected the obvious hypothesis. Runtime ceremony
+(re-grounding notes, runtime state) was **0.4%** of that journal; provider
+reasoning replay was 41% and actual tool evidence 26%. The problem is not that
+machinery crowds out work — it is *which half compaction throws away*.
+
+| Cause | Field comparison | Fixed in 0.2.7 |
+|---|---|---|
+| Compaction drops tool outputs but keeps contract/plan text, so the model forgets what it found while reciting what it promised | Claude Code offloads old tool results to disk and leaves path references (microcompaction) | `read_evidence` reads compacted outputs back from the journal by `evidenceId`; digests advertise it |
+| Loop detection **fails the run** | OpenCode detects the same doom-loop and **forces a prompt** — it asks the human | Guards escalate to the human when a channel is attached; terminal only when headless. Lost containment stays terminal always |
+| Skill bodies inlined wholesale every turn | Pi's progressive disclosure; Claude Code loads `SKILL.md` on demand | Addendum lists names + descriptions; `read_skill` fetches bodies |
+| No visibility into what fills the window | — | `context.projected` per decision; per-role composition in the scorecard |
+
+Still open, and the honest remaining lever: **reconnaissance is not isolated by
+default.** `delegate_scout` exists and returns digests instead of raw file
+contents, but the model must choose it; Claude Code, Codex, OpenCode, and Kimi
+all push exploration into subagent context windows as the default path. That is
+the next endurance change, and it should be made against the composition
+telemetry rather than ahead of it.
+
 ---
 
 ## 5. Sources & confidence

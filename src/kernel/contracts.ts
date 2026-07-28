@@ -519,6 +519,7 @@ export type RunEventType =
   | "user.message"
   | "runtime.note"
   | "context.compacted"
+  | "context.projected"
   | "model.decided"
   | "tool.completed"
   | "tool.failed"

@@ -24,6 +24,23 @@ export interface TrajectoryMetrics {
   readonly failuresByCode: Readonly<Record<string, number>>;
   readonly failuresByDisposition: Readonly<Record<string, number>>;
   readonly toolCallsByName: Readonly<Record<string, number>>;
+  /**
+   * What the model was actually sent, measured rather than assumed. Long-run
+   * degradation is a context-composition problem, and "machinery crowded out
+   * the evidence" and "evidence crowded out the contract" look identical from
+   * the outside while wanting opposite fixes.
+   */
+  readonly context?: ContextCompositionMetrics;
+}
+
+export interface ContextCompositionMetrics {
+  readonly samples: number;
+  readonly meanSelectedBytes: number;
+  readonly maxSelectedBytes: number;
+  /** Mean share of the projected request, 0-1, keyed by transcript role. */
+  readonly meanShareByRole: Readonly<Record<string, number>>;
+  /** Peak fraction of the learned context budget any single request used. */
+  readonly maxBudgetUtilization: number;
 }
 
 export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetrics {
@@ -48,6 +65,11 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
   const failuresByDisposition: Record<string, number> = {};
   const toolCallsByName: Record<string, number> = {};
   let pendingToolNames: string[] = [];
+  let contextSamples = 0;
+  let contextBytesTotal = 0;
+  let contextBytesMax = 0;
+  let budgetUtilizationMax = 0;
+  const roleBytesTotal: Record<string, number> = {};
 
   for (const event of events) {
     const data = record(event.data);
@@ -106,6 +128,20 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
         contextCompactions += 1;
       }
     }
+    if (event.type === "context.projected") {
+      const selected = typeof data?.selectedBytes === "number" ? data.selectedBytes : 0;
+      contextSamples += 1;
+      contextBytesTotal += selected;
+      if (selected > contextBytesMax) contextBytesMax = selected;
+      const budget = typeof data?.budgetBytes === "number" ? data.budgetBytes : 0;
+      if (budget > 0) budgetUtilizationMax = Math.max(budgetUtilizationMax, selected / budget);
+      const byRole = record(data?.byRole);
+      if (byRole !== undefined) {
+        for (const [role, bytes] of Object.entries(byRole)) {
+          if (typeof bytes === "number") roleBytesTotal[role] = (roleBytesTotal[role] ?? 0) + bytes;
+        }
+      }
+    }
     if (event.type === "recovery.decided") {
       recoveryDecisions += 1;
       if (data?.retry === true) retriesScheduled += 1;
@@ -145,7 +181,30 @@ export function analyzeTrajectory(events: readonly RunEvent[]): TrajectoryMetric
     failuresByCode,
     failuresByDisposition,
     toolCallsByName,
+    ...(contextSamples === 0 ? {} : {
+      context: {
+        samples: contextSamples,
+        meanSelectedBytes: Math.round(contextBytesTotal / contextSamples),
+        maxSelectedBytes: contextBytesMax,
+        meanShareByRole: shareByRole(roleBytesTotal, contextBytesTotal),
+        maxBudgetUtilization: Number(budgetUtilizationMax.toFixed(4)),
+      },
+    }),
   };
+}
+
+function shareByRole(
+  roleBytesTotal: Readonly<Record<string, number>>,
+  total: number,
+): Readonly<Record<string, number>> {
+  if (total <= 0) return {};
+  const shares: Record<string, number> = {};
+  // Descending share: the first line of this table is the answer to "what is
+  // actually filling the window".
+  for (const [role, bytes] of Object.entries(roleBytesTotal).sort((left, right) => right[1] - left[1])) {
+    shares[role] = Number((bytes / total).toFixed(4));
+  }
+  return shares;
 }
 
 function record(value: JsonValue | undefined): Record<string, JsonValue> | undefined {

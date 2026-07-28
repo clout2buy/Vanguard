@@ -30,6 +30,7 @@ the input, not a request to imitate one competitor wholesale.
 | R5 | MCP breadth | Add resources and prompts before remote transports; preserve exact allowlists and frame caps | Planned |
 | R6 | Git workflows | First-class status/diff/branch/commit capabilities with review and confirmation boundaries | Planned |
 | R7 | Isolation | Ship a host/container runner or a native OS boundary; never relabel workspace containment as a sandbox | Design required |
+| R8 | Long-horizon endurance | Compaction stays retrievable; productivity guards escalate to the human; fixed per-turn cost falls; composition is measured | Implemented |
 
 ## R1 acceptance record
 
@@ -80,6 +81,50 @@ construct the kernel in-process register implementations through
 agree; the CLI's route to externally-implemented tools stays MCP. `EXTENSIONS.md`
 states this explicitly so a declared-but-unsatisfied tool reads as intended
 rather than broken.
+
+## R8 acceptance record
+
+The gap survey measured breadth. This phase is about **endurance**: a session
+that works for one task and degrades over the next ten. Four changes, all
+aimed at the same reported failure — "it forgets things, slowly gets worse,
+and dies from safety machinery."
+
+**Compaction became retrievable, not lossy.** `summarizeHistoricalToolExchange`
+drops raw arguments and outputs, which meant a long session forgot *what it
+found* while still reciting *what it promised*. The bytes were never gone —
+they sit in the hash-chained journal under the same `evidenceId` the digest
+already carried. `read_evidence` reads them back, bounded and byte-paged, as an
+`observe` tool with no evidence authority (restating a journaled observation
+cannot mint new proof). Digests advertise retrieval only in runtimes that offer
+the tool, threaded through an explicit `retrievableEvidence` policy option so
+the model is never invited to call something that does not exist.
+
+**Productivity guards escalate instead of executing.** Detection was already
+right; the disposition was wrong for an attended session. Narration stalls,
+exhausted verification and completion-evidence budgets, repeated malformed
+batches, observation stagnation, execution thrash, and the repeated-action
+circuit breaker now park the run and ask the human when a user channel is
+attached, re-arming every budget from the answer exactly as steering does.
+Headless runs keep the terminal failure — nobody is there to unstick them —
+and **lost containment is explicitly excluded**: that is a safety verdict, not
+a productivity heuristic, and it still fences the run regardless of who is
+watching. This is the disposition OpenCode reaches for with `doom_loop`, which
+forces a prompt rather than a death.
+
+**Skills load on demand.** Bodies were inlined wholesale into the task
+addendum, so every turn of every run paid for the entire skill corpus whether
+or not any of it was relevant — a fixed tax that grows with the library and
+never with its usefulness. The addendum now carries names and one-line
+descriptions; `read_skill` returns a body when the model decides it wants one.
+
+**Context composition is measured, not assumed.** Every projection journals
+`context.projected` with selected bytes, the learned budget, and a per-role
+byte split; `analyzeTrajectory` aggregates mean/max bytes, peak budget
+utilization, and mean share by role, sorted largest-first, into the scorecard.
+This exists because the first hypothesis about long-run degradation — that
+runtime ceremony dominated the window — was measured against a real journal
+and turned out to be false (runtime notes were 0.4%). Tuning this further
+without measurement would be guessing twice.
 
 ## Release gates for every phase
 

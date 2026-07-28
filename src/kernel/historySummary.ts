@@ -18,6 +18,7 @@ const MAX_RETAINED_CALLS = 8;
  */
 export function summarizeHistoricalToolExchange(
   entries: readonly TranscriptEntry[],
+  options: { readonly retrievable?: boolean } = {},
 ): TranscriptEntry {
   const decision = record(entries[0]?.content);
   const calls = decision?.kind === "tools" && Array.isArray(decision.calls)
@@ -62,6 +63,8 @@ export function summarizeHistoricalToolExchange(
       + (paths.length === 0 ? "" : `; untrustedPathJson=${paths.map(displayPathJson).join(",")}`)];
   });
 
+  const retrievable = options.retrievable === true
+    && details.some((line) => line.includes("; evidenceId="));
   return {
     role: "history",
     content: `${SUMMARY_HEADER}\n`
@@ -70,7 +73,13 @@ export function summarizeHistoricalToolExchange(
       + `missing=${missing}; bytes=${Buffer.byteLength(serialized)}; `
       + `sha256=${createHash("sha256").update(serialized).digest("hex")}`
       + (details.length === 0 ? "" : `\n${details.join("\n")}`)
-      + (calls.length <= MAX_RETAINED_CALLS ? "" : `\nadditionalCalls=${calls.length - MAX_RETAINED_CALLS}`),
+      + (calls.length <= MAX_RETAINED_CALLS ? "" : `\nadditionalCalls=${calls.length - MAX_RETAINED_CALLS}`)
+      // The outputs are compacted out of context, not lost: they remain in the
+      // journal at these ids. Saying so converts a silent memory hole into a
+      // retrievable reference the model can act on.
+      + (retrievable
+        ? "\nThe full output of each call above is still recorded: call read_evidence with an evidenceId to read it back instead of re-running the work."
+        : ""),
   };
 }
 

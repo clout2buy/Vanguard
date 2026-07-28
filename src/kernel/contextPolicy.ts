@@ -9,6 +9,9 @@ interface ContextChunk {
 }
 
 export class EvidenceContextPolicy implements ContextPolicyPort {
+  /** See StickyContextPolicy: retrieval is advertised only where the tool exists. */
+  constructor(private readonly options: { readonly retrievableEvidence?: boolean } = {}) {}
+
   select(
     task: string,
     transcript: readonly TranscriptEntry[],
@@ -33,7 +36,9 @@ export class EvidenceContextPolicy implements ContextPolicyPort {
       rawChunks.map((chunk, index) => chunk.toolExchange ? index : -1).filter((index) => index >= 0).slice(-2),
     );
     const chunks = rawChunks.map((chunk, index) =>
-      chunk.toolExchange && !recentToolChunks.has(index) ? compactToolExchange(chunk) : chunk,
+      chunk.toolExchange && !recentToolChunks.has(index)
+        ? compactToolExchange(chunk, this.options.retrievableEvidence === true)
+        : chunk,
     );
 
     const taskIndices = chunks
@@ -147,13 +152,13 @@ function causalChunks(transcript: readonly TranscriptEntry[]): ContextChunk[] {
   return chunks;
 }
 
-function compactToolExchange(chunk: ContextChunk): ContextChunk {
+function compactToolExchange(chunk: ContextChunk, retrievable: boolean): ContextChunk {
   return {
     priority: chunk.priority,
     toolExchange: false,
     // A history entry is runtime-authored, inert, and never occupies a human
     // or executable provider slot.
-    entries: [summarizeHistoricalToolExchange(chunk.entries)],
+    entries: [summarizeHistoricalToolExchange(chunk.entries, { retrievable })],
   };
 }
 

@@ -184,8 +184,10 @@ test("workspace skills are advertised to contracted runs", async () => {
         output?: { sha256?: string };
       } | undefined;
       const decision = decisions === 0
-        ? { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } }
+        ? { kind: "tool", call: { id: "skill", name: "read_skill", input: { name: "demo-skill" } } }
         : decisions === 1
+        ? { kind: "tool", call: { id: "read", name: "read_file", input: { path: "answer.mjs" } } }
+        : decisions === 2
           ? {
               kind: "tool",
               call: {
@@ -194,9 +196,9 @@ test("workspace skills are advertised to contracted runs", async () => {
                 input: { path: "answer.mjs", expectedSha256: observation?.output?.sha256, before: "41", after: "42" },
               },
             }
-          : decisions === 2
+          : decisions === 3
             ? { kind: "tool", call: { id: "test", name: "run_command", input: { command: "node", args: ["test.mjs"] } } }
-            : decisions === 3
+            : decisions === 4
               ? { kind: "tool", call: { id: "review", name: "review_changes", input: {} } }
               : { kind: "complete", answer: "Applied the demo skill." };
       response.writeHead(200, { "content-type": "application/json" });
@@ -222,8 +224,17 @@ test("workspace skills are advertised to contracted runs", async () => {
     isolatedRoot = path.dirname(scorecard.workspaceRoot);
     assert.equal(scorecard.outcome.status, "completed");
     const journal = await readFile(path.join(isolatedRoot, "run.jsonl"), "utf8");
-    assert.match(journal, /Available workspace skills/u);
-    assert.match(journal, /Skill: demo-skill — Explains how to repair answers\./u);
+    // Progressive disclosure: the task advertises the skill, it does not carry
+    // the body. Inlining every skill taxed every turn of every run whether or
+    // not the skill mattered.
+    const events = journal.split("\n").filter(Boolean)
+      .map((line) => (JSON.parse(line) as { event: { type: string; data: unknown } }).event);
+    const opening = events.find((event) => event.type === "run.started" || event.type === "run.contracted");
+    const taskText = String((opening?.data as { task?: string } | undefined)?.task ?? "");
+    assert.match(taskText, /Available workspace skills/u);
+    assert.match(taskText, /- demo-skill: Explains how to repair answers\./u);
+    assert.doesNotMatch(taskText, /Always set the answer to 42\./u, "skill bodies must not ride in every turn");
+    // ...and read_skill still delivers it when the model asks.
     assert.match(journal, /Always set the answer to 42\./u);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
